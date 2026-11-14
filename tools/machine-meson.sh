@@ -33,11 +33,25 @@ for p in $srcs; do
     esac
 done
 
-[ -n "$files" ] || exit 0
+# The hook patch does subdir('<machine>'), so the directory must be named
+# after the machine; catching a mismatch here beats a meson error later.
+if [ "$(basename "$sub")" != "$m" ]; then
+    echo "machine-meson: $m: subdir '$sub' must end in /$m" >&2
+    exit 1
+fi
 
-new=$(printf '%s\n' \
-    '# Generated from config.mk by the build; do not edit.' \
-    "$ss.add(when: '$cfg', if_true: files($files))")
+# A machine that drops its last module still needs a valid meson file: the
+# hook patch already enters this directory, so leave an empty list rather
+# than a stale file from the previous build (or none at all).
+if [ -n "$files" ]; then
+    new=$(printf '%s\n' \
+        '# Generated from config.mk by the build; do not edit.' \
+        "$ss.add(when: '$cfg', if_true: files($files))")
+else
+    new=$(printf '%s\n' \
+        '# Generated from config.mk by the build; do not edit.' \
+        '# (no module sources: the machine file is added by the hook patch)')
+fi
 
 mkdir -p "$(dirname "$out")"
 if [ -f "$out" ] && [ "$new" = "$(cat "$out")" ]; then
