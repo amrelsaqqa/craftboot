@@ -16,7 +16,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "mt7621.h"
+#include "mt7621/mt7621.h"
 #include "qapi/visitor.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
@@ -249,7 +249,6 @@
 
 #define MT7621_UART_CLOCK       50000000
 #define MT7621_UART_BAUD_BASE   (MT7621_UART_CLOCK / 16)
-#define MT7621_UART1_OFF        0x00000e00
 #define MT7621_UART1_IRQ        27
 
 /* sysctl register offsets we care about */
@@ -4593,65 +4592,6 @@ static void mt7621_apply_board(MT7621State *s, const char *filename)
      */
 }
 
-/*
- * TX-only mirror of the second UART.  Enough of a 16550 for a polled console:
- * LSR always reports THRE|TEMT, everything else reads as zero, and writes to
- * THR end up in the host log.  RouterOS uses this port when it moves the
- * console off uartlite@c00, and without a sink the kernel's printk vanishes.
- */
-static uint64_t mt7621_uart1_read(void *opaque, hwaddr addr, unsigned size)
-{
-    MT7621State *s = opaque;
-    unsigned reg = (addr & 0xff) >> 2;
-
-    switch (reg) {
-    case 5:                             /* LSR */
-        (void)s;
-        return 0x60;                    /* THRE | TEMT */
-    case 6:                             /* MSR */
-        return 0xb0;                    /* CTS | DSR | DCD */
-    default:
-        return 0;
-    }
-}
-
-static void mt7621_uart1_write(void *opaque, hwaddr addr, uint64_t val,
-                               unsigned size)
-{
-    MT7621State *s = opaque;
-    unsigned reg = (addr & 0xff) >> 2;
-    static bool at_line_start = true;
-
-    switch (reg) {
-    case 0:                             /* THR (ignoring DLAB) */
-        if (at_line_start) {
-            fputs("[uart1] ", stderr);
-            at_line_start = false;
-        }
-        fputc((int)(val & 0xff), stderr);
-        if ((val & 0xff) == '\n') {
-            at_line_start = true;
-        }
-        fflush(stderr);
-        break;
-    case 1:                             /* IER */
-    case 2:                             /* FCR */
-    case 3:                             /* LCR */
-    case 4:                             /* MCR */
-        break;
-    default:
-        break;
-    }
-    (void)s;
-}
-
-static const MemoryRegionOps mt7621_uart1_ops = {
-    .read = mt7621_uart1_read,
-    .write = mt7621_uart1_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = { .min_access_size = 1, .max_access_size = 4 },
-    .impl = { .min_access_size = 1, .max_access_size = 4 },
-};
 
 /*
  * Minimal Inside Secure EIP-93 crypto engine (crypto@1e004000, periph offset
@@ -5155,9 +5095,7 @@ static void mt7621_machine_init(MachineState *machine)
      * host log with a "[uart1] " prefix.  MT7621_UART1=0 disables the mirror.
      */
     if (mt7621_flag("MT7621_UART1")) {
-        memory_region_init_io(&s->uart1, NULL, &mt7621_uart1_ops, s,
-                              "mt7621.uart1", 0x100);
-        memory_region_add_subregion(&s->periph, MT7621_UART1_OFF, &s->uart1);
+        mt7621_uart1_init(s);
     }
 
     mt7621_crypto_reset(s);

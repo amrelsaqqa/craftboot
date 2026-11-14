@@ -232,4 +232,7 @@ struct MT7621State {
     uint32_t cfg1_cache_fields;
 };
 
+/* modules (each one is modules/<block>.c) */
+void mt7621_uart1_init(MT7621State *s);
+
 #endif /* HW_MIPS_MT7621_H */

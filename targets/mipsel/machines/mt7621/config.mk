@@ -30,6 +30,7 @@
 # docs/machines.md.
 mt7621_MACHINE_SRCS := \
     mt7621.c:hw/mips/mt7621.c \
-    mt7621.h:hw/mips/mt7621.h
+    mt7621.h:hw/mips/mt7621/mt7621.h \
+    modules/uart.c:hw/mips/mt7621/uart.c
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model
