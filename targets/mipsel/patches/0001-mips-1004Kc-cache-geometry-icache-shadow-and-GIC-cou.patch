@@ -1,4 +1,4 @@
-From 99af008bd26b6e0c7e11404323be6229ff473788 Mon Sep 17 00:00:00 2001
+From e2ecf5a58aa0519a2fd2571cc2907145148e357a Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Sat, 14 Nov 2026 18:57:25 +0200
 Subject: [PATCH 1/3] mips: 1004Kc cache geometry, icache shadow and GIC
@@ -7,12 +7,12 @@ Subject: [PATCH 1/3] mips: 1004Kc cache geometry, icache shadow and GIC
 ---
  accel/tcg/cputlb.c               | 111 ++++++++++++++++++++++++++++++-
  accel/tcg/translator.c           |   4 ++
- hw/timer/mips_gictimer.c         |  51 ++++++++++++--
+ hw/timer/mips_gictimer.c         |  50 ++++++++++++--
  include/exec/icache-shadow.h     |  54 +++++++++++++++
  include/hw/timer/mips_gictimer.h |   1 +
  target/mips/cpu-defs.c.inc       | 107 +++++++++++++++++++++++++++++
  target/mips/tcg/translate.c      |  69 +++++++++++++------
- 7 files changed, 370 insertions(+), 27 deletions(-)
+ 7 files changed, 369 insertions(+), 27 deletions(-)
  create mode 100644 include/exec/icache-shadow.h
 
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
@@ -174,7 +174,7 @@ index 034f2f3..6bfd3dd 100644
  }
  
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
-index 2b0696d..e9f7bf4 100644
+index 2b0696d..ffad82b 100644
 --- a/hw/timer/mips_gictimer.c
 +++ b/hw/timer/mips_gictimer.c
 @@ -10,11 +10,35 @@
@@ -215,7 +215,7 @@ index 2b0696d..e9f7bf4 100644
  }
  
  static void gic_vptimer_update(MIPSGICTimerState *gictimer,
-@@ -23,9 +47,22 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -23,9 +47,21 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
      uint64_t next;
      uint32_t wait;
  
@@ -227,8 +227,7 @@ index 2b0696d..e9f7bf4 100644
 +     * then sees an interrupt it can never acknowledge and spins forever with
 +     * Cause.IP2 stuck high.
 +     */
-+    if (gictimer->vptimers[vp_index].comparelo == 0xffffffff &&
-+        !getenv("MT7621_GICTIMER_LEGACY")) {
++    if (gictimer->vptimers[vp_index].comparelo == 0xffffffff) {
 +        timer_del(gictimer->vptimers[vp_index].qtimer);
 +        return;
 +    }
@@ -240,7 +239,7 @@ index 2b0696d..e9f7bf4 100644
  
      timer_mod(gictimer->vptimers[vp_index].qtimer, next);
  }
-@@ -64,7 +101,7 @@ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
+@@ -64,7 +100,7 @@ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
                  gic_vptimer_expire(gictimer, i, now);
              }
          }
@@ -249,7 +248,7 @@ index 2b0696d..e9f7bf4 100644
      }
  }
  
-@@ -78,7 +115,7 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
+@@ -78,7 +114,7 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
      } else {
          /* Store new count register */
          now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -258,7 +257,7 @@ index 2b0696d..e9f7bf4 100644
          /* Update timer timer */
          for (i = 0; i < gictimer->num_vps; i++) {
              gic_vptimer_update(gictimer, i, now);
-@@ -118,7 +155,7 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+@@ -118,7 +154,7 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
      gictimer->countstop = 1;
      /* Store the current value */
      gictimer->sh_counterlo +=
@@ -340,7 +339,7 @@ index c7ca6c8..17d71dc 100644
  uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gic);
  void mips_gictimer_store_sh_count(MIPSGICTimerState *gic, uint64_t count);
 diff --git a/target/mips/cpu-defs.c.inc b/target/mips/cpu-defs.c.inc
-index d93b9d3..26ad941 100644
+index d93b9d3..243c806 100644
 --- a/target/mips/cpu-defs.c.inc
 +++ b/target/mips/cpu-defs.c.inc
 @@ -18,6 +18,39 @@
@@ -361,23 +360,23 @@ index d93b9d3..26ad941 100644
 + *
 + * Overridable for bring-up testing.
 + */
-+#ifndef MT7621_CACHE_IS
-+#define MT7621_CACHE_IS 2
++#ifndef MIPS_1004KC_CACHE_IS
++#define MIPS_1004KC_CACHE_IS 2
 +#endif
-+#ifndef MT7621_CACHE_IL
-+#define MT7621_CACHE_IL 4
++#ifndef MIPS_1004KC_CACHE_IL
++#define MIPS_1004KC_CACHE_IL 4
 +#endif
-+#ifndef MT7621_CACHE_IA
-+#define MT7621_CACHE_IA 3
++#ifndef MIPS_1004KC_CACHE_IA
++#define MIPS_1004KC_CACHE_IA 3
 +#endif
-+#ifndef MT7621_CACHE_DS
-+#define MT7621_CACHE_DS 2
++#ifndef MIPS_1004KC_CACHE_DS
++#define MIPS_1004KC_CACHE_DS 2
 +#endif
-+#ifndef MT7621_CACHE_DL
-+#define MT7621_CACHE_DL 4
++#ifndef MIPS_1004KC_CACHE_DL
++#define MIPS_1004KC_CACHE_DL 4
 +#endif
-+#ifndef MT7621_CACHE_DA
-+#define MT7621_CACHE_DA 3
++#ifndef MIPS_1004KC_CACHE_DA
++#define MIPS_1004KC_CACHE_DA 3
 +#endif
 +
  /* CPU / CPU family specific config register values. */
@@ -408,10 +407,10 @@ index d93b9d3..26ad941 100644
 +         * cache-flush routines for 16/32/64/128-byte lines.
 +         */
 +        .CP0_Config1 = MIPS_CONFIG1 | (1 << CP0C1_FP) | (63 << CP0C1_MMU) |
-+                       (MT7621_CACHE_IS << CP0C1_IS) | (MT7621_CACHE_IL << CP0C1_IL) |
-+                       (MT7621_CACHE_IA << CP0C1_IA) |
-+                       (MT7621_CACHE_DS << CP0C1_DS) | (MT7621_CACHE_DL << CP0C1_DL) |
-+                       (MT7621_CACHE_DA << CP0C1_DA) |
++                       (MIPS_1004KC_CACHE_IS << CP0C1_IS) | (MIPS_1004KC_CACHE_IL << CP0C1_IL) |
++                       (MIPS_1004KC_CACHE_IA << CP0C1_IA) |
++                       (MIPS_1004KC_CACHE_DS << CP0C1_DS) | (MIPS_1004KC_CACHE_DL << CP0C1_DL) |
++                       (MIPS_1004KC_CACHE_DA << CP0C1_DA) |
 +                       (1 << CP0C1_CA),
 +        .CP0_Config2 = MIPS_CONFIG2,
 +        /*

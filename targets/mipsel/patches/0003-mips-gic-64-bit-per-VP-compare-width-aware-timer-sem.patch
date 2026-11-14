@@ -1,4 +1,4 @@
-From 51a7dfdf6f6f49587424545b7839b5d62b12c60d Mon Sep 17 00:00:00 2001
+From 3401287bf2fa35f7a2a6d6f557ff45aab172a886 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 16:46:50 +0200
 Subject: [PATCH 3/3] mips-gic: 64-bit per-VP compare, width-aware timer
@@ -13,16 +13,16 @@ Subject: [PATCH 3/3] mips-gic: 64-bit per-VP compare, width-aware timer
 * counter-bits is a device property (default 0 = 32-bit) and the user-mode
   visible counter reports the same width as the shared one.
 
-mt7621: set counter-bits=8 (hardware), keep MT7621_GIC_COUNTER_BITS and
-MT7621_CPU_PLL as experiment knobs only.
+mt7621: set counter-bits=8 (hardware), keep the machine-level counter-bits and
+the PLL as experiment knobs only.
 
 (cherry picked from commit 6bc283dfc7d8345608f0c0085c1e6895cfff6283)
 ---
- hw/intc/mips_gic.c               |  41 +++++++-----
- hw/timer/mips_gictimer.c         | 108 ++++++++++++++++++++++++++-----
- include/hw/intc/mips_gic.h       |   7 ++
- include/hw/timer/mips_gictimer.h |   8 ++-
- 4 files changed, 131 insertions(+), 33 deletions(-)
+ hw/intc/mips_gic.c               | 41 +++++++++------
+ hw/timer/mips_gictimer.c         | 90 ++++++++++++++++++++++++++------
+ include/hw/intc/mips_gic.h       |  7 +++
+ include/hw/timer/mips_gictimer.h |  8 ++-
+ 4 files changed, 113 insertions(+), 33 deletions(-)
 
 diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
 index 989c2a9..2844f4e 100644
@@ -126,7 +126,7 @@ index 989c2a9..2844f4e 100644
  
  static void mips_gic_class_init(ObjectClass *klass, const void *data)
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
-index 395e7f6..1b0f2aa 100644
+index 9a1f37a..0f6e50f 100644
 --- a/hw/timer/mips_gictimer.c
 +++ b/hw/timer/mips_gictimer.c
 @@ -41,6 +41,15 @@ static uint64_t gictimer_ns(uint64_t ticks)
@@ -154,19 +154,18 @@ index 395e7f6..1b0f2aa 100644
  
      /*
       * 0xffffffff is the reset value of the compare register and means "not
-@@ -64,17 +73,60 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -64,12 +73,44 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
       * then sees an interrupt it can never acknowledge and spins forever with
       * Cause.IP2 stuck high.
       */
--    if (gictimer->vptimers[vp_index].comparelo == 0xffffffff &&
+-    if (gictimer->vptimers[vp_index].comparelo == 0xffffffff) {
 +    /*
 +     * COMPARE_HI resets to 0 and COMPARE_LO to 0xffffffff, so a compare of
 +     * 0xffffffff means "not programmed" in both widths.  (All-ones in the
 +     * high half would turn every LO-only write into a deadline ~2^63 ticks
 +     * away.)
 +     */
-+    if (gictimer->vptimers[vp_index].compare == 0xffffffffULL &&
-         !getenv("MT7621_GICTIMER_LEGACY")) {
++    if (gictimer->vptimers[vp_index].compare == 0xffffffffULL) {
          timer_del(gictimer->vptimers[vp_index].qtimer);
          return;
      }
@@ -203,32 +202,7 @@ index 395e7f6..1b0f2aa 100644
  
      timer_mod(gictimer->vptimers[vp_index].qtimer, next);
  }
- 
-+static void gtc_log(const char *what, uint32_t vp, uint64_t a, uint64_t b)
-+{
-+    static int budget = 80;
-+
-+    if (!getenv("MT7621_GICCLOG") || budget-- <= 0) {
-+        return;
-+    }
-+    fprintf(stderr, "gicclog: %s vp%u %016" PRIx64 " %016" PRIx64 "\n",
-+            what, vp, a, b);
-+}
-+
- static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
-                                uint64_t now)
- {
-@@ -82,6 +134,9 @@ static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
-         /* timer stopped */
-         return;
-     }
-+    gtc_log("expire", vp_index,
-+            gictimer->vptimers[vp_index].compare,
-+            gictimer_count_raw(gictimer, now));
-     gictimer->cb(gictimer->opaque, vp_index);
-     gic_vptimer_update(gictimer, vp_index, now);
- }
-@@ -134,19 +189,10 @@ static void gictimer_reanchor(MIPSGICTimerState *gictimer, uint64_t count,
+@@ -133,19 +174,10 @@ static void gictimer_reanchor(MIPSGICTimerState *gictimer, uint64_t count,
      }
  }
  
@@ -249,7 +223,7 @@ index 395e7f6..1b0f2aa 100644
  
      gictimer_reanchor(gictimer,
                        (cur & 0xffffffffULL) | ((uint64_t)hi << 32), now);
-@@ -155,7 +201,7 @@ void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gictimer, uint32_t hi)
+@@ -154,7 +186,7 @@ void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gictimer, uint32_t hi)
  void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
  {
      uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -258,7 +232,7 @@ index 395e7f6..1b0f2aa 100644
  
      /* A 32-bit write replaces the low half and leaves the high half alone. */
      gictimer_reanchor(gictimer,
-@@ -165,13 +211,41 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
+@@ -164,13 +196,37 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
  uint32_t mips_gictimer_get_vp_compare(MIPSGICTimerState *gictimer,
                                        uint32_t vp_index)
  {
@@ -282,8 +256,6 @@ index 395e7f6..1b0f2aa 100644
                                      uint32_t vp_index, uint64_t compare)
  {
 -    gictimer->vptimers[vp_index].comparelo = (uint32_t) compare;
-+    gtc_log("cmp-lo", vp_index, compare & 0xffffffffULL,
-+            gictimer_count_raw(gictimer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
 +    gictimer->vptimers[vp_index].compare =
 +        (gictimer->vptimers[vp_index].compare & ~0xffffffffULL) |
 +        (compare & 0xffffffffULL);
@@ -294,8 +266,6 @@ index 395e7f6..1b0f2aa 100644
 +void mips_gictimer_store_vp_compare_hi(MIPSGICTimerState *gictimer,
 +                                       uint32_t vp_index, uint32_t hi)
 +{
-+    gtc_log("cmp-hi", vp_index, hi,
-+            gictimer_count_raw(gictimer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
 +    gictimer->vptimers[vp_index].compare =
 +        (gictimer->vptimers[vp_index].compare & 0xffffffffULL) |
 +        ((uint64_t)hi << 32);

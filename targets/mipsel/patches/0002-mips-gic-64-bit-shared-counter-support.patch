@@ -1,4 +1,4 @@
-From 9398ac4923557eaef516f8445bcae2fbc9d07bd1 Mon Sep 17 00:00:00 2001
+From bf3a7f5a2d811c7d3f0158203adfb6e3607d2992 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 15:59:05 +0200
 Subject: [PATCH 2/3] mips-gic: 64-bit shared counter support
@@ -63,7 +63,7 @@ index 0c50ba4..989c2a9 100644
                       (gic->num_vps << GIC_SH_CONFIG_PVPS_SHF);
      for (i = 0; i < gic->num_vps; i++) {
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
-index e9f7bf4..395e7f6 100644
+index ffad82b..9a1f37a 100644
 --- a/hw/timer/mips_gictimer.c
 +++ b/hw/timer/mips_gictimer.c
 @@ -41,6 +41,15 @@ static uint64_t gictimer_ns(uint64_t ticks)
@@ -82,7 +82,7 @@ index e9f7bf4..395e7f6 100644
  static void gic_vptimer_update(MIPSGICTimerState *gictimer,
                                     uint32_t vp_index, uint64_t now)
  {
-@@ -60,8 +69,7 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -59,8 +68,7 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
          timer_del(gictimer->vptimers[vp_index].qtimer);
          return;
      }
@@ -92,7 +92,7 @@ index e9f7bf4..395e7f6 100644
      next = now + gictimer_ns((uint64_t)wait);
  
      timer_mod(gictimer->vptimers[vp_index].qtimer, next);
-@@ -86,41 +94,72 @@ static void gic_vptimer_cb(void *opaque)
+@@ -85,41 +93,72 @@ static void gic_vptimer_cb(void *opaque)
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
  }
  
@@ -188,7 +188,7 @@ index e9f7bf4..395e7f6 100644
  }
  
  uint32_t mips_gictimer_get_vp_compare(MIPSGICTimerState *gictimer,
-@@ -144,8 +183,13 @@ uint8_t mips_gictimer_get_countstop(MIPSGICTimerState *gictimer)
+@@ -143,8 +182,13 @@ uint8_t mips_gictimer_get_countstop(MIPSGICTimerState *gictimer)
  
  void mips_gictimer_start_count(MIPSGICTimerState *gictimer)
  {
@@ -203,7 +203,7 @@ index e9f7bf4..395e7f6 100644
  }
  
  void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
-@@ -154,8 +198,8 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+@@ -153,8 +197,8 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
  
      gictimer->countstop = 1;
      /* Store the current value */

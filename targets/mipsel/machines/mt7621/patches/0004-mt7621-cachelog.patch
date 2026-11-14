@@ -1,8 +1,7 @@
-From 0f7875ffe4dd2192069f30fc88068051a13462b9 Mon Sep 17 00:00:00 2001
+From d68c5c1388ffe4ec27e282663014669fcbbe18da Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
-Date: Thu, 12 Nov 2026 02:42:36 +0200
-Subject: [PATCH] mt7621: NFI 0xEC, default-on CMGCR/CMGIC/RX_LSO, DL + CACHLOG
- knobs
+Date: Sat, 14 Nov 2026 19:11:26 +0200
+Subject: [PATCH 3/3] mt7621: cache-op logging (MT7621_CACHLOG)
 
 ---
  target/mips/tcg/system/special_helper.c | 10 ++++++++++

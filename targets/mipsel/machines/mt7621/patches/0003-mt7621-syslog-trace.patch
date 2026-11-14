@@ -1,11 +1,8 @@
-From cccae4c8cadec8c83ef5994caa0a7dea02acdaba Mon Sep 17 00:00:00 2001
+From 194deaab13c54ba8aa0f8b2ccab4e3b580a0a6b2 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
-Date: Thu, 12 Nov 2026 01:42:11 +0200
-Subject: [PATCH] mt7621: MT7621_SYSLOG trace (syscalls + read buffers)
+Date: Sat, 14 Nov 2026 19:11:26 +0200
+Subject: [PATCH 2/3] mt7621: syscall tracing (MT7621_SYSLOG)
 
-Restores the diagnostic that was lost when the QEMU-side working tree was
-reset: logs open/mount/stat/ioctl/mknod/symlink with decoded string arguments,
-plus small read() buffers and the return value.
 ---
  target/mips/tcg/system/special_helper.c |   2 +-
  target/mips/tcg/system/tlb_helper.c     | 108 ++++++++++++++++++++++++
