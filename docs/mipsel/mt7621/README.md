@@ -38,5 +38,7 @@ tests/mipsel/mt7621/net-ping.sh <dump> <guest-ip>
 
 - `../../machines.md` — the machine source layout conventions (blocks,
   interface headers, the move recipe); `ipq4019` is the worked example.
+- `modularisation.md` — the split plan and mt7621-specific cautions for
+  whoever moves it next (ipq4019 is the worked example).
 - `model-quirks.md` — emulator gaps and the deliberate deviations.
 - `nand-images.md` — flat dumps vs full-die images and persistence.

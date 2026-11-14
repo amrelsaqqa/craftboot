@@ -15,7 +15,8 @@ sit on the MDIO bus).  That split is the reason a machine is not one file:
 `ipq4019` is the **worked example** (eleven modules, `ipq4019.c` down from
 11.8k to 2.2k lines).  This document is the rule set extracted from that work,
 kept generic so the other machines can be moved the same way; `mt7621` is the
-next one to apply it to.
+next one to apply it to (its own notes are in
+`docs/mipsel/mt7621/modularisation.md`).
 
 ### The worked example: ipq4019
 
