@@ -1,4 +1,4 @@
-From 46a0976cb3e33c9591e37b0538e28d4f8d86022e Mon Sep 17 00:00:00 2001
+From 6bc283dfc7d8345608f0c0085c1e6895cfff6283 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 16:46:50 +0200
 Subject: [PATCH 5/5] mips-gic: 64-bit per-VP compare, width-aware timer

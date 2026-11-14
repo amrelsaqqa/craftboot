@@ -1,4 +1,4 @@
-From 5dbacd68e59f8372cb177f1ddca87f716ac867f6 Mon Sep 17 00:00:00 2001
+From 57274c7403ae7e76948107ec34640b71a0dac9f7 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 15:59:05 +0200
 Subject: [PATCH 4/5] mips-gic: 64-bit shared counter support

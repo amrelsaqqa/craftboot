@@ -1,0 +1,40 @@
+From c59ce9b5e5b8a06328702c0dcac93c302686fe43 Mon Sep 17 00:00:00 2001
+From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
+Date: Sat, 14 Nov 2026 18:44:26 +0200
+Subject: [PATCH] mt7621: add the base machine hook
+
+CONFIG_MT7621, the machine file and the subdirectory that holds the generated
+module list.  The modules themselves are added by hw/mips/mt7621/meson.build,
+which prep generates from config.mk.
+---
+ hw/mips/Kconfig     | 6 ++++++
+ hw/mips/meson.build | 2 ++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/hw/mips/Kconfig b/hw/mips/Kconfig
+index b59cb2f..c922d8f 100644
+--- a/hw/mips/Kconfig
++++ b/hw/mips/Kconfig
+@@ -86,3 +86,9 @@ config MIPS_BOSTON
+ 
+ config FW_CFG_MIPS
+     bool
++
++config MT7621
++    bool
++    default y
++    depends on MIPS
++    select SERIAL_MM
+diff --git a/hw/mips/meson.build b/hw/mips/meson.build
+index 390f0fd..3153010 100644
+--- a/hw/mips/meson.build
++++ b/hw/mips/meson.build
+@@ -4,6 +4,8 @@ common_ss.add(when: 'CONFIG_FW_CFG_MIPS', if_true: files('fw_cfg.c'))
+ common_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_bootp.c'))
+ mips_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_virt.c'))
+ mips_ss.add(when: 'CONFIG_MALTA', if_true: files('malta.c'))
++mips_ss.add(when: 'CONFIG_MT7621', if_true: files('mt7621.c'))
++subdir('mt7621')
+ mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))
+ 
+ if 'CONFIG_TCG' in config_all_accel

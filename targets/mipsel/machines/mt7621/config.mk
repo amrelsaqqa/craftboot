@@ -14,14 +14,16 @@
 #   make build           copy only the pairs whose content changed, then ninja
 #   make sync            build's copy step without configure/prep: the fast
 #                        edit loop for one module
-#   make export-patches  run the same list backwards: the files are excluded
-#                        from the generated patch series and copied out of the
-#                        dev checkout (DEV=...) back into this directory
+#   make export-patches  regenerate the target series from the dev checkout
+#                        (DEV=...); these sources are excluded from it.  This
+#                        directory is their only source of truth -- nothing is
+#                        copied back.
 #
 # The copy is a real copy, not a symlink: the build tree is disposable and
 # prep makes it a git repository, so the machine sources appear there as
-# ordinary files.  Nothing in this directory is patched -- the series only
-# carries core changes plus the meson/Kconfig hunk that lists the .c files.
+# ordinary files.  Nothing in this directory is patched -- the target series
+# carries core changes only, and this machine's series carries the base hook
+# (Kconfig, the machine file, subdir); the module list is generated.
 #
 # When adding a file, add it here only: the module list in
 # hw/mips/mt7621/meson.build is generated from this list by prep/build/sync,

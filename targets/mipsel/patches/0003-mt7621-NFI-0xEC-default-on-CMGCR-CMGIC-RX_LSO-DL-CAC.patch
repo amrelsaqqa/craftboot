@@ -1,4 +1,4 @@
-From ead94a6484a9dbe602fc1bc2f5ea07cd73c3078b Mon Sep 17 00:00:00 2001
+From 0f7875ffe4dd2192069f30fc88068051a13462b9 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 02:42:36 +0200
 Subject: [PATCH 3/5] mt7621: NFI 0xEC, default-on CMGCR/CMGIC/RX_LSO, DL +

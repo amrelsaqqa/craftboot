@@ -1,4 +1,4 @@
-From 81c08dcbd06d2ebb051d37d029a3d199a3561c7c Mon Sep 17 00:00:00 2001
+From e1ea78699ec28a53e93c4512dac2073fcf317fd6 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 01:39:41 +0200
 Subject: [PATCH 1/5] mt7621: QEMU-side changes for the MT7621 machine
@@ -12,8 +12,6 @@ can be switched with git checkout instead of applying patches.
  accel/tcg/cputlb.c                      | 111 ++++++++++++++++++-
  accel/tcg/translator.c                  |   4 +
  hw/intc/mips_gic.c                      |  62 +++++++++++
- hw/mips/Kconfig                         |   6 +
- hw/mips/meson.build                     |   1 +
  hw/timer/mips_gictimer.c                |  72 ++++++++++--
  include/exec/icache-shadow.h            |  54 +++++++++
  include/hw/timer/mips_gictimer.h        |   1 +
@@ -22,7 +20,7 @@ can be switched with git checkout instead of applying patches.
  target/mips/tcg/system/tlb_helper.c     | 139 +++++++++++++++++++++++-
  target/mips/tcg/system_helper.h.inc     |   1 +
  target/mips/tcg/translate.c             |  69 ++++++++----
- 14 files changed, 658 insertions(+), 28 deletions(-)
+ 12 files changed, 651 insertions(+), 28 deletions(-)
  create mode 100644 include/exec/icache-shadow.h
 
 diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
@@ -357,32 +355,6 @@ index 0c50ba4..42ef79e 100644
          /* Mask/Enabled Checks */
          OFFSET_CHECK(intr < gic->num_irq);
          if (data & GIC_SH_WEDGE_RW_MSK) {
-diff --git a/hw/mips/Kconfig b/hw/mips/Kconfig
-index b59cb2f..c922d8f 100644
---- a/hw/mips/Kconfig
-+++ b/hw/mips/Kconfig
-@@ -86,3 +86,9 @@ config MIPS_BOSTON
- 
- config FW_CFG_MIPS
-     bool
-+
-+config MT7621
-+    bool
-+    default y
-+    depends on MIPS
-+    select SERIAL_MM
-diff --git a/hw/mips/meson.build b/hw/mips/meson.build
-index 390f0fd..2f2fba7 100644
---- a/hw/mips/meson.build
-+++ b/hw/mips/meson.build
-@@ -4,6 +4,7 @@ common_ss.add(when: 'CONFIG_FW_CFG_MIPS', if_true: files('fw_cfg.c'))
- common_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_bootp.c'))
- mips_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_virt.c'))
- mips_ss.add(when: 'CONFIG_MALTA', if_true: files('malta.c'))
-+mips_ss.add(when: 'CONFIG_MT7621', if_true: files('mt7621.c'))
- mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))
- 
- if 'CONFIG_TCG' in config_all_accel
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
 index 2b0696d..1b9d359 100644
 --- a/hw/timer/mips_gictimer.c
