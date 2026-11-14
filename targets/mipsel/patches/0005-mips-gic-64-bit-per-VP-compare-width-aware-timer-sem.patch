@@ -1,5 +1,5 @@
-From 3e4dd78868f17fccd4230b0ca9751e72a898b8ac Mon Sep 17 00:00:00 2001
-From: agent <agent@local>
+From 46a0976cb3e33c9591e37b0538e28d4f8d86022e Mon Sep 17 00:00:00 2001
+From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 16:46:50 +0200
 Subject: [PATCH 5/6] mips-gic: 64-bit per-VP compare, width-aware timer
  semantics

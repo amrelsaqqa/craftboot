@@ -1,4 +1,4 @@
-From 26f4b452eaa29d07a6bffff86db3d1f2439c8fc7 Mon Sep 17 00:00:00 2001
+From 8ea48a7950e8bbee29aaac169342224acf67f713 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Sat, 14 Nov 2026 17:36:49 +0200
 Subject: [PATCH 6/6] mt7621: split the machine into modules
