@@ -2,9 +2,11 @@
 
 **Status: in progress on `refactor/mt7621-modules`.**  Out so far:
 `modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
-register-file ops plus the GPIO semantics inside it) and `modules/wdt.c`
-(timer 1 of the system controller).  `mt7621.c` is down to 5,013 lines.
-Every step passed check-patches, a fresh prep + build and boot-smoke.
+register-file ops plus the GPIO semantics inside it), `modules/wdt.c` (timer 1
+of the system controller), `modules/systick.c` (cevt-systick, its timers and
+the boot hand-over) and `modules/board.c` (presets, aliases, image probe and
+`chip_mode`).  `mt7621.c` is down to 4,743 lines.  Every step passed
+check-patches, a fresh prep + build, boot-smoke 3/3 and net-ping 5/5.
 
 Two moves are not quite the pure moves the plan assumed:
 
@@ -17,8 +19,8 @@ Two moves are not quite the pure moves the plan assumed:
   `wdt_rst_cause` is still consumed by the machine's reset path, so only the
   timer and ops moved.
 
-Next, in order: systick (`mt7621_systick_ops` plus its timers), SPI NOR,
-NAND, board presets, then PDMA/QDMA and the switch glue.
+Next, in order: SPI NOR (controller + die), the MTK NAND controller and its
+die, then PDMA/QDMA and the switch glue as one subsystem.
 
 The split of the IPQ4019 machine is the worked example for this.  Read
 `docs/machines.md` first -- it has the conventions, the move recipe, the
