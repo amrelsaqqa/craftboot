@@ -1,7 +1,7 @@
 From 81c08dcbd06d2ebb051d37d029a3d199a3561c7c Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 01:39:41 +0200
-Subject: [PATCH 1/6] mt7621: QEMU-side changes for the MT7621 machine
+Subject: [PATCH 1/5] mt7621: QEMU-side changes for the MT7621 machine
 
 Working-tree additions that used to live only in qemu-mt7621.patch:
 instruction-cache shadow, GIC/gictimer adjustments, CP0 Def/config

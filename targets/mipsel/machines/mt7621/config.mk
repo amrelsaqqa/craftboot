@@ -44,5 +44,8 @@ mt7621_MACHINE_SRCS := \
     modules/crypto.c:hw/mips/mt7621/crypto.c \
     modules/dump.c:hw/mips/mt7621/dump.c \
     modules/loader.c:hw/mips/mt7621/loader.c
+# The meson file inside this directory's hw/mips/mt7621/ destination is
+# generated from mt7621_MACHINE_SRCS by prep, not kept in the repository; the
+# machine's one-line hook (series, patches/) only enters the subdirectory.
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model

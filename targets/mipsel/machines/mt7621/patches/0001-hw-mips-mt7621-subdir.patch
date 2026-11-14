@@ -1,0 +1,23 @@
+From 0d4f76790afe0702944cc168c65f48273a0910f9 Mon Sep 17 00:00:00 2001
+From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
+Date: Sat, 14 Nov 2026 18:08:30 +0200
+Subject: [PATCH] mt7621: enter the module subdirectory
+
+The machine's module list is generated into hw/mips/mt7621/meson.build from
+config.mk during prep, so the hook only has to enter it.
+---
+ hw/mips/meson.build | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/mips/meson.build b/hw/mips/meson.build
+index 2f2fba7..3153010 100644
+--- a/hw/mips/meson.build
++++ b/hw/mips/meson.build
+@@ -5,6 +5,7 @@ common_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_bootp.c'))
+ mips_ss.add(when: 'CONFIG_LOONGSON3V', if_true: files('loongson3_virt.c'))
+ mips_ss.add(when: 'CONFIG_MALTA', if_true: files('malta.c'))
+ mips_ss.add(when: 'CONFIG_MT7621', if_true: files('mt7621.c'))
++subdir('mt7621')
+ mips_ss.add(when: 'CONFIG_MIPS_CPS', if_true: files('cps.c'))
+ 
+ if 'CONFIG_TCG' in config_all_accel

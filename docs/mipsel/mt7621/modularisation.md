@@ -71,18 +71,21 @@ is specific to mt7621.
 
 ## What the split has hit so far
 
-- The `meson.build` stanza that lists the machine's sources lives in the
-  *target* series (`targets/mipsel/patches/0001-...`), not in a machine hook
-  patch as on ipq4019.  While the split was in progress a temporary machine
-  patch rewrote it; that patch is gone.  The dev branch now carries a
-  `mt7621: split the machine into modules` commit whose only series-visible
-  change is the stanza, so the series has six patches and the last one is
-  `0006-mt7621-split-the-machine-into-modules.patch`.  `export-patches`
-  reproduces it exactly -- nothing is hand-maintained any more.
+- **The build hook is per machine.**  `target/0001` adds only
+  `files('mt7621.c')`; the machine's own one-line patch,
+  `machines/mt7621/patches/0001-hw-mips-mt7621-subdir.patch`, adds
+  `subdir('mt7621')`, and the module list inside `hw/mips/mt7621/meson.build`
+  is generated from `mt7621_MACHINE_SRCS` during prep.  Nothing is
+  hand-maintained, and the target series is back to 0001-0005.
 
-  Syncing the dev branch is therefore part of this work, not an optional
-  cleanup: a fresh re-export from a single-file `mt7621-model` would drop the
-  module list.
+  This shape is required, not cosmetic: the target series is applied whether
+  or not a given machine is selected, so a second mipsel machine's stanza
+  there would reference sources that `prep` never copied for this build and
+  fail at configure time.  Machine series are applied only when selected.
+
+  Ordering constraint: `subdir('mt7621')` fails at configure until the
+  generator has written `hw/mips/mt7621/meson.build`.  Land the generator
+  first; the hook and the removal of the old target-series list follow.
 - `mt7621.h` lands in `hw/mips/mt7621/`, not `hw/mips/`: a module's
   `#include "mt7621.h"` resolves as its sibling, and the machine includes
   `"mt7621/mt7621.h"`.  This is the ipq4019 layout (`hw/arm/ipq4019/ipq4019.h`).
