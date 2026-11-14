@@ -2,7 +2,9 @@
 
 **Status: in progress on `refactor/mt7621-modules`.**  The Ethernet subsystem
 is out (`modules/eth.c`, 1,456 lines, plus the private `modules/eth.h`), which
-was the largest block.  `mt7621.c` is down to 2,116 lines from 5,469.
+was the largest block; so are the CM/CPC (`modules/cm.c`) and the EIP-93
+crypto engine (`modules/crypto.c`).  `mt7621.c` is down to 1,729 lines from
+5,469.
 
 Out so far:
 `modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
@@ -25,10 +27,12 @@ Two moves are not quite the pure moves the plan assumed:
   `wdt_rst_cause` is still consumed by the machine's reset path, so only the
   timer and ops moved.
 
-Next: the CM/CPC block (GCR + CPC, `mt7621_cm_read/write`, core start/reset),
-the EIP-93 crypto engine, and the loader (uImage/ELF) if it still wants its own
-file.  The debug knobs (guest code patcher, RAM dump/window) are candidates for
-a `dump.c` like ipq4019's.
+What is left in `mt7621.c` is the machine proper (memory map, RAM/alias
+windows, boot stages, reset sequencing, `-M` properties) plus three candidates
+for further moves: the uImage/ELF loader, the NAND attach (`-drive
+if=none,id=nand`, which belongs with `modules/nand.c`) and the debug knobs
+(guest code patcher, RAM dump/window) -- the last group is a `dump.c` in the
+ipq4019 shape.
 
 Notes from the Ethernet move, since it is the pattern for a subsystem:
 
