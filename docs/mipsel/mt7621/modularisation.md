@@ -65,9 +65,12 @@ is specific to mt7621.
   `mt7621.c:hw/mips/mt7621.c`.  Add a module by adding a pair:
   `modules/uart.c:hw/mips/mt7621/uart.c` (the directory is created by the
   copy rule).
-- The build system (`prep`, `build`, `sync`, `export-patches`) already
-  supports several sources per machine; the hook patch's `meson.build` hunk
-  must list each new `.c`.
+- The build system (`prep`, `build`, `sync`, `export-patches`) supports
+  several sources per machine.  `hw/mips/mt7621/meson.build` is **generated**
+  from `mt7621_MACHINE_SRCS` by `tools/machine-meson.sh`; the two variables it
+  reads are `mt7621_MACHINE_SS` (the meson source set, `mips_ss` here) and
+  `mt7621_MACHINE_SUBDIR` (`hw/mips/mt7621`).  Adding a module means editing
+  `config.mk` only -- headers are copied but never listed.
 
 ## What the split has hit so far
 
@@ -75,8 +78,9 @@ is specific to mt7621.
   `files('mt7621.c')`; the machine's own one-line patch,
   `machines/mt7621/patches/0001-hw-mips-mt7621-subdir.patch`, adds
   `subdir('mt7621')`, and the module list inside `hw/mips/mt7621/meson.build`
-  is generated from `mt7621_MACHINE_SRCS` during prep.  Nothing is
-  hand-maintained, and the target series is back to 0001-0005.
+  is generated from `mt7621_MACHINE_SRCS` (see `mt7621_MACHINE_SS` and
+  `mt7621_MACHINE_SUBDIR`) during prep.  Nothing is hand-maintained, and the
+  target series is back to 0001-0005.
 
   This shape is required, not cosmetic: the target series is applied whether
   or not a given machine is selected, so a second mipsel machine's stanza

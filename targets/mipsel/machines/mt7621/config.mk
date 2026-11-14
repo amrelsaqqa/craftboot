@@ -23,8 +23,9 @@
 # ordinary files.  Nothing in this directory is patched -- the series only
 # carries core changes plus the meson/Kconfig hunk that lists the .c files.
 #
-# When adding a file, add it here *and* to that hook patch's files(...) list.
-# An entry missing here means the build silently keeps the previous copy.
+# When adding a file, add it here only: the module list in
+# hw/mips/mt7621/meson.build is generated from this list by prep/build/sync,
+# and the machine hook patch is static (it only does subdir('mt7621')).
 #
 # One machine, many files: the machine itself plus one module per controller.
 # The layout conventions (and the copy rules above) are in docs/machines.md.
@@ -44,8 +45,11 @@ mt7621_MACHINE_SRCS := \
     modules/crypto.c:hw/mips/mt7621/crypto.c \
     modules/dump.c:hw/mips/mt7621/dump.c \
     modules/loader.c:hw/mips/mt7621/loader.c
-# The meson file inside this directory's hw/mips/mt7621/ destination is
-# generated from mt7621_MACHINE_SRCS by prep, not kept in the repository; the
-# machine's one-line hook (series, patches/) only enters the subdirectory.
+# hw/mips/mt7621/meson.build is generated from mt7621_MACHINE_SRCS by
+# prep/build/sync; these are the two things the generator needs.  The machine's
+# hook patch is static and only does subdir('mt7621').
+mt7621_MACHINE_SS     := mips_ss
+mt7621_MACHINE_SUBDIR := hw/mips/mt7621
+
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model
