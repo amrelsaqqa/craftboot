@@ -55,6 +55,33 @@ hardware (the pointer returned by the first 0x400 DMA allocation, and
 `Dl = 2` and `MT7621_DL` overrides it for experiments. U-Boot and RouterBOOT
 are unaffected: both boot this model at `Dl = 4`.
 
+## 1b. Clocks: crystal and DDR/bus decode
+
+Real boards (a K2P log Breed 1.2 prints) report `CPU 880, DDR 1200, Bus 293,
+Ref 40`.  The model now matches the first and last of those: SYSCFG0[8:6] is 4
+(40 MHz crystal, per clk-mt7621's 0-2 = 20 MHz, 3-5 = 40 MHz, 6-7 = 25 MHz) and
+the CPU PLL in MEMC 0x648 is FBDIV 21 / PREDIV 0, i.e. `(21 + 1) * 40 / 2^0 =
+880 MHz`.
+
+Two decodes are still wrong, and they come from registers whose real values are
+not known:
+
+- **DDR** is derived from MEMC 0x618 (`0x64 -> 960`, `0x78 -> 1120`,
+  `0x80 -> 1280`, `0x96 -> 1440`, `0x190 -> 4000` MHz with a 40 MHz reference;
+  the multiplier is `(v >> 2) & ~3`).  The model ships 0x190, inherited from
+  before the crystal was fixed, which is why Breed prints `DDR: 4000MHz`.
+  Landing 1200 needs the real board's 0x618 value.
+- **Bus** decodes as `CPU / 4` here (220 MHz at 880), while the K2P log shows
+  `CPU / 3` (293).  The divider is not in `CLKCFG0` bits 8-9 or `CUR_CLK_STS`
+  (both measured); the real board's `CLKCFG0` must select it.
+
+`CUR_CLK_STS` itself is decoded: bits 1:0 multiply the CPU clock and bits 9:8
+divide it (`0x101 -> 880`, `0x102 -> 1760`, `0x201 -> 440`, `0x301 -> 293`).
+
+All of these are reachable at run time for further measurements:
+`MT7621_MEMC604`, `MT7621_MEMC618`, `MT7621_DDR_PLL`, `MT7621_CLKCFG` and
+`MT7621_CLKSTS`.
+
 ## 2. DSA receive path: `fport` encoding and the delayed RX interrupt
 
 The frame engine fills RX descriptor word 3 with the receiving port, and the
