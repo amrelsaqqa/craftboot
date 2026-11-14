@@ -1,6 +1,56 @@
 # Splitting the mt7621 machine: notes for the next agent
 
-**Status: not started.  `mt7621.c` is untouched (one 5,469-line file).**
+**Status: in progress on `refactor/mt7621-modules`.**  The Ethernet subsystem
+is out (`modules/eth.c`, 1,456 lines, plus the private `modules/eth.h`), which
+was the largest block; so are the CM/CPC (`modules/cm.c`) and the EIP-93
+crypto engine (`modules/crypto.c`).  The loader (`modules/loader.c`), the
+NAND attach (`modules/nand.c`) and the debug knobs (`modules/dump.c`) followed.
+`mt7621.c` is **1,082 lines from 5,469** -- below ipq4019's 2,244 for the same
+kind of machine.
+
+Out so far:
+`modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
+register-file ops plus the GPIO semantics inside it), `modules/wdt.c` (timer 1
+of the system controller), `modules/systick.c` (cevt-systick, its timers and
+the boot hand-over), `modules/board.c` (presets, aliases, image probe and
+`chip_mode`), `modules/flash.c` (SPI NOR controller + W25Q128FV die) and
+`modules/nand.c` (NFI + K9F1G08U0B die, dump loader, persistence).
+Every step passed check-patches, a fresh prep + build, boot-smoke 3/3 and
+net-ping 5/5 (the tap is now usable on this host).
+
+Two moves are not quite the pure moves the plan assumed:
+
+- **GPIO is not a leaf.**  It has no register window of its own; its direction
+  masking and DSET/DCLR handling live inside the sysctl register file, which
+  the DRAM controller page also uses.  So the move took the shared
+  `mt7621_reg_ops` (exported in the header) rather than inventing a GPIO
+  `MemoryRegionOps`.
+- **Watchdog resets are a machine decision.**  The module arms and fires;
+  `wdt_rst_cause` is still consumed by the machine's reset path, so only the
+  timer and ops moved.
+
+What is left in `mt7621.c` is the machine proper: memory map, RAM and KSEG1
+alias windows, boot stages, reset sequencing, `-M` properties and the
+command-line injection knob.  The split is structurally done; further work
+would be ripple (splitting `sysctl_defaults`/`dramc_defaults` out of the
+machine, say), not structure.
+
+Notes from the Ethernet move, since it is the pattern for a subsystem:
+
+- Private register maps go in `modules/<block>.h` when there are many (109
+  lines of ETH/PDMA/QDMA/TX_DMA/RX_DMA bits here); the machine must not see
+  them.
+- Two machine entry points fell out naturally: `mt7621_eth_init()` (port
+  selection, NIC, MMIO + SRAM windows, nitest timer) and
+  `mt7621_eth_dev_reset()` (ring state, switch/PHY defaults).  Reset was the
+  only place the machine touched the frame engine directly.
+- Definition order inside the new file matters: `phy/switch defaults` call
+  `mt7621_sw_word()`, so they must come after it, not before.
+
+Two more interface notes from this round: `mt7621_pwrite_all()` had to become
+public because the machine's NAND flush uses the same helper, and both die
+loaders stay callable from machine init (`mt7621_nand_load()`), since `-kernel`
+is what fills them.
 
 The split of the IPQ4019 machine is the worked example for this.  Read
 `docs/machines.md` first -- it has the conventions, the move recipe, the
@@ -18,6 +68,18 @@ is specific to mt7621.
 - The build system (`prep`, `build`, `sync`, `export-patches`) already
   supports several sources per machine; the hook patch's `meson.build` hunk
   must list each new `.c`.
+
+## What the split has hit so far
+
+- The `meson.build` stanza that lists `mt7621.c` lives in the *target* series
+  (`targets/mipsel/patches/0001-...`), not in a machine hook patch as on
+  ipq4019.  Rather than hand-editing a generated patch, the machine carries
+  `patches/0001-hw-mips-meson-list-modules.patch` (and `series`) that rewrites
+  the stanza.  Fold it into the dev branch on the next `export-patches`, then
+  the machine series can go away.
+- `mt7621.h` lands in `hw/mips/mt7621/`, not `hw/mips/`: a module's
+  `#include "mt7621.h"` resolves as its sibling, and the machine includes
+  `"mt7621/mt7621.h"`.  This is the ipq4019 layout (`hw/arm/ipq4019/ipq4019.h`).
 - Tests: `tests/mipsel/mt7621/boot-smoke.sh <image> [seconds]` checks the
   console banners; `tests/mipsel/mt7621/net-ping.sh <image> <guest-ip>`
   verifies the Ethernet path.  Run both after any move that touches flash,

@@ -26,8 +26,23 @@
 # When adding a file, add it here *and* to that hook patch's files(...) list.
 # An entry missing here means the build silently keeps the previous copy.
 #
-# One file today; the layout conventions (and the copy rules above) are in
-# docs/machines.md.
-mt7621_MACHINE_SRCS := mt7621.c:hw/mips/mt7621.c
+# One machine, many files: the machine itself plus one module per controller.
+# The layout conventions (and the copy rules above) are in docs/machines.md.
+mt7621_MACHINE_SRCS := \
+    mt7621.c:hw/mips/mt7621.c \
+    mt7621.h:hw/mips/mt7621/mt7621.h \
+    modules/uart.c:hw/mips/mt7621/uart.c \
+    modules/regfile.c:hw/mips/mt7621/regfile.c \
+    modules/wdt.c:hw/mips/mt7621/wdt.c \
+    modules/systick.c:hw/mips/mt7621/systick.c \
+    modules/board.c:hw/mips/mt7621/board.c \
+    modules/flash.c:hw/mips/mt7621/flash.c \
+    modules/nand.c:hw/mips/mt7621/nand.c \
+    modules/eth.c:hw/mips/mt7621/eth.c \
+    modules/eth.h:hw/mips/mt7621/eth.h \
+    modules/cm.c:hw/mips/mt7621/cm.c \
+    modules/crypto.c:hw/mips/mt7621/crypto.c \
+    modules/dump.c:hw/mips/mt7621/dump.c \
+    modules/loader.c:hw/mips/mt7621/loader.c
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model
