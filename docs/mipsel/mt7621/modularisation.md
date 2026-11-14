@@ -1,10 +1,24 @@
 # Splitting the mt7621 machine: notes for the next agent
 
-**Status: in progress on `refactor/mt7621-modules`.**  `mt7621.h` exists (machine
-type, board enum, sizes, `struct MT7621State`), and `modules/uart.c` is out:
-the TX-only 16550 mirror, with the machine calling `mt7621_uart1_init()`.
-`mt7621.c` is 5,223 lines.  Every step so far passed check-patches, a fresh
-prep + build and boot-smoke.
+**Status: in progress on `refactor/mt7621-modules`.**  Out so far:
+`modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
+register-file ops plus the GPIO semantics inside it) and `modules/wdt.c`
+(timer 1 of the system controller).  `mt7621.c` is down to 5,013 lines.
+Every step passed check-patches, a fresh prep + build and boot-smoke.
+
+Two moves are not quite the pure moves the plan assumed:
+
+- **GPIO is not a leaf.**  It has no register window of its own; its direction
+  masking and DSET/DCLR handling live inside the sysctl register file, which
+  the DRAM controller page also uses.  So the move took the shared
+  `mt7621_reg_ops` (exported in the header) rather than inventing a GPIO
+  `MemoryRegionOps`.
+- **Watchdog resets are a machine decision.**  The module arms and fires;
+  `wdt_rst_cause` is still consumed by the machine's reset path, so only the
+  timer and ops moved.
+
+Next, in order: systick (`mt7621_systick_ops` plus its timers), SPI NOR,
+NAND, board presets, then PDMA/QDMA and the switch glue.
 
 The split of the IPQ4019 machine is the worked example for this.  Read
 `docs/machines.md` first -- it has the conventions, the move recipe, the
