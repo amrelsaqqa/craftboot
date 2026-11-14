@@ -232,7 +232,11 @@ struct MT7621State {
     uint32_t cfg1_cache_fields;
 };
 
+/* shared machine state the modules read */
+extern bool mt7621_trace;
+
 /* modules (each one is modules/<block>.c) */
 void mt7621_uart1_init(MT7621State *s);
+extern const MemoryRegionOps mt7621_reg_ops;
 
 #endif /* HW_MIPS_MT7621_H */
