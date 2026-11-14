@@ -256,7 +256,15 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
      * Bits above it: DRAM type and xtal mode.
      */
-    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | s->chip_mode;
+    /*
+     * xtal mode lives in SYSCFG0[8:6]: Linux's clk-mt7621 maps 0-2 to
+     * 20 MHz, 3-5 to 40 MHz and 6-7 to 25 MHz.  Real MT7621 boards (the
+     * K2P log Breed prints, for instance) run a 40 MHz crystal, and Breed,
+     * U-Boot and Linux all derive their delays from it -- 25 MHz made every
+     * clock in the boot log wrong (DDR 2500 instead of 1200, Bus 218
+     * instead of 293).
+     */
+    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000100 | s->chip_mode;
     /*
      * CPLL clock config.  RouterBOOT programs 0x40800000 on the RB750Gr3,
      * which is how Linux ends up reporting the 875 MHz CPU clock (and the
@@ -264,8 +272,18 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * makes it report 25 MHz instead, which then disagrees with the emulated
      * timers by a factor of 70.
      */
-    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40800000; /* 880 MHz PLL */
-    s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
+    {
+        const char *cfg = getenv("MT7621_CLKCFG");
+
+        s->sysctl_regs[SYS_CLKCFG0 / 4] = cfg ? (uint32_t)strtoul(cfg, NULL, 0)
+                                              : 0x40800000;
+    }
+    {
+        const char *sts = getenv("MT7621_CLKSTS");
+
+        s->sysctl_regs[SYS_CUR_CLK_STS / 4] = sts ? (uint32_t)strtoul(sts, NULL, 0)
+                                                  : 0x00000101;
+    }
     /*
      * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
      * DDR/PLL calibration as finished. Our DDR is always ready.
@@ -285,8 +303,13 @@ static void mt7621_sysctl_defaults(MT7621State *s)
 static void mt7621_dramc_defaults(MT7621State *s)
 {
     memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
-    s->dramc_regs[0x604 / 4] = 0x00000000;
-    s->dramc_regs[0x618 / 4] = 0x00000190;
+    {
+        const char *v604 = getenv("MT7621_MEMC604");
+        const char *v618 = getenv("MT7621_MEMC618");
+
+        s->dramc_regs[0x604 / 4] = v604 ? (uint32_t)strtoul(v604, NULL, 0) : 0;
+        s->dramc_regs[0x618 / 4] = v618 ? (uint32_t)strtoul(v618, NULL, 0) : 0x190;
+    }
     /*
      * MEMC CPU PLL (0x648), decoded by Linux's clk-mt7621 as
      *   cpu = ((FBDIV + 1) * xtal) >> prediv_tbl[PREDIV], then / ffiv * ffrac
@@ -305,7 +328,13 @@ static void mt7621_dramc_defaults(MT7621State *s)
         const char *pll = getenv("MT7621_CPU_PLL");
 
         s->dramc_regs[0x648 / 4] = pll ? (uint32_t)strtoul(pll, NULL, 0)
-                                       : ((69 << 4) | (1 << 12)); /* 875MHz */
+                                       : ((21 << 4) | (0 << 12)); /* 880MHz */
+    }
+    {
+        const char *ddr = getenv("MT7621_DDR_PLL");
+
+        s->dramc_regs[0x64c / 4] = ddr ? (uint32_t)strtoul(ddr, NULL, 0)
+                                       : (29 << 4);
     }
     s->dramc_regs[0x3fc / 4] = 0x00000400;
 }
