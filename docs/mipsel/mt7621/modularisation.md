@@ -1,6 +1,10 @@
 # Splitting the mt7621 machine: notes for the next agent
 
-**Status: not started.  `mt7621.c` is untouched (one 5,469-line file).**
+**Status: in progress on `refactor/mt7621-modules`.**  `mt7621.h` exists (machine
+type, board enum, sizes, `struct MT7621State`), and `modules/uart.c` is out:
+the TX-only 16550 mirror, with the machine calling `mt7621_uart1_init()`.
+`mt7621.c` is 5,223 lines.  Every step so far passed check-patches, a fresh
+prep + build and boot-smoke.
 
 The split of the IPQ4019 machine is the worked example for this.  Read
 `docs/machines.md` first -- it has the conventions, the move recipe, the
@@ -18,6 +22,18 @@ is specific to mt7621.
 - The build system (`prep`, `build`, `sync`, `export-patches`) already
   supports several sources per machine; the hook patch's `meson.build` hunk
   must list each new `.c`.
+
+## What the split has hit so far
+
+- The `meson.build` stanza that lists `mt7621.c` lives in the *target* series
+  (`targets/mipsel/patches/0001-...`), not in a machine hook patch as on
+  ipq4019.  Rather than hand-editing a generated patch, the machine carries
+  `patches/0001-hw-mips-meson-list-modules.patch` (and `series`) that rewrites
+  the stanza.  Fold it into the dev branch on the next `export-patches`, then
+  the machine series can go away.
+- `mt7621.h` lands in `hw/mips/mt7621/`, not `hw/mips/`: a module's
+  `#include "mt7621.h"` resolves as its sibling, and the machine includes
+  `"mt7621/mt7621.h"`.  This is the ipq4019 layout (`hw/arm/ipq4019/ipq4019.h`).
 - Tests: `tests/mipsel/mt7621/boot-smoke.sh <image> [seconds]` checks the
   console banners; `tests/mipsel/mt7621/net-ping.sh <image> <guest-ip>`
   verifies the Ethernet path.  Run both after any move that touches flash,
