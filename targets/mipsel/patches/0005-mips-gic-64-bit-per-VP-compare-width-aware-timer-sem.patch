@@ -1,7 +1,7 @@
 From 3e4dd78868f17fccd4230b0ca9751e72a898b8ac Mon Sep 17 00:00:00 2001
 From: agent <agent@local>
 Date: Thu, 12 Nov 2026 16:46:50 +0200
-Subject: [PATCH 5/5] mips-gic: 64-bit per-VP compare, width-aware timer
+Subject: [PATCH 5/6] mips-gic: 64-bit per-VP compare, width-aware timer
  semantics
 
 * GIC_VP_COMPARE_HI is now readable/writable and the deadline is stored as a

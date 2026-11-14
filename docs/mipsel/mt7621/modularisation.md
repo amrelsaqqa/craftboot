@@ -73,16 +73,16 @@ is specific to mt7621.
 
 - The `meson.build` stanza that lists the machine's sources lives in the
   *target* series (`targets/mipsel/patches/0001-...`), not in a machine hook
-  patch as on ipq4019.  While the split was in progress the machine carried
-  `patches/0001-hw-mips-meson-list-modules.patch` to rewrite it; that was
-  folded into the target patch at merge time and the machine series deleted.
+  patch as on ipq4019.  While the split was in progress a temporary machine
+  patch rewrote it; that patch is gone.  The dev branch now carries a
+  `mt7621: split the machine into modules` commit whose only series-visible
+  change is the stanza, so the series has six patches and the last one is
+  `0006-mt7621-split-the-machine-into-modules.patch`.  `export-patches`
+  reproduces it exactly -- nothing is hand-maintained any more.
 
-  **The dev branch must catch up.**  `export-patches` regenerates the target
-  series from `~/qemu-mt7621/qemu` (branch `mt7621-model`), and that branch
-  still has the single-file machine and the one-file `files(...)` stanza.
-  Re-exporting before it is updated would drop the module list again.  When
-  the dev branch is synced to this layout, re-export and the list comes back
-  from the source.
+  Syncing the dev branch is therefore part of this work, not an optional
+  cleanup: a fresh re-export from a single-file `mt7621-model` would drop the
+  module list.
 - `mt7621.h` lands in `hw/mips/mt7621/`, not `hw/mips/`: a module's
   `#include "mt7621.h"` resolves as its sibling, and the machine includes
   `"mt7621/mt7621.h"`.  This is the ipq4019 layout (`hw/arm/ipq4019/ipq4019.h`).

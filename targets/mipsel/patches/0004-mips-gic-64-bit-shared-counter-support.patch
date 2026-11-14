@@ -1,7 +1,7 @@
 From a596e4dc050c5e71a66aecc8fcab0a3b2f4e6690 Mon Sep 17 00:00:00 2001
 From: agent <agent@local>
 Date: Thu, 12 Nov 2026 15:59:05 +0200
-Subject: [PATCH 4/5] mips-gic: 64-bit shared counter support
+Subject: [PATCH 4/6] mips-gic: 64-bit shared counter support
 
 MIPSGICTimerState.sh_counter is now 64-bit; COUNTERHI is implemented for both
 read and write, a 32-bit COUNTERLO write preserves the high half, and

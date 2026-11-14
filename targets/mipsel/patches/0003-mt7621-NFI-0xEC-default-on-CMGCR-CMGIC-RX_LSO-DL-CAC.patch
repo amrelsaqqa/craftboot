@@ -1,7 +1,7 @@
 From 4392fb2559f87084da9cb05b28deca2c1dd4c94f Mon Sep 17 00:00:00 2001
 From: agent <agent@local>
 Date: Thu, 12 Nov 2026 02:42:36 +0200
-Subject: [PATCH 3/5] mt7621: NFI 0xEC, default-on CMGCR/CMGIC/RX_LSO, DL +
+Subject: [PATCH 3/6] mt7621: NFI 0xEC, default-on CMGCR/CMGIC/RX_LSO, DL +
  CACHLOG knobs
 
 ---

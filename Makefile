@@ -39,7 +39,9 @@ SRC      = $(SUBDIR)/src
 OBJ      = $(SUBDIR)/build
 BINARIES  = $($(T)_BINARIES)
 DEV      ?= dev/qemu
-DEV_BRANCH ?= $($(T)_DEV_BRANCH)
+# a target may pin one branch for its whole series; otherwise the machine's
+# own branch is used (the usual case: one machine per target today).
+DEV_BRANCH ?= $(or $($(T)_DEV_BRANCH),$(foreach m,$(MACHINES),$($(m)_DEV_BRANCH)))
 
 # Patch series, applied in this order: shared, target-wide, then per machine.
 SERIES   = $(wildcard patches/generic/series) $(TDIR)/series \
