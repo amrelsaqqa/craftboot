@@ -34,6 +34,7 @@ mt7621_MACHINE_SRCS := \
     modules/uart.c:hw/mips/mt7621/uart.c \
     modules/regfile.c:hw/mips/mt7621/regfile.c \
     modules/wdt.c:hw/mips/mt7621/wdt.c \
-    modules/systick.c:hw/mips/mt7621/systick.c
+    modules/systick.c:hw/mips/mt7621/systick.c \
+    modules/board.c:hw/mips/mt7621/board.c
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model
