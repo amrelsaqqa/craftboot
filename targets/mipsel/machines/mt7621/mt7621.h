@@ -239,6 +239,11 @@ bool mt7621_flag(const char *name);
 /* modules (each one is modules/<block>.c) */
 void mt7621_uart1_init(MT7621State *s);
 void mt7621_wdt_init(MT7621State *s);
+void mt7621_systick_init(MT7621State *s);
+/* the CM/CPC reset path reprograms the systick compare */
+void mt7621_systick_set_pending(MT7621State *s, bool pending);
+void mt7621_systick_rearm(MT7621State *s);
+void mt7621_systick_boot_handover(MT7621State *s);
 extern const MemoryRegionOps mt7621_reg_ops;
 
 #endif /* HW_MIPS_MT7621_H */
