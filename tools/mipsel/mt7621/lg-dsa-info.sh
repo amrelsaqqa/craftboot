@@ -3,14 +3,18 @@
 # Dump the guest's DSA/switch wiring and any driver RX errors.
 #   tools/lg-dsa-info.sh
 set -u
-cd /home/amrelsaqqa/qemu-mt7621 || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
+BIN=${QEMU:-build/mipsel/qemu-system-mipsel}
+IMG=${IMAGE:-$HOME/full.bin}
+[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
+[ -f "$IMG" ] || { echo "missing image $IMG (set IMAGE=…)"; exit 1; }
 out=run/lg-dsa
 PORT=4491
 pkill qemu-system-mip >/dev/null 2>&1; sleep 2
 rm -rf "$out"; mkdir -p "$out"
 
-MT7621_ETHLOG=1 ./build/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
-    -kernel /home/amrelsaqqa/full.bin -display none -monitor none \
+MT7621_ETHLOG=1 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M \
+    -kernel "$IMG" -display none -monitor none \
     -chardev socket,id=ser0,host=127.0.0.1,port=$PORT,server=on,wait=off,telnet=on,logfile="$out/serial.log" \
     -serial chardev:ser0 \
     -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \

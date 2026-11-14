@@ -4,14 +4,18 @@
 # Dl=4 failure and dumping the two candidate windows.
 #   tools/breed-dump.sh
 set -u
-cd /home/amrelsaqqa/qemu-mt7621 || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
+BIN=${QEMU:-build/mipsel/qemu-system-mipsel}
+IMG=${IMAGE:-$HOME/full.bin}
+[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
+[ -f "$IMG" ] || { echo "missing image $IMG (set IMAGE=…)"; exit 1; }
 out=run/breed-dump
 MON=/tmp/breed-mon.sock
 pkill qemu-system-mip >/dev/null 2>&1; sleep 2
 rm -rf "$out" "$MON"; mkdir -p "$out"
 
-MT7621_DL=4 ./build/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
-    -kernel /home/amrelsaqqa/full.bin -display none \
+MT7621_DL=4 "$BIN" -M mt7621,board=lg-gapm7200 -m 256M \
+    -kernel "$IMG" -display none \
     -serial file:"$out/serial.log" \
     -monitor unix:"$MON",server=on,wait=off \
     -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \

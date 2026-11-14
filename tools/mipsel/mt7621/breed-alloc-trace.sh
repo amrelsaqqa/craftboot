@@ -1,10 +1,14 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Step over software breakpoints and dump registers at the allocator sites.
-cd /home/amrelsaqqa/qemu-mt7621 || exit 1
+cd "$(dirname "$0")/../../.." || exit 1
+BIN=${QEMU:-build/mipsel/qemu-system-mipsel}
+IMG=${IMAGE:-$HOME/full.bin}
+[ -x "$BIN" ] || { echo "missing $BIN (make TARGET=mipsel build)"; exit 1; }
+[ -f "$IMG" ] || { echo "missing image $IMG (set IMAGE=…)"; exit 1; }
 pkill qemu-system-mip >/dev/null 2>&1; sleep 1
-env ${1:+MT7621_DL=$1} ./build/qemu-system-mipsel -M mt7621,board=lg-gapm7200 -m 256M \
-    -kernel /home/amrelsaqqa/full.bin -display none -serial file:/tmp/rsp.log \
+env ${1:+MT7621_DL=$1} "$BIN" -M mt7621,board=lg-gapm7200 -m 256M \
+    -kernel "$IMG" -display none -serial file:/tmp/rsp.log \
     -S -gdb tcp:127.0.0.1:1242 >/dev/null 2>&1 &
 sleep 2
 python3 - <<'PY'

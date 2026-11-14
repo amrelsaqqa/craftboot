@@ -2,6 +2,7 @@
 /build/
 /cache/
 /dev/
+/run/            # output of the mt7621 debug tools
 
 # large images, dumps and prebuilt payloads (kept outside git)
 /artifacts/
