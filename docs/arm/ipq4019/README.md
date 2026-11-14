@@ -34,8 +34,9 @@ The machine is split by controller.  `ipq4019.c` is the machine itself
 its register file, its `MemoryRegionOps`, its state and one init entry point.
 The sources are *copied* (they are not patched): `config.mk` maps each one to
 the QEMU tree, the machine file to `hw/arm/ipq4019.c` and the blocks to
-`hw/arm/ipq4019/`, so a block includes `"ipq4019.h"` and the hook series only
-lists the block files in `meson.build`.
+`hw/arm/ipq4019/`, so a block includes `"ipq4019.h"`.  The hook patch only adds
+the machine file and `subdir('ipq4019')`; the module list in
+`hw/arm/ipq4019/meson.build` is generated from `config.mk` by the build.
 
 | file | owns |
 |---|---|
@@ -63,9 +64,9 @@ Rules that keep the split useful:
   would only move the coupling;
 - anything another file needs is a prototype in the header; nothing else
   crosses a file boundary, and the header stays small;
-- adding a block is a `config.mk` entry (`ipq4019_MACHINE_SRCS`), a file in
-  the machine patch's `meson.build` hunk, and a line in the header -- nothing
-  else.
+- adding a block is a `config.mk` entry (`ipq4019_MACHINE_SRCS`) and, if it
+  crosses files, a line in the header -- the meson list follows from the same
+  entry.
 
 ## Building
 

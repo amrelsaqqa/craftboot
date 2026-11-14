@@ -7,7 +7,7 @@ Subject: [PATCH] arm: ipq4019 machine support hooks
  accel/tcg/cpu-exec.c        | 11 +++++++++++
  cpu-common.c                |  3 +++
  hw/arm/Kconfig              |  5 +++++
- hw/arm/meson.build          |  1 +
+ hw/arm/meson.build          |  2 +
  include/hw/core/cpu.h       | 16 +++++++++++++++-
  target/arm/tcg/tlb_helper.c | 29 +++++++++++++++++++++++++++++
  6 files changed, 64 insertions(+), 1 deletion(-)
@@ -65,11 +65,12 @@ diff --git a/hw/arm/meson.build b/hw/arm/meson.build
 index aeaf654..1db12af 100644
 --- a/hw/arm/meson.build
 +++ b/hw/arm/meson.build
-@@ -107,4 +107,5 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
+@@ -107,4 +107,6 @@ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
  arm_common_ss.add(files('boot.c'))
  
  hw_arch += {'arm': arm_ss}
-+arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c', 'ipq4019/gpio.c', 'ipq4019/uart.c', 'ipq4019/bam.c', 'ipq4019/eth.c', 'ipq4019/stub.c', 'ipq4019/board.c', 'ipq4019/flash.c', 'ipq4019/qpic.c', 'ipq4019/dump.c'))
++arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c'))
++subdir('ipq4019')
  hw_common_arch += {'arm': arm_common_ss}
 diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
 index 9615051..38b9315 100644

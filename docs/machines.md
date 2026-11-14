@@ -84,12 +84,28 @@ hw/arm/ipq4019.c
 hw/arm/ipq4019/{ipq4019.h, uart.c, gpio.c, …}
 ```
 
-and the hook patch lists the sources in `meson.build`:
+and the machine hook patch is static -- it adds the machine file and enters
+the machine's directory:
 
 ```meson
-arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files(
-    'ipq4019.c', 'ipq4019/uart.c', 'ipq4019/gpio.c', …))
+arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c'))
+subdir('ipq4019')
 ```
+
+`hw/arm/ipq4019/meson.build` is **generated**, never edited: during
+`prep`/`build`/`sync`, `tools/machine-meson.sh` writes it from
+`<machine>_MACHINE_SRCS`:
+
+```meson
+# Generated from config.mk by the build; do not edit.
+arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files(
+    'gpio.c', 'uart.c', 'bam.c', 'eth.c', 'stub.c', 'board.c',
+    'flash.c', 'qpic.c', 'dump.c'))
+```
+
+`<machine>_MACHINE_SS` in `config.mk` names the meson source set
+(`arm_common_ss`, `mips_ss`, …).  Adding a module therefore touches exactly one
+file, `config.mk`; no patch is edited and no list is copied.
 
 ### Include rules
 
@@ -172,9 +188,9 @@ the dump itself is split.
 4. **Move the definitions with the code.**  Cut the block's `struct`s/defines
    into the new module (or the header, if shared), then de-`static` exactly
    the cross-file interface and add its prototypes to the header.
-5. **Wire it:** `config.mk`, the hook patch's `meson.build` list, and the tree
-   you are building in (`build/<target>/src/hw/.../meson.build`) if you are
-   iterating without a `prep`.
+5. **Wire it:** add the pair to `config.mk` and the source set
+   (`<machine>_MACHINE_SS`); the generated `meson.build` follows.  A machine
+   hook patch only gains `subdir('<soc>')` once, when the split starts.
 6. **Build with `sync`, fix the interface errors**, and iterate.  The compiler
    is the checklist: implicit declaration, unknown type, conflicting
    types, undefined reference.
@@ -245,7 +261,8 @@ step 1 is mostly the header and the file map.
 - [ ] block's types/defines moved with it
 - [ ] only the interface de-`static`ed; prototypes in the header
 - [ ] constructor moved into the module (`add_<block>()`)
-- [ ] `config.mk` + hook patch + tree `meson.build` updated
+- [ ] `config.mk` updated (and `<machine>_MACHINE_SS` set); the generated
+      `meson.build` follows -- no patch edited
 - [ ] `sync` builds clean
 - [ ] boot test passes (guest log + no anomalies)
 - [ ] `check-patches` passes

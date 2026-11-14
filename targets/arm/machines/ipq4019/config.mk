@@ -22,8 +22,8 @@
 # ordinary files.  Nothing in this directory is patched -- the series only
 # carries core changes plus the meson/Kconfig hunk that lists the .c files.
 #
-# When adding a file, add it here *and* to that hook patch's files(...) list.
-# An entry missing here means the build silently keeps the previous copy.
+# When adding a file, add it here only: the module list is generated from this
+# list.  An entry missing here means the build silently keeps the previous copy.
 #
 # The machine file stays in hw/arm; the blocks live under hw/arm/ipq4019/ so
 # their includes are plain ("ipq4019.h") and the build tree groups them the way
@@ -42,5 +42,12 @@ ipq4019_MACHINE_SRCS := \
     modules/qpic.c:hw/arm/ipq4019/qpic.c \
     modules/qpic.h:hw/arm/ipq4019/qpic.h \
     modules/dump.c:hw/arm/ipq4019/dump.c
+# The meson source set the generated module list is added to.
+# tools/machine-meson.sh writes hw/arm/ipq4019/meson.build from
+# ipq4019_MACHINE_SRCS during prep/build/sync; the hook patch only enters the
+# directory, so adding a module never touches a patch.
+ipq4019_MACHINE_SS   := arm_common_ss
+ipq4019_MACHINE_SUBDIR := hw/arm/ipq4019
+
 ipq4019_BOARDS       := hap-ac2 hap-ac3
 ipq4019_DEV_BRANCH   := ipq4019-model

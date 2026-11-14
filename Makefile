@@ -118,6 +118,7 @@ prep: fetch
 	    git -c user.email=build@local -c user.name=build commit -q \
 	        -m "qemu $(TAG) baseline"
 	@set -e; $(foreach m,$(MACHINES),echo "  machine $(m)"; $(foreach p,$($(m)_MACHINE_SRCS),mkdir -p "$(SRC)/$$(dirname $(word 2,$(subst :, ,$(p))))"; cp "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))"; ))
+	@set -e; $(foreach m,$(MACHINES),tools/machine-meson.sh "$(SRC)/$($(m)_MACHINE_SUBDIR)/meson.build" "$(m)" "$($(m)_MACHINE_SRCS)" "$($(m)_MACHINE_SS)" "$($(m)_MACHINE_SUBDIR)";)
 	@set -e; for s in $(SERIES); do \
 	    while read -r p; do \
 	        [ -z "$$p" ] && continue; \
@@ -139,6 +140,7 @@ build:
 	@test -f "$(SUBDIR)/.prepped" || \
 	    $(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" prep
 	@set -e; $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))" || { echo "  sync $(m)/$(word 1,$(subst :, ,$(p)))"; mkdir -p "$(SRC)/$$(dirname $(word 2,$(subst :, ,$(p))))"; cp "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))"; };))
+	@set -e; $(foreach m,$(MACHINES),tools/machine-meson.sh "$(SRC)/$($(m)_MACHINE_SUBDIR)/meson.build" "$(m)" "$($(m)_MACHINE_SRCS)" "$($(m)_MACHINE_SS)" "$($(m)_MACHINE_SUBDIR)";)
 	@if [ ! -f "$(OBJ)/build.ninja" ]; then \
 	    mkdir -p "$(OBJ)"; \
 	    echo "configure $(TARGET)"; \
@@ -158,11 +160,12 @@ sync:
 	    echo "no tree for $(TARGET): run make TARGET=$(TARGET) prep first"; \
 	    exit 1; }
 	@set -e; $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))" || { echo "  sync $(m)/$(word 1,$(subst :, ,$(p)))"; mkdir -p "$(SRC)/$$(dirname $(word 2,$(subst :, ,$(p))))"; cp "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))"; };))
+	@set -e; $(foreach m,$(MACHINES),tools/machine-meson.sh "$(SRC)/$($(m)_MACHINE_SUBDIR)/meson.build" "$(m)" "$($(m)_MACHINE_SRCS)" "$($(m)_MACHINE_SS)" "$($(m)_MACHINE_SUBDIR)";)
 	ninja -C "$(OBJ)" $(BINARIES)
 	@for b in $(BINARIES); do ln -sf "$(PWD)/$(OBJ)/$$b" "$(SUBDIR)/$$b"; done
 	@echo "synced $(SUBDIR): $(BINARIES)"
 
-# ---- export-patches: dev branch -> target patches + machine sources ------
+# ---- export-patches: dev branch -> target patch series -------------------
 export-patches:
 	@test -n "$(DEV_BRANCH)" || { echo "no DEV_BRANCH for target $(TARGET)"; exit 1; }
 	@test -d "$(DEV)" || { echo "no dev checkout at $(DEV) (set DEV=…)"; exit 1; }
@@ -171,7 +174,6 @@ export-patches:
 	    -o "$(PWD)/$(TDIR)/patches" -- . \
 	    $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),':(exclude)'$(word 2,$(subst :, ,$(p)))) \
 	    )
-	@set -e; $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),cp "$(DEV)/$(word 2,$(subst :, ,$(p)))" "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))";))
 	@{ echo "# Target $(TARGET) — applied in this order to $(TAG)."; \
 	   echo "# 'make TARGET=$(TARGET) check-patches' proves they apply cleanly."; \
 	   ls "$(TDIR)"/patches/*.patch; } > "$(TDIR)/series"
