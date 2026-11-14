@@ -57,6 +57,7 @@ typedef enum MT7621Board {
 #define MT7621_NAND_OOB_SIZE    64
 #define MT7621_ETH_SIZE         0x00020000
 #define MT7621_CM_SIZE          0x00010000
+#define MT7621_GIC_BASE         0x1fbc0000
 #define MT7621_MAX_CPUS         4
 #define SYSCTL_WORDS            (0x1000 / 4)
 #define DRAMC_WORDS             (0x1000 / 4)
@@ -246,6 +247,9 @@ void mt7621_nfi_init(MT7621State *s);
 void mt7621_nand_load(MT7621State *s, const char *filename);
 void mt7621_eth_init(MT7621State *s);
 void mt7621_eth_dev_reset(MT7621State *s);
+void mt7621_cm_init(MT7621State *s);
+void mt7621_cm_defaults(MT7621State *s);
+void mt7621_cpu_reset(void *opaque);
 /* write-all helper for the persistent NAND image */
 int mt7621_pwrite_all(int fd, const void *buf, size_t len, off_t off);
 /* the CM/CPC reset path reprograms the systick compare */

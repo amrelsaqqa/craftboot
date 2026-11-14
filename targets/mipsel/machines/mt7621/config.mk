@@ -39,6 +39,7 @@ mt7621_MACHINE_SRCS := \
     modules/flash.c:hw/mips/mt7621/flash.c \
     modules/nand.c:hw/mips/mt7621/nand.c \
     modules/eth.c:hw/mips/mt7621/eth.c \
-    modules/eth.h:hw/mips/mt7621/eth.h
+    modules/eth.h:hw/mips/mt7621/eth.h \
+    modules/cm.c:hw/mips/mt7621/cm.c
 mt7621_BOARDS      := lg-gapm7200 rb750gr3
 mt7621_DEV_BRANCH  := mt7621-model
