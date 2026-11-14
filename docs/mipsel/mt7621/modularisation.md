@@ -72,6 +72,29 @@ is specific to mt7621.
   `mt7621_MACHINE_SUBDIR` (`hw/mips/mt7621`).  Adding a module means editing
   `config.mk` only -- headers are copied but never listed.
 
+## The dev checkout
+
+The target series (0001-0003) is the only thing generated from a QEMU tree:
+`~/qemu-mt7621/qemu`, branch `mt7621-model` (`mt7621_DEV_BRANCH`).  Note the
+path: `~/qemu-mt7621` is the old repository (its own `dcache-work`/`master`),
+while the checkout is the `qemu/` inside it.
+
+```sh
+make TARGET=mipsel export-patches DEV=~/qemu-mt7621/qemu
+```
+
+That command produces the three arch-wide patches and nothing else.  The
+machine series is repository-owned and must never appear on that branch:
+`export-patches` does not generate machine patches, and a machine commit there
+would only invite it to be regenerated into the wrong series.
+
+If the branch is lost, recreate it from the pinned tag plus the three global
+changes as commits (1004Kc cache geometry / icache shadow / GIC coupling,
+64-bit shared counter, per-VP compare) and re-export to prove the result
+matches.  Losing it costs regeneration, not correctness: builds, machine work
+and the machine series are unaffected, and `check-patches` still proves the
+committed series applies on its own.
+
 ## What the split has hit so far
 
 - **Split by generality.**  The target series keeps what any machine of this
