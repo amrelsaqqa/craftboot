@@ -241,6 +241,7 @@ void mt7621_uart1_init(MT7621State *s);
 void mt7621_wdt_init(MT7621State *s);
 void mt7621_systick_init(MT7621State *s);
 void mt7621_board_apply(MT7621State *s, const char *filename);
+void mt7621_spi_init(MT7621State *s);
 /* the CM/CPC reset path reprograms the systick compare */
 void mt7621_systick_set_pending(MT7621State *s, bool pending);
 void mt7621_systick_rearm(MT7621State *s);
