@@ -4,8 +4,10 @@
 `modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
 register-file ops plus the GPIO semantics inside it), `modules/wdt.c` (timer 1
 of the system controller), `modules/systick.c` (cevt-systick, its timers and
-the boot hand-over) and `modules/board.c` (presets, aliases, image probe and
-`chip_mode`).  `mt7621.c` is down to 4,743 lines.  Every step passed
+the boot hand-over), `modules/board.c` (presets, aliases, image probe and
+`chip_mode`), `modules/flash.c` (SPI NOR controller + W25Q128FV die) and
+`modules/nand.c` (NFI + K9F1G08U0B die, dump loader, persistence).
+`mt7621.c` is down to 3,654 lines; the modules total 1,744.  Every step passed
 check-patches, a fresh prep + build, boot-smoke 3/3 and net-ping 5/5.
 
 Two moves are not quite the pure moves the plan assumed:
@@ -19,8 +21,15 @@ Two moves are not quite the pure moves the plan assumed:
   `wdt_rst_cause` is still consumed by the machine's reset path, so only the
   timer and ops moved.
 
-Next, in order: SPI NOR (controller + die), the MTK NAND controller and its
-die, then PDMA/QDMA and the switch glue as one subsystem.
+Next: PDMA/QDMA plus the MT7530 switch glue as one subsystem, with a private
+`modules/eth.h` for its register/state types (the QPIC precedent).  Then the
+CM/CPC block, the EIP-93 crypto engine, and whatever the loader/ELF path still
+needs once those are gone.
+
+Two more interface notes from this round: `mt7621_pwrite_all()` had to become
+public because the machine's NAND flush uses the same helper, and both die
+loaders stay callable from machine init (`mt7621_nand_load()`), since `-kernel`
+is what fills them.
 
 The split of the IPQ4019 machine is the worked example for this.  Read
 `docs/machines.md` first -- it has the conventions, the move recipe, the
