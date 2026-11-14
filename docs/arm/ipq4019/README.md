@@ -108,6 +108,8 @@ switch -- see `model-quirks.md`; serial-only bring-up runs without `-netdev`.
 
 ## Documentation
 
+- `../../machines.md` — the machine source layout conventions (blocks,
+  interface headers, the move recipe); `ipq4019` is the worked example.
 - `model-quirks.md` — emulator gaps and deliberate deviations, including the
   boot-chain handover and what is not modelled.
 - `boot-and-storage.md` — the boot stages, the die model and the QPIC NAND
