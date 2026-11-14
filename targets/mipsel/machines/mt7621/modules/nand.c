@@ -592,3 +592,99 @@ void mt7621_nfi_init(MT7621State *s)
                           "mt7621.nfi", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_NFI_OFF, &s->nfi);
 }
+
+/*
+ * Attach an optional writable NAND image passed as
+ *   -drive file=nand.img,if=none,id=nand,format=raw
+ * A fresh/empty image is seeded from the dump; an existing one is used as
+ * is, so writes survive QEMU restarts while the dump stays pristine.
+ */
+void mt7621_nand_attach(MT7621State *s)
+{
+    const char *path = getenv("MT7621_NAND_IMAGE");
+    BlockBackend *blk;
+    int64_t len;
+    int fd;
+    off_t sz;
+
+    s->nand_fd = -1;
+
+    /*
+     * Preferred: a plain image file we create and seed ourselves, so the
+     * user does not have to know the flash size:
+     *   MT7621_NAND_IMAGE=~/nand-state.img qemu-system-mipsel ...
+     */
+    if (path) {
+        if (!s->nand) {
+            warn_report("mt7621: MT7621_NAND_IMAGE needs a readable boot dump");
+            return;
+        }
+        fd = open(path, O_RDWR | O_CREAT, 0644);
+        if (fd < 0) {
+            warn_report("mt7621: cannot open NAND image %s: %s, changes will "
+                        "be kept in RAM only", path, strerror(errno));
+            return;
+        }
+        sz = lseek(fd, 0, SEEK_END);
+        if (sz < 0) {
+            warn_report("mt7621: cannot size %s", path);
+            close(fd);
+            return;
+        }
+        if ((uint64_t)sz < s->nand_size) {
+            if (mt7621_pwrite_all(fd, s->nand, s->nand_size, 0) < 0) {
+                warn_report("mt7621: cannot seed %s", path);
+                close(fd);
+                return;
+            }
+            printf("mt7621: NAND image %s seeded from the boot dump "
+                   "(%" PRIu64 " bytes)\n", path, s->nand_size);
+        } else {
+            if (pread(fd, s->nand, s->nand_size, 0) != (ssize_t)s->nand_size) {
+                warn_report("mt7621: cannot read %s", path);
+                close(fd);
+                return;
+            }
+            printf("mt7621: using persistent NAND image %s\n", path);
+        }
+        s->nand_fd = fd;
+        return;
+    }
+
+    /* Alternative, QEMU style (the file has to exist):
+     *   -drive file=nand.img,if=none,id=nand,format=raw
+     */
+    blk = blk_by_name("nand");
+    if (!blk) {
+        return;
+    }
+    if (!s->nand) {
+        warn_report("mt7621: -drive id=nand needs a readable boot dump");
+        return;
+    }
+
+    len = blk_getlength(blk);
+    if (len < 0) {
+        warn_report("mt7621: cannot size the NAND image, ignoring it");
+        return;
+    }
+    if (len < s->nand_size) {
+        if (blk_pwrite(blk, 0, s->nand_size, s->nand, 0) < 0) {
+            warn_report("mt7621: cannot seed the NAND image, changes will "
+                        "be kept in RAM only");
+            return;
+        }
+        printf("mt7621: NAND image seeded from the boot dump (%" PRIu64
+               " bytes)\n", s->nand_size);
+    } else {
+        if (blk_pread(blk, 0, s->nand_size, s->nand, 0) < 0) {
+            warn_report("mt7621: cannot read the NAND image, changes will "
+                        "be kept in RAM only");
+            return;
+        }
+        printf("mt7621: using the persistent NAND image (%" PRIu64
+               " bytes)\n", s->nand_size);
+    }
+    s->nand_blk = blk;
+}
+

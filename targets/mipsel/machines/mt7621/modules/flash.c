@@ -540,3 +540,135 @@ void mt7621_spi_init(MT7621State *s)
     memory_region_init_io(&s->spi, NULL, &mt7621_spi_ops, s, "mt7621.spi", 0x100);
     memory_region_add_subregion(&s->sysctl, MT7621_SPI_OFF, &s->spi);
 }
+
+/*
+ * Read bytes of the flash's *logical* address space (the concatenation of
+ * the main areas).  Dumps that include the spare area store 2112 bytes per
+ * page, so a linear read would pick up 64 bytes of OOB every 2048 bytes and
+ * corrupt anything larger than one page -- which is what a uImage payload
+ * is.
+ */
+ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
+                                  void *buf, size_t len)
+{
+    uint8_t *dst = buf;
+    size_t done = 0;
+
+    while (done < len) {
+        uint64_t foff = off + done;
+        size_t take = len - done;
+
+        if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+            uint64_t page = foff / MT7621_NAND_PAGE_SIZE;
+            uint64_t inpage = foff % MT7621_NAND_PAGE_SIZE;
+
+            if (take > MT7621_NAND_PAGE_SIZE - inpage) {
+                take = MT7621_NAND_PAGE_SIZE - inpage;
+            }
+            foff = page * s->nand_stride + inpage;
+        }
+        if (pread(fd, dst + done, take, foff) != (ssize_t)take) {
+            return -1;
+        }
+        done += take;
+    }
+    return len;
+}
+
+/*
+ * MT7621_FLASH_SAVE=<path> keeps a copy of the (writable) NOR buffer on disk
+ * while the guest runs.  The memory window only exposes the first 4 MiB, so
+ * pmemsave cannot reach the rest; netinstall writes the whole 16 MiB.
+ */
+static void mt7621_flash_save_cb(void *opaque)
+{
+    MT7621State *s = opaque;
+    const char *path = getenv("MT7621_FLASH_SAVE");
+    int fd;
+
+    if (path && s->flash) {
+        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+        if (fd >= 0) {
+            if (write(fd, s->flash, s->flash_size) != (ssize_t)s->flash_size) {
+                error_report("mt7621: short write saving %s", path);
+            }
+            close(fd);
+        }
+    }
+    timer_mod(s->flash_save_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+}
+
+/*
+ * SPI NOR boards boot from a memory-mapped flash: the BootROM maps the
+ * first 4 MiB at 0x1fc00000 and enters at 0xbfc00000.  There is no RAM
+ * load and no uImage header; RouterBOOT's own stage-1 header jumps into
+ * its second stage at flash offset 0x10000.
+ */
+void mt7621_nor_load(MT7621State *s, const char *filename)
+{
+    int fd;
+    off_t sz;
+    uint64_t window;
+
+    fd = open(filename, O_RDONLY | O_BINARY);
+    if (fd < 0) {
+        error_report("mt7621: cannot open %s: %s", filename, strerror(errno));
+        exit(1);
+    }
+    sz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (sz <= 0) {
+        error_report("mt7621: %s: empty flash image", filename);
+        exit(1);
+    }
+
+    s->flash = g_malloc0(sz);
+    if (pread(fd, s->flash, sz, 0) != sz) {
+        error_report("mt7621: %s: short read", filename);
+        exit(1);
+    }
+    close(fd);
+    s->flash_size = sz;
+    s->spi_nor = true;
+
+    /*
+     * The flash controller's memory window covers the whole part, not just the
+     * 4 MiB the boot ROM maps for boot: RouterOS's mtd driver reads through
+     * this window (its SPI reads never show up as controller transactions),
+     * and a YAFFS scan that runs off the end of a 4 MiB alias sees nothing but
+     * zeros and refuses to mount.  MT7621_FLASH_WINDOW=4m restores the old
+     * behaviour for A/B testing.
+     */
+    window = (uint64_t)sz;
+    {
+        const char *w = getenv("MT7621_FLASH_WINDOW");
+
+        if (w && (!strcmp(w, "4m") || !strcmp(w, "4M"))) {
+            window = MIN((uint64_t)sz, (uint64_t)MT7621_SPI_WINDOW);
+        }
+    }
+    memory_region_init_ram_ptr(&s->flash_mr, NULL, "mt7621.spi-nor",
+                               window, s->flash);
+    /*
+     * Writable: RouterBOOT does not program settings through the SPI
+     * controller at all, it stores them into the memory mapped window
+     * ("writing settings to flash.."), which the SoC turns into a flash
+     * program cycle.  Keeping the window read-only silently dropped every
+     * setting the booter ever saved.
+     */
+    memory_region_add_subregion(get_system_memory(), MT7621_SPI_FLASH_BASE,
+                                &s->flash_mr);
+
+    if (getenv("MT7621_FLASH_SAVE")) {
+        s->flash_save_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                          mt7621_flash_save_cb, s);
+        timer_mod(s->flash_save_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
+    }
+
+    s->entry = MT7621_SPI_FLASH_BASE | 0xa0000000;   /* KSEG1 0xbfc00000 */
+    printf("mt7621: SPI NOR %0.1f MiB mapped at 0x%08x, entry 0x%08x\n",
+           (double)sz / (1024 * 1024), MT7621_SPI_FLASH_BASE, s->entry);
+}
+
