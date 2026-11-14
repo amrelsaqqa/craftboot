@@ -66,14 +66,18 @@ the CPU PLL in MEMC 0x648 is FBDIV 21 / PREDIV 0, i.e. `(21 + 1) * 40 / 2^0 =
 Two decodes are still wrong, and they come from registers whose real values are
 not known:
 
-- **DDR** is derived from MEMC 0x618 (`0x64 -> 960`, `0x78 -> 1120`,
-  `0x80 -> 1280`, `0x96 -> 1440`, `0x190 -> 4000` MHz with a 40 MHz reference;
-  the multiplier is `(v >> 2) & ~3`).  The model ships 0x190, inherited from
-  before the crystal was fixed, which is why Breed prints `DDR: 4000MHz`.
-  Landing 1200 needs the real board's 0x618 value.
-- **Bus** decodes as `CPU / 4` here (220 MHz at 880), while the K2P log shows
-  `CPU / 3` (293).  The divider is not in `CLKCFG0` bits 8-9 or `CUR_CLK_STS`
-  (both measured); the real board's `CLKCFG0` must select it.
+- **DDR** is decoded from MEMC 0x618: `0x64 -> 960`, `0x78 -> 1120`,
+  `0x80 -> 1280`, `0x96 -> 1440`, `0x190 -> 4000` MHz, i.e.
+  `ref * 4 * (v >> 4)`, halved when 0x604 bit 2 is set.  The pair shipped now
+  is `0x604 = 0x4`, `0x618 = 0xf0`, which prints **DDR 1200** - the rate the
+  reference board reports.
+- **Bus** decodes as `CPU / 4` in these images (220 MHz at 880).  The 293 MHz
+  in the K2P log comes from Breed **r1126** (2017); the dumps here are r1280 /
+  r1286 / r1416, so the difference may be the bootloader build rather than the
+  SoC.  Nothing modelled moves it: SYSCFG0 bits 9-31, CLKCFG0 (all four
+  selector values), CLKCFG1, CUR_CLK_STS and MEMC 0x604/0x618 were all swept.
+  A K2P-class dump (r1126) would settle whether the model needs a divider
+  register we have not found.
 
 `CUR_CLK_STS` itself is decoded: bits 1:0 multiply the CPU clock and bits 9:8
 divide it (`0x101 -> 880`, `0x102 -> 1760`, `0x201 -> 440`, `0x301 -> 293`).

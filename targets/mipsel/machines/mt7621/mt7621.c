@@ -264,7 +264,13 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * clock in the boot log wrong (DDR 2500 instead of 1200, Bus 218
      * instead of 293).
      */
-    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000100 | s->chip_mode;
+    {
+        const char *cfg0 = getenv("MT7621_SYSCFG0");
+
+        s->sysctl_regs[SYS_SYSCFG0 / 4] = cfg0
+            ? (uint32_t)strtoul(cfg0, NULL, 0)
+            : (0x00000100 | s->chip_mode);
+    }
     /*
      * CPLL clock config.  RouterBOOT programs 0x40800000 on the RB750Gr3,
      * which is how Linux ends up reporting the 875 MHz CPU clock (and the
@@ -274,9 +280,13 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      */
     {
         const char *cfg = getenv("MT7621_CLKCFG");
+        const char *cfg1 = getenv("MT7621_CLKCFG1");
 
         s->sysctl_regs[SYS_CLKCFG0 / 4] = cfg ? (uint32_t)strtoul(cfg, NULL, 0)
                                               : 0x40800000;
+        if (cfg1) {
+            s->sysctl_regs[0x30 / 4] = (uint32_t)strtoul(cfg1, NULL, 0);
+        }
     }
     {
         const char *sts = getenv("MT7621_CLKSTS");
@@ -307,8 +317,16 @@ static void mt7621_dramc_defaults(MT7621State *s)
         const char *v604 = getenv("MT7621_MEMC604");
         const char *v618 = getenv("MT7621_MEMC618");
 
-        s->dramc_regs[0x604 / 4] = v604 ? (uint32_t)strtoul(v604, NULL, 0) : 0;
-        s->dramc_regs[0x618 / 4] = v618 ? (uint32_t)strtoul(v618, NULL, 0) : 0x190;
+        /*
+         * DDR rate decode: 0x604 bit 2 halves it and 0x618 carries the
+         * multiplier ((v >> 4) * 4 with a 40 MHz reference).  0x4 / 0xf0 is
+         * the pair that prints DDR 1200 on a 40 MHz crystal, the rate a real
+         * B70-class board reports.
+         */
+        s->dramc_regs[0x604 / 4] = v604 ? (uint32_t)strtoul(v604, NULL, 0)
+                                        : 0x00000004;
+        s->dramc_regs[0x618 / 4] = v618 ? (uint32_t)strtoul(v618, NULL, 0)
+                                        : 0x000000f0;
     }
     /*
      * MEMC CPU PLL (0x648), decoded by Linux's clk-mt7621 as
@@ -635,6 +653,9 @@ static void mt7621_reset(void *opaque)
      */
     if (mt7621_flag("MT7621_NO_CMGCR") && !getenv("MT7621_CFG3")) {
         env->CP0_Config3 &= ~((1u << 13) | (1u << 29));
+    }
+    if (getenv("MT7621_CFG2")) {
+        env->CP0_Config2 = strtoul(getenv("MT7621_CFG2"), NULL, 0);
     }
     if (getenv("MT7621_CFG3")) {
         env->CP0_Config3 = strtoul(getenv("MT7621_CFG3"), NULL, 0);
