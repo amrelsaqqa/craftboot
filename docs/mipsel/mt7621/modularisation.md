@@ -1,14 +1,18 @@
 # Splitting the mt7621 machine: notes for the next agent
 
-**Status: in progress on `refactor/mt7621-modules`.**  Out so far:
+**Status: in progress on `refactor/mt7621-modules`.**  The Ethernet subsystem
+is out (`modules/eth.c`, 1,456 lines, plus the private `modules/eth.h`), which
+was the largest block.  `mt7621.c` is down to 2,116 lines from 5,469.
+
+Out so far:
 `modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
 register-file ops plus the GPIO semantics inside it), `modules/wdt.c` (timer 1
 of the system controller), `modules/systick.c` (cevt-systick, its timers and
 the boot hand-over), `modules/board.c` (presets, aliases, image probe and
 `chip_mode`), `modules/flash.c` (SPI NOR controller + W25Q128FV die) and
 `modules/nand.c` (NFI + K9F1G08U0B die, dump loader, persistence).
-`mt7621.c` is down to 3,654 lines; the modules total 1,744.  Every step passed
-check-patches, a fresh prep + build, boot-smoke 3/3 and net-ping 5/5.
+Every step passed check-patches, a fresh prep + build, boot-smoke 3/3 and
+net-ping 5/5 (the tap is now usable on this host).
 
 Two moves are not quite the pure moves the plan assumed:
 
@@ -21,10 +25,22 @@ Two moves are not quite the pure moves the plan assumed:
   `wdt_rst_cause` is still consumed by the machine's reset path, so only the
   timer and ops moved.
 
-Next: PDMA/QDMA plus the MT7530 switch glue as one subsystem, with a private
-`modules/eth.h` for its register/state types (the QPIC precedent).  Then the
-CM/CPC block, the EIP-93 crypto engine, and whatever the loader/ELF path still
-needs once those are gone.
+Next: the CM/CPC block (GCR + CPC, `mt7621_cm_read/write`, core start/reset),
+the EIP-93 crypto engine, and the loader (uImage/ELF) if it still wants its own
+file.  The debug knobs (guest code patcher, RAM dump/window) are candidates for
+a `dump.c` like ipq4019's.
+
+Notes from the Ethernet move, since it is the pattern for a subsystem:
+
+- Private register maps go in `modules/<block>.h` when there are many (109
+  lines of ETH/PDMA/QDMA/TX_DMA/RX_DMA bits here); the machine must not see
+  them.
+- Two machine entry points fell out naturally: `mt7621_eth_init()` (port
+  selection, NIC, MMIO + SRAM windows, nitest timer) and
+  `mt7621_eth_dev_reset()` (ring state, switch/PHY defaults).  Reset was the
+  only place the machine touched the frame engine directly.
+- Definition order inside the new file matters: `phy/switch defaults` call
+  `mt7621_sw_word()`, so they must come after it, not before.
 
 Two more interface notes from this round: `mt7621_pwrite_all()` had to become
 public because the machine's NAND flush uses the same helper, and both die
