@@ -3,8 +3,10 @@
 **Status: in progress on `refactor/mt7621-modules`.**  The Ethernet subsystem
 is out (`modules/eth.c`, 1,456 lines, plus the private `modules/eth.h`), which
 was the largest block; so are the CM/CPC (`modules/cm.c`) and the EIP-93
-crypto engine (`modules/crypto.c`).  `mt7621.c` is down to 1,729 lines from
-5,469.
+crypto engine (`modules/crypto.c`).  The loader (`modules/loader.c`), the
+NAND attach (`modules/nand.c`) and the debug knobs (`modules/dump.c`) followed.
+`mt7621.c` is **1,082 lines from 5,469** -- below ipq4019's 2,244 for the same
+kind of machine.
 
 Out so far:
 `modules/uart.c` (TX-only 16550 mirror), `modules/regfile.c` (the shared
@@ -27,12 +29,11 @@ Two moves are not quite the pure moves the plan assumed:
   `wdt_rst_cause` is still consumed by the machine's reset path, so only the
   timer and ops moved.
 
-What is left in `mt7621.c` is the machine proper (memory map, RAM/alias
-windows, boot stages, reset sequencing, `-M` properties) plus three candidates
-for further moves: the uImage/ELF loader, the NAND attach (`-drive
-if=none,id=nand`, which belongs with `modules/nand.c`) and the debug knobs
-(guest code patcher, RAM dump/window) -- the last group is a `dump.c` in the
-ipq4019 shape.
+What is left in `mt7621.c` is the machine proper: memory map, RAM and KSEG1
+alias windows, boot stages, reset sequencing, `-M` properties and the
+command-line injection knob.  The split is structurally done; further work
+would be ripple (splitting `sysctl_defaults`/`dramc_defaults` out of the
+machine, say), not structure.
 
 Notes from the Ethernet move, since it is the pattern for a subsystem:
 
