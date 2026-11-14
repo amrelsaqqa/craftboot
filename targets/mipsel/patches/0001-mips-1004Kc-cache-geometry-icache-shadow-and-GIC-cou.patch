@@ -1,90 +1,20 @@
-From e1ea78699ec28a53e93c4512dac2073fcf317fd6 Mon Sep 17 00:00:00 2001
+From 99af008bd26b6e0c7e11404323be6229ff473788 Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
-Date: Thu, 12 Nov 2026 01:39:41 +0200
-Subject: [PATCH 1/5] mt7621: QEMU-side changes for the MT7621 machine
+Date: Sat, 14 Nov 2026 18:57:25 +0200
+Subject: [PATCH 1/3] mips: 1004Kc cache geometry, icache shadow and GIC
+ counter frequency
 
-Working-tree additions that used to live only in qemu-mt7621.patch:
-instruction-cache shadow, GIC/gictimer adjustments, CP0 Def/config
-tweaks for the 1004Kc model.  Committed on a local branch so revisions
-can be switched with git checkout instead of applying patches.
 ---
- accel/tcg/cpu-exec.c                    |  44 ++++++++
- accel/tcg/cputlb.c                      | 111 ++++++++++++++++++-
- accel/tcg/translator.c                  |   4 +
- hw/intc/mips_gic.c                      |  62 +++++++++++
- hw/timer/mips_gictimer.c                |  72 ++++++++++--
- include/exec/icache-shadow.h            |  54 +++++++++
- include/hw/timer/mips_gictimer.h        |   1 +
- target/mips/cpu-defs.c.inc              | 107 ++++++++++++++++++
- target/mips/tcg/system/special_helper.c |  15 +++
- target/mips/tcg/system/tlb_helper.c     | 139 +++++++++++++++++++++++-
- target/mips/tcg/system_helper.h.inc     |   1 +
- target/mips/tcg/translate.c             |  69 ++++++++----
- 12 files changed, 651 insertions(+), 28 deletions(-)
+ accel/tcg/cputlb.c               | 111 ++++++++++++++++++++++++++++++-
+ accel/tcg/translator.c           |   4 ++
+ hw/timer/mips_gictimer.c         |  51 ++++++++++++--
+ include/exec/icache-shadow.h     |  54 +++++++++++++++
+ include/hw/timer/mips_gictimer.h |   1 +
+ target/mips/cpu-defs.c.inc       | 107 +++++++++++++++++++++++++++++
+ target/mips/tcg/translate.c      |  69 +++++++++++++------
+ 7 files changed, 370 insertions(+), 27 deletions(-)
  create mode 100644 include/exec/icache-shadow.h
 
-diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
-index ad94f96..43c4607 100644
---- a/accel/tcg/cpu-exec.c
-+++ b/accel/tcg/cpu-exec.c
-@@ -881,6 +881,49 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
-     return false;
- }
- 
-+
-+/*
-+ * Bring-up aid (MT7621_PCWATCH): keep the last 128 translated-block PCs and
-+ * dump them the first time execution leaves the kernel image range, i.e. the
-+ * first user-space entry or the first runaway into the heap.
-+ */
-+static void pcwatch_note(uint64_t pc)
-+{
-+    static int on = -1;
-+    static int armed, done;
-+    static uint64_t ring[256];
-+    static unsigned idx;
-+    unsigned i;
-+
-+    if (on < 0) {
-+        on = getenv("MT7621_PCWATCH") != NULL;
-+    }
-+    if (!on || done || pc < 0x80000000ULL) {
-+        return;
-+    }
-+    /* arm when the kernel's syscall dispatch runs (execve("/init") path) */
-+    if (!armed) {
-+        if (pc < 0x8010c200ULL || pc >= 0x8010c400ULL) {
-+            return;
-+        }
-+        armed = 1;
-+        fprintf(stderr, "pcwatch: armed at exec path pc=%08llx\n",
-+                (unsigned long long)pc);
-+    }
-+    ring[idx & 255] = pc;
-+    idx++;
-+    /* dump when the boot thread goes to sleep (r4k_wait) */
-+    if (pc >= 0x80107400ULL && pc < 0x80107500ULL) {
-+        done = 1;
-+        fprintf(stderr, "pcwatch: first sleep at pc=%08llx, last %u TBs:\n",
-+                (unsigned long long)pc, idx < 256 ? idx : 256);
-+        for (i = 0; i < (idx < 256 ? idx : 256); i++) {
-+            unsigned k = (idx - (idx < 256 ? idx : 256) + i) & 255;
-+            fprintf(stderr, "  %08llx\n", (unsigned long long)ring[k]);
-+        }
-+    }
-+}
-+
- static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
-                                     vaddr pc, TranslationBlock **last_tb,
-                                     int *tb_exit)
-@@ -996,6 +1039,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
-                 tb_add_jump(last_tb, tb_exit, tb);
-             }
- 
-+            pcwatch_note(tb->pc);
-             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
- 
-             /* Try to align the host and virtual clocks
 diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
 index fd1606c..be4473f 100644
 --- a/accel/tcg/cputlb.c
@@ -243,139 +173,15 @@ index 034f2f3..6bfd3dd 100644
      return val;
  }
  
-diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
-index 0c50ba4..42ef79e 100644
---- a/hw/intc/mips_gic.c
-+++ b/hw/intc/mips_gic.c
-@@ -19,10 +19,42 @@
- #include "system/reset.h"
- #include "kvm_mips.h"
- #include "hw/intc/mips_gic.h"
-+#include "qemu/osdep.h"
-+#include <stdlib.h>
-+static int gic_log_on(void)
-+{
-+    static int v = -1;
-+    if (v < 0) v = getenv("MT7621_GICLOG") != NULL;
-+    return v;
-+}
-+static void gic_log(const char *op, hwaddr addr, uint64_t val)
-+{
-+    CPUState *cs = qemu_get_cpu(0);
-+    uint32_t pc = 0;
-+    if (cs) {
-+        CPUMIPSState *env = cpu_env(cs);
-+        pc = (uint32_t)env->active_tc.PC;
-+    }
-+    fprintf(stderr, "gic: %s %04x <- %08x pc=%08x\n", op, (unsigned)addr,
-+            (uint32_t)val, pc);
-+}
- #include "hw/irq.h"
- #include "hw/qdev-properties.h"
- 
-+static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin);
-+
- static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
-+{
-+    static int budget = 300;
-+    if (gic_log_on() && budget-- > 0) {
-+        CPUState *cs = qemu_get_cpu(0);
-+        uint32_t pc = cs ? (uint32_t)cpu_env(cs)->active_tc.PC : 0;
-+        fprintf(stderr, "gic: set_vp_irq vp=%d pin=%d pc=%08x\n", vp, pin, pc);
-+    }
-+    mips_gic_set_vp_irq_impl(gic, vp, pin);
-+}
-+
-+static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin)
- {
-     int ored_level = 0;
-     int i;
-@@ -50,6 +82,18 @@ static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
-                                    pin + GIC_CPU_PIN_OFFSET,
-                                    ored_level);
-     } else {
-+        if (gic_log_on()) {
-+            static int budget = 120;
-+            if (budget-- > 0) {
-+                fprintf(stderr, "gic: cpu pin %d level %d (vp mask %08x pend %08x)\n",
-+                        pin + GIC_CPU_PIN_OFFSET, ored_level,
-+                        gic->vps[vp].mask, gic->vps[vp].pend);
-+            }
-+        }
-+        if (getenv("MT7621_IPILOG") && vp != 0) {
-+            fprintf(stderr, "ipilog: -> vp%d pin%d level%d\n",
-+                    vp, pin + GIC_CPU_PIN_OFFSET, ored_level);
-+        }
-         qemu_set_irq(gic->vps[vp].env->irq[pin + GIC_CPU_PIN_OFFSET],
-                      ored_level);
-     }
-@@ -70,6 +114,12 @@ static void gic_set_irq(void *opaque, int n_IRQ, int level)
- {
-     MIPSGICState *gic = (MIPSGICState *) opaque;
- 
-+    if (gic_log_on()) {
-+        static int budget = 200;
-+        if (budget-- > 0) {
-+            fprintf(stderr, "gic: input %d -> level %d\n", n_IRQ, level);
-+        }
-+    }
-     gic->irq_state[n_IRQ].pending = (uint8_t) level;
-     if (!gic->irq_state[n_IRQ].enabled) {
-         /* GIC interrupt source disabled */
-@@ -187,6 +237,9 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
-                       size, addr);
-         break;
-     }
-+    if (gic_log_on()) {
-+        gic_log("rd", addr, ret);
-+    }
-     return ret;
- bad_offset:
-     qemu_log_mask(LOG_GUEST_ERROR, "Wrong GIC offset at 0x%" PRIx64 "\n", addr);
-@@ -259,6 +312,9 @@ bad_offset:
- 
- static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
- {
-+    if (gic_log_on()) {
-+        gic_log("wr", addr, data);
-+    }
-     int intr;
-     MIPSGICState *gic = (MIPSGICState *) opaque;
-     uint32_t vp_index = current_cpu->cpu_index;
-@@ -297,6 +353,12 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
-     case GIC_SH_WEDGE_OFS:
-         /* Figure out which VP/HW Interrupt this maps to */
-         intr = data & ~GIC_SH_WEDGE_RW_MSK;
-+        if (getenv("MT7621_IPILOG")) {
-+            fprintf(stderr, "ipilog: WEDGE irq=%u %s map_vp=%d pin=%u\n",
-+                    intr, (data & GIC_SH_WEDGE_RW_MSK) ? "set" : "clr",
-+                    (int)gic->irq_state[intr].map_vp,
-+                    (unsigned)(gic->irq_state[intr].map_pin & GIC_MAP_MSK));
-+        }
-         /* Mask/Enabled Checks */
-         OFFSET_CHECK(intr < gic->num_irq);
-         if (data & GIC_SH_WEDGE_RW_MSK) {
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
-index 2b0696d..1b9d359 100644
+index 2b0696d..e9f7bf4 100644
 --- a/hw/timer/mips_gictimer.c
 +++ b/hw/timer/mips_gictimer.c
-@@ -9,12 +9,47 @@
- #include "qemu/osdep.h"
+@@ -10,11 +10,35 @@
  #include "qemu/timer.h"
  #include "hw/timer/mips_gictimer.h"
-+#include <stdlib.h>
  
 -#define TIMER_PERIOD 10 /* 10 ns period for 100 Mhz frequency */
-+static int gt_log_on(void)
-+{
-+    static int v = -1;
-+    static int budget = 400;
-+    if (v < 0) v = getenv("MT7621_GICTIMERLOG") != NULL;
-+    if (!v) return 0;
-+    if (budget-- <= 0) return 0;
-+    return 1;
-+}
-+
 +/*
 + * The GIC shared counter ticks at the SoC's "GIC frequency".  The MT7621
 + * feeds it from the CPU clock (RouterBOOT reports 875 MHz on the RB750Gr3 and
@@ -409,7 +215,7 @@ index 2b0696d..1b9d359 100644
  }
  
  static void gic_vptimer_update(MIPSGICTimerState *gictimer,
-@@ -23,9 +58,28 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -23,9 +47,22 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
      uint64_t next;
      uint32_t wait;
  
@@ -431,27 +237,10 @@ index 2b0696d..1b9d359 100644
 -    next = now + (uint64_t)wait * TIMER_PERIOD;
 +           (uint32_t)gictimer_ticks(now);
 +    next = now + gictimer_ns((uint64_t)wait);
-+    if (gt_log_on()) {
-+        fprintf(stderr, "gictimer: vp%d cmp=%08x cnt=%08x wait=%u now=%lld\n",
-+                (int)vp_index, gictimer->vptimers[vp_index].comparelo,
-+                gictimer->sh_counterlo + (uint32_t)gictimer_ticks(now),
-+                wait, (long long)now);
-+    }
  
      timer_mod(gictimer->vptimers[vp_index].qtimer, next);
  }
-@@ -37,6 +91,10 @@ static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
-         /* timer stopped */
-         return;
-     }
-+    if (gt_log_on()) {
-+        fprintf(stderr, "gictimer: EXPIRE vp%d now=%lld\n",
-+                (int)vp_index, (long long)now);
-+    }
-     gictimer->cb(gictimer->opaque, vp_index);
-     gic_vptimer_update(gictimer, vp_index, now);
- }
-@@ -64,7 +122,7 @@ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
+@@ -64,7 +101,7 @@ uint32_t mips_gictimer_get_sh_count(MIPSGICTimerState *gictimer)
                  gic_vptimer_expire(gictimer, i, now);
              }
          }
@@ -460,7 +249,7 @@ index 2b0696d..1b9d359 100644
      }
  }
  
-@@ -78,7 +136,7 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
+@@ -78,7 +115,7 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
      } else {
          /* Store new count register */
          now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -469,7 +258,7 @@ index 2b0696d..1b9d359 100644
          /* Update timer timer */
          for (i = 0; i < gictimer->num_vps; i++) {
              gic_vptimer_update(gictimer, i, now);
-@@ -118,7 +176,7 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
+@@ -118,7 +155,7 @@ void mips_gictimer_stop_count(MIPSGICTimerState *gictimer)
      gictimer->countstop = 1;
      /* Store the current value */
      gictimer->sh_counterlo +=
@@ -675,239 +464,6 @@ index d93b9d3..26ad941 100644
      {
          .name = "74Kf",
          .CP0_PRid = 0x00019700,
-diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
-index b54cbe8..fb90f45 100644
---- a/target/mips/tcg/system/special_helper.c
-+++ b/target/mips/tcg/system/special_helper.c
-@@ -19,6 +19,7 @@
-  */
- 
- #include "qemu/osdep.h"
-+#include "exec/icache-shadow.h"
- #include "qemu/log.h"
- #include "cpu.h"
- #include "exec/helper-proto.h"
-@@ -101,6 +102,8 @@ bool mips_io_recompile_replay_branch(CPUState *cs, const TranslationBlock *tb)
-     return false;
- }
- 
-+void mt7621_sysret_trace(CPUMIPSState *env);
-+
- static inline void exception_return(CPUMIPSState *env)
- {
-     debug_pre_eret(env);
-@@ -113,6 +116,9 @@ static inline void exception_return(CPUMIPSState *env)
-     }
-     compute_hflags(env);
-     debug_post_eret(env);
-+    if (getenv("MT7621_RECVLOG")) {
-+        mt7621_sysret_trace(env);
-+    }
- }
- 
- void helper_eret(CPUMIPSState *env)
-@@ -139,6 +145,15 @@ void helper_deret(CPUMIPSState *env)
-     debug_post_eret(env);
- }
- 
-+/*
-+ * Flush the instruction-cache shadow: what the guest writes to memory is
-+ * visible to instruction fetch again.
-+ */
-+void helper_icache_shadow_flush(CPUMIPSState *env, target_ulong addr)
-+{
-+    icache_shadow_invalidate(addr);
-+}
-+
- void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
- {
-     static const char *const type_name[] = {
-diff --git a/target/mips/tcg/system/tlb_helper.c b/target/mips/tcg/system/tlb_helper.c
-index 566924b..b38307c 100644
---- a/target/mips/tcg/system/tlb_helper.c
-+++ b/target/mips/tcg/system/tlb_helper.c
-@@ -1028,6 +1028,11 @@ static inline void set_badinstr_registers(CPUMIPSState *env)
-     }
- }
- 
-+static int mt7621_pend;
-+static int mt7621_pendfd;
-+static uint32_t mt7621_pendbuf;
-+void mt7621_sysret_trace(CPUMIPSState *env);
-+
- void mips_cpu_do_interrupt(CPUState *cs)
- {
-     MIPSCPU *cpu = MIPS_CPU(cs);
-@@ -1223,10 +1228,96 @@ void mips_cpu_do_interrupt(CPUState *cs)
-     case EXCP_DBE:
-         cause = 7;
-         goto set_EPC;
--    case EXCP_SYSCALL:
-+    case EXCP_SYSCALL: {
-+        static int budget = 400;
-+        static int netbudget = 4000;
-+        if (getenv("MT7621_RECVLOG")) {
-+            unsigned nr2 = (unsigned)env->active_tc.gpr[2];
-+            /*
-+             * The receive buffer doubles as the build buffer for sendto(),
-+             * so dumping it on recvfrom() entry only shows the previous
-+             * send.  Sample it at the first syscall after the call returned
-+             * instead.
-+             */
-+            if (mt7621_pend) {
-+                char pbuf[56];
-+                size_t i;
-+                mt7621_pend = 0;
-+                memset(pbuf, 0, sizeof(pbuf));
-+                cpu_memory_rw_debug(env_cpu(env), mt7621_pendbuf, (void *)pbuf, 48,
-+                                    false);
-+                fprintf(stderr, "net got fd=%d:", mt7621_pendfd);
-+                for (i = 0; i < 48; i++) {
-+                    fprintf(stderr, " %02x", (unsigned char)pbuf[i]);
-+                }
-+                fprintf(stderr, " |");
-+                for (i = 0; i < 48; i++) {
-+                    fputc(g_ascii_isprint(pbuf[i]) ? pbuf[i] : '.', stderr);
-+                }
-+                fprintf(stderr, "|\n");
-+            }
-+            if ((nr2 == 4176 || nr2 == 4180) && netbudget-- > 0) {
-+                uint32_t b = (uint32_t)env->active_tc.gpr[5];
-+                unsigned n = (unsigned)env->active_tc.gpr[6];
-+                char dbuf[64];
-+                size_t i;
-+                memset(dbuf, 0, sizeof(dbuf));
-+                if (n > 48) {
-+                    n = 48;
-+                }
-+                cpu_memory_rw_debug(env_cpu(env), b, (void *)dbuf, n, false);
-+                fprintf(stderr, "net %s fd=%u buf=%08x len=%u:",
-+                        nr2 == 4176 ? "recv" : "send",
-+                        (unsigned)env->active_tc.gpr[4], b,
-+                        (unsigned)env->active_tc.gpr[6]);
-+                for (i = 0; i < n; i++) {
-+                    fprintf(stderr, " %02x", (unsigned char)dbuf[i]);
-+                }
-+                fprintf(stderr, " |");
-+                for (i = 0; i < n; i++) {
-+                    fputc(g_ascii_isprint(dbuf[i]) ? dbuf[i] : '.', stderr);
-+                }
-+                fprintf(stderr, "|\n");
-+                if (nr2 == 4176) {
-+                    mt7621_pend = 1;
-+                    mt7621_pendfd = (int)env->active_tc.gpr[4];
-+                    mt7621_pendbuf = b;
-+                }
-+            }
-+        }
-+        if (getenv("MT7621_SYSCALLLOG") && budget-- > 0) {
-+            unsigned nr = (unsigned)env->active_tc.gpr[2];
-+            fprintf(stderr, "syscall nr=%u a0=%08x a1=%08x a2=%08x pc=%08x",
-+                    nr, (uint32_t)env->active_tc.gpr[4],
-+                    (uint32_t)env->active_tc.gpr[5],
-+                    (uint32_t)env->active_tc.gpr[6],
-+                    (uint32_t)env->active_tc.PC);
-+            /* 4005 = open, 4288 = openat: print the pathname */
-+            if (nr == 4005 || nr == 4288) {
-+                uint32_t a = (uint32_t)env->active_tc.gpr[4];
-+                char path[80];
-+                size_t i;
-+                if (nr == 4288) {
-+                    a = (uint32_t)env->active_tc.gpr[5];
-+                }
-+                memset(path, 0, sizeof(path));
-+                if (cpu_memory_rw_debug(env_cpu(env), a, (void *)path,
-+                                        sizeof(path) - 1, false) >= 0) {
-+                    for (i = 0; i < sizeof(path) - 1; i++) {
-+                        if (!g_ascii_isprint(path[i])) {
-+                            path[i] = 0;
-+                            break;
-+                        }
-+                    }
-+                    fprintf(stderr, " path=\"%s\"", path);
-+                }
-+            }
-+            fprintf(stderr, "\n");
-+        }
-         cause = 8;
-         update_badinstr = 1;
-         goto set_EPC;
-+    }
-     case EXCP_BREAK:
-         cause = 9;
-         update_badinstr = 1;
-@@ -1324,6 +1415,16 @@ void mips_cpu_do_interrupt(CPUState *cs)
-         }
- 
-         env->active_tc.PC += offset;
-+        if (getenv("MT7621_VECLOG")) {
-+            static int budget = 60;
-+            if (budget-- > 0) {
-+                fprintf(stderr, "vec: ebase=%08x exbase=%08x status=%08x "
-+                        "cause=%d pc=%08x epc=%08x\n",
-+                        (unsigned)env->CP0_EBase, (unsigned)env->exception_base,
-+                        (unsigned)env->CP0_Status, cause,
-+                        (unsigned)env->active_tc.PC, (unsigned)env->CP0_EPC);
-+            }
-+        }
-         set_hflags_for_handler(env);
-         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
-                          (cause << CP0Ca_EC);
-@@ -1350,6 +1451,42 @@ void mips_cpu_do_interrupt(CPUState *cs)
-     cs->exception_index = EXCP_NONE;
- }
- 
-+/*
-+ * MT7621_RECVLOG: the netinstall agent polls its discovery sockets through
-+ * the libc syscall stub at 0x432228, so sample the return value right after
-+ * the stub resumes: a positive v0 is the number of bytes recvfrom() put in
-+ * the buffer, which is the only reliable way to see what the agent got.
-+ */
-+
-+void mt7621_sysret_trace(CPUMIPSState *env)
-+{
-+    uint32_t pc = (uint32_t)env->active_tc.PC;
-+    int32_t v0 = (int32_t)env->active_tc.gpr[2];
-+    char pbuf[56];
-+    size_t i;
-+
-+    if (!mt7621_pend || pc != 0x43222c) {
-+        return;
-+    }
-+    mt7621_pend = 0;
-+    fprintf(stderr, "net ret fd=%d v0=%d", mt7621_pendfd, v0);
-+    if (v0 > 0 && v0 < 1500) {
-+        memset(pbuf, 0, sizeof(pbuf));
-+        cpu_memory_rw_debug(env_cpu(env), mt7621_pendbuf, (void *)pbuf,
-+                            v0 < 48 ? v0 : 48, false);
-+        fprintf(stderr, ":");
-+        for (i = 0; i < 48; i++) {
-+            fprintf(stderr, " %02x", (unsigned char)pbuf[i]);
-+        }
-+        fprintf(stderr, " |");
-+        for (i = 0; i < 48; i++) {
-+            fputc(g_ascii_isprint(pbuf[i]) ? pbuf[i] : '.', stderr);
-+        }
-+        fprintf(stderr, "|");
-+    }
-+    fprintf(stderr, "\n");
-+}
-+
- bool mips_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
- {
-     if (interrupt_request & CPU_INTERRUPT_HARD) {
-diff --git a/target/mips/tcg/system_helper.h.inc b/target/mips/tcg/system_helper.h.inc
-index eaac5e2..12ec343 100644
---- a/target/mips/tcg/system_helper.h.inc
-+++ b/target/mips/tcg/system_helper.h.inc
-@@ -175,6 +175,7 @@ DEF_HELPER_1(eret, void, env)
- DEF_HELPER_1(eretnc, void, env)
- DEF_HELPER_1(deret, void, env)
- DEF_HELPER_3(cache, void, env, tl, i32)
-+DEF_HELPER_2(icache_shadow_flush, void, env, tl)
- 
- #ifdef TARGET_MIPS64
- /* Longson CSR */
 diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
 index 54849e9..7a6804a 100644
 --- a/target/mips/tcg/translate.c

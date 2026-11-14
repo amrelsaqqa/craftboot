@@ -1,3 +1,6 @@
 # Machine mt7621 — applied after the target series, in this order.
 # 'make TARGET=mipsel check-patches' proves they apply to a pristine checkout.
 targets/mipsel/machines/mt7621/patches/0001-hw-mips-mt7621-base-hook.patch
+targets/mipsel/machines/mt7621/patches/0002-mt7621-bring-up-tracing-in-the-MIPS-core.patch
+targets/mipsel/machines/mt7621/patches/0003-mt7621-syslog-trace.patch
+targets/mipsel/machines/mt7621/patches/0004-mt7621-cachelog.patch

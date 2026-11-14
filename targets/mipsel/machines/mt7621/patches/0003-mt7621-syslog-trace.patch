@@ -1,7 +1,7 @@
 From cccae4c8cadec8c83ef5994caa0a7dea02acdaba Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 01:42:11 +0200
-Subject: [PATCH 2/5] mt7621: MT7621_SYSLOG trace (syscalls + read buffers)
+Subject: [PATCH] mt7621: MT7621_SYSLOG trace (syscalls + read buffers)
 
 Restores the diagnostic that was lost when the QEMU-side working tree was
 reset: logs open/mount/stat/ioctl/mknod/symlink with decoded string arguments,

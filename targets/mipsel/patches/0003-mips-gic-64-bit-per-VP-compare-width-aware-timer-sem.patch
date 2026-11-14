@@ -1,7 +1,7 @@
-From 6bc283dfc7d8345608f0c0085c1e6895cfff6283 Mon Sep 17 00:00:00 2001
+From 51a7dfdf6f6f49587424545b7839b5d62b12c60d Mon Sep 17 00:00:00 2001
 From: Amr Elsaqqa <amrelsaqqa@hotmail.com>
 Date: Thu, 12 Nov 2026 16:46:50 +0200
-Subject: [PATCH 5/5] mips-gic: 64-bit per-VP compare, width-aware timer
+Subject: [PATCH 3/3] mips-gic: 64-bit per-VP compare, width-aware timer
  semantics
 
 * GIC_VP_COMPARE_HI is now readable/writable and the deadline is stored as a
@@ -15,18 +15,20 @@ Subject: [PATCH 5/5] mips-gic: 64-bit per-VP compare, width-aware timer
 
 mt7621: set counter-bits=8 (hardware), keep MT7621_GIC_COUNTER_BITS and
 MT7621_CPU_PLL as experiment knobs only.
+
+(cherry picked from commit 6bc283dfc7d8345608f0c0085c1e6895cfff6283)
 ---
- hw/intc/mips_gic.c               |  41 +++++++----
- hw/timer/mips_gictimer.c         | 113 +++++++++++++++++++++++++------
+ hw/intc/mips_gic.c               |  41 +++++++-----
+ hw/timer/mips_gictimer.c         | 108 ++++++++++++++++++++++++++-----
  include/hw/intc/mips_gic.h       |   7 ++
  include/hw/timer/mips_gictimer.h |   8 ++-
- 4 files changed, 134 insertions(+), 35 deletions(-)
+ 4 files changed, 131 insertions(+), 33 deletions(-)
 
 diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
-index b92553a..8fd74fd 100644
+index 989c2a9..2844f4e 100644
 --- a/hw/intc/mips_gic.c
 +++ b/hw/intc/mips_gic.c
-@@ -156,7 +156,7 @@ static uint64_t gic_read_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
+@@ -106,7 +106,7 @@ static uint64_t gic_read_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
      case GIC_VP_COMPARE_LO_OFS:
          return mips_gictimer_get_vp_compare(gic->gic_timer, vp_index);
      case GIC_VP_COMPARE_HI_OFS:
@@ -35,7 +37,7 @@ index b92553a..8fd74fd 100644
      default:
          qemu_log_mask(LOG_UNIMP, "Read %d bytes at GIC offset LOCAL/OTHER 0x%"
                        PRIx64 "\n", size, addr);
-@@ -182,7 +182,10 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
+@@ -132,7 +132,10 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
          ret = mips_gictimer_get_sh_count(gic->gic_timer);
          break;
      case GIC_SH_COUNTERHI_OFS:
@@ -47,7 +49,7 @@ index b92553a..8fd74fd 100644
          break;
      case GIC_SH_PEND_OFS ... GIC_SH_PEND_LAST_OFS:
          /* each bit represents pending status for an interrupt pin */
-@@ -230,7 +233,10 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
+@@ -180,7 +183,10 @@ static uint64_t gic_read(void *opaque, hwaddr addr, unsigned size)
          ret = mips_gictimer_get_sh_count(gic->gic_timer);
          break;
      case USM_VISIBLE_SECTION_OFS + GIC_USER_MODE_COUNTERHI:
@@ -59,7 +61,7 @@ index b92553a..8fd74fd 100644
          break;
      default:
          qemu_log_mask(LOG_UNIMP, "Read %d bytes at GIC offset 0x%" PRIx64 "\n",
-@@ -300,6 +306,11 @@ static void gic_write_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
+@@ -247,6 +253,11 @@ static void gic_write_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
      case GIC_VP_COMPARE_LO_OFS:
          gic_timer_store_vp_compare(gic, vp_index, data);
          break;
@@ -71,7 +73,7 @@ index b92553a..8fd74fd 100644
      default:
          qemu_log_mask(LOG_UNIMP, "Write %d bytes at GIC offset LOCAL/OTHER "
                        "0x%" PRIx64" 0x%08" PRIx64 "\n", size, addr, data);
-@@ -342,7 +353,8 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
+@@ -286,7 +297,8 @@ static void gic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
          }
          break;
      case GIC_SH_COUNTERHI_OFS:
@@ -81,7 +83,7 @@ index b92553a..8fd74fd 100644
              mips_gictimer_store_sh_count_hi(gic->gic_timer, data);
          }
          break;
-@@ -424,17 +436,8 @@ static void gic_reset(void *opaque)
+@@ -362,17 +374,8 @@ static void gic_reset(void *opaque)
      MIPSGICState *gic = (MIPSGICState *) opaque;
      int numintrs = (gic->num_irq / 8) - 1;
  
@@ -101,7 +103,7 @@ index b92553a..8fd74fd 100644
                       (numintrs     << GIC_SH_CONFIG_NUMINTRS_SHF)  |
                       (gic->num_vps << GIC_SH_CONFIG_PVPS_SHF);
      for (i = 0; i < gic->num_vps; i++) {
-@@ -506,6 +509,8 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
+@@ -444,6 +447,8 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
          }
      }
      s->gic_timer = mips_gictimer_init(s, s->num_vps, gic_timer_expire_cb);
@@ -110,7 +112,7 @@ index b92553a..8fd74fd 100644
      qdev_init_gpio_in(dev, gic_set_irq, s->num_irq);
      for (i = 0; i < s->num_irq; i++) {
          s->irq_state[i].irq = qdev_get_gpio_in(dev, i);
-@@ -515,6 +520,12 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
+@@ -453,6 +458,12 @@ static void mips_gic_realize(DeviceState *dev, Error **errp)
  static const Property mips_gic_properties[] = {
      DEFINE_PROP_UINT32("num-vp", MIPSGICState, num_vps, 1),
      DEFINE_PROP_UINT32("num-irq", MIPSGICState, num_irq, 256),
@@ -124,10 +126,10 @@ index b92553a..8fd74fd 100644
  
  static void mips_gic_class_init(ObjectClass *klass, const void *data)
 diff --git a/hw/timer/mips_gictimer.c b/hw/timer/mips_gictimer.c
-index 5181fa0..b2d9bfd 100644
+index 395e7f6..1b0f2aa 100644
 --- a/hw/timer/mips_gictimer.c
 +++ b/hw/timer/mips_gictimer.c
-@@ -52,6 +52,15 @@ static uint64_t gictimer_ns(uint64_t ticks)
+@@ -41,6 +41,15 @@ static uint64_t gictimer_ns(uint64_t ticks)
      return muldiv64(ticks, NANOSECONDS_PER_SECOND, gictimer_freq);
  }
  
@@ -143,7 +145,7 @@ index 5181fa0..b2d9bfd 100644
  /* 32-bit view of the shared counter, used by the per-VP compare logic. */
  static uint32_t gictimer_count32(MIPSGICTimerState *gictimer, uint64_t now)
  {
-@@ -65,7 +74,7 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -54,7 +63,7 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
                                     uint32_t vp_index, uint64_t now)
  {
      uint64_t next;
@@ -152,7 +154,7 @@ index 5181fa0..b2d9bfd 100644
  
      /*
       * 0xffffffff is the reset value of the compare register and means "not
-@@ -75,16 +84,49 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+@@ -64,17 +73,60 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
       * then sees an interrupt it can never acknowledge and spins forever with
       * Cause.IP2 stuck high.
       */
@@ -198,16 +200,7 @@ index 5181fa0..b2d9bfd 100644
 +               gictimer_count32(gictimer, now);
 +    }
 +    next = now + gictimer_ns(wait);
-     if (gt_log_on()) {
--        fprintf(stderr, "gictimer: vp%d cmp=%08x cnt=%08x wait=%u now=%lld\n",
--                (int)vp_index, gictimer->vptimers[vp_index].comparelo,
-+        fprintf(stderr, "gictimer: vp%d cmp=%08" PRIx64 " cnt=%08x "
-+                "wait=%" PRIu64 " now=%lld\n",
-+                (int)vp_index, gictimer->vptimers[vp_index].compare,
-                 gictimer_count32(gictimer, now),
-                 wait, (long long)now);
-     }
-@@ -92,6 +134,17 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
+ 
      timer_mod(gictimer->vptimers[vp_index].qtimer, next);
  }
  
@@ -225,9 +218,9 @@ index 5181fa0..b2d9bfd 100644
  static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
                                 uint64_t now)
  {
-@@ -103,6 +156,9 @@ static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
-         fprintf(stderr, "gictimer: EXPIRE vp%d now=%lld\n",
-                 (int)vp_index, (long long)now);
+@@ -82,6 +134,9 @@ static void gic_vptimer_expire(MIPSGICTimerState *gictimer, uint32_t vp_index,
+         /* timer stopped */
+         return;
      }
 +    gtc_log("expire", vp_index,
 +            gictimer->vptimers[vp_index].compare,
@@ -235,7 +228,7 @@ index 5181fa0..b2d9bfd 100644
      gictimer->cb(gictimer->opaque, vp_index);
      gic_vptimer_update(gictimer, vp_index, now);
  }
-@@ -155,19 +211,10 @@ static void gictimer_reanchor(MIPSGICTimerState *gictimer, uint64_t count,
+@@ -134,19 +189,10 @@ static void gictimer_reanchor(MIPSGICTimerState *gictimer, uint64_t count,
      }
  }
  
@@ -256,7 +249,7 @@ index 5181fa0..b2d9bfd 100644
  
      gictimer_reanchor(gictimer,
                        (cur & 0xffffffffULL) | ((uint64_t)hi << 32), now);
-@@ -176,7 +223,7 @@ void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gictimer, uint32_t hi)
+@@ -155,7 +201,7 @@ void mips_gictimer_store_sh_count_hi(MIPSGICTimerState *gictimer, uint32_t hi)
  void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
  {
      uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -265,7 +258,7 @@ index 5181fa0..b2d9bfd 100644
  
      /* A 32-bit write replaces the low half and leaves the high half alone. */
      gictimer_reanchor(gictimer,
-@@ -186,13 +233,41 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
+@@ -165,13 +211,41 @@ void mips_gictimer_store_sh_count(MIPSGICTimerState *gictimer, uint64_t count)
  uint32_t mips_gictimer_get_vp_compare(MIPSGICTimerState *gictimer,
                                        uint32_t vp_index)
  {

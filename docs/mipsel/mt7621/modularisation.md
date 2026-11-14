@@ -74,11 +74,19 @@ is specific to mt7621.
 
 ## What the split has hit so far
 
+- **Split by generality.**  The target series keeps what any machine of this
+  target can use -- generic MIPS/GIC mechanics -- and is named accordingly
+  (`mips: 1004Kc cache geometry, icache shadow and GIC counter frequency`,
+  `mips-gic: 64-bit shared counter`, `mips-gic: 64-bit per-VP compare`).  Every
+  `MT7621_*` knob and tracer lives in the machine series, because only this
+  machine's guests use it.
+
 - **The build hook is per machine.**  The target series is core changes only
-  (0001-0005); everything mt7621-specific is in
-  `machines/mt7621/patches/0001-hw-mips-mt7621-base-hook.patch`:
-  `CONFIG_MT7621` in `hw/mips/Kconfig`, `files('mt7621.c')` in
-  `hw/mips/meson.build`, and `subdir('mt7621')`.  The module list inside
+  (0001-0003); everything mt7621-specific is in
+  the machine series, `0001` being the base hook: `CONFIG_MT7621` in
+  `hw/mips/Kconfig`, `files('mt7621.c')` in `hw/mips/meson.build`, and
+  `subdir('mt7621')`; `0002-0004` are `bring-up tracing`, `syslog trace` and
+  `cachelog`.  The module list inside
   `hw/mips/mt7621/meson.build` is generated from `mt7621_MACHINE_SRCS` (see
   `mt7621_MACHINE_SS` and `mt7621_MACHINE_SUBDIR`).  Same shape as ipq4019,
   so `docs/machines.md`'s canonical hook describes both, and a second mipsel
