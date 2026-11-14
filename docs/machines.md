@@ -12,11 +12,10 @@ sit on the MDIO bus).  That split is the reason a machine is not one file:
 - **a board module** holds the presets and the merge order (explicit property
   beats preset beats env), so adding a board is a data change, not code.
 
-`ipq4019` is the **worked example** (eleven modules, `ipq4019.c` down from
-11.8k to 2.2k lines).  This document is the rule set extracted from that work,
-kept generic so the other machines can be moved the same way; `mt7621` is the
-next one to apply it to (its own notes are in
-`docs/mipsel/mt7621/modularisation.md`).
+`ipq4019` (arm) and `mt7621` (mipsel) are both split this way: the first was
+the worked example (eleven modules, `ipq4019.c` down from 11.8k to 2.2k lines),
+the second applied the rules afterwards (`mt7621.c` 5,469 → 1,082 with twelve
+modules).  Its own notes are in `docs/mipsel/mt7621/modularisation.md`.
 
 ### The worked example: ipq4019
 
@@ -59,6 +58,26 @@ Nothing is patched under `modules/`: the machine sources are *copied* into
 the QEMU tree by `prep`/`build`/`sync` and excluded from
 `export-patches` (they are the machine, not a core change).
 
+## Where a patch lives
+
+Two series exist per target, and the split decides what may go in each:
+
+| series | contents | applied |
+|---|---|---|
+| target (`targets/<arch>/patches` + `series`) | core changes any machine of the architecture needs: CPU/cache/GIC corrections, common helpers. **No machine names.** | always |
+| machine (`targets/<arch>/machines/<soc>/patches` + `series`) | that machine's own artifacts: its `config <SOC>` stanza, the `files('<soc>.c')` + `subdir('<soc>')` hook, and any core change that exists only for it (bring-up tracing, a machine-specific syslog path) | only when the machine is selected |
+
+That is not cosmetic: the target series is applied whether or not a given
+machine is selected, so a machine's Kconfig or meson hook there would reference
+a source `prep` never copied, and two machines' hunks in one series would
+conflict.  Machine *sources* are in neither series -- they are copied, not
+patched.
+
+`mt7621` is the reference split: three target patches (1004Kc cache geometry,
+two GIC fixes) with no machine names, four machine patches (base hook, bring-up
+tracing, syslog, cachelog).  `ipq4019` has no target series at all, so its
+whole hook is the one machine patch.
+
 ## Build mapping
 
 `config.mk` maps every source to its destination explicitly, because the
@@ -84,12 +103,19 @@ hw/arm/ipq4019.c
 hw/arm/ipq4019/{ipq4019.h, uart.c, gpio.c, …}
 ```
 
-and the machine hook patch is static -- it adds the machine file and enters
-the machine's directory:
+and the machine hook patch is static -- it adds the `config <SOC>` Kconfig
+stanza, the machine file, and enters the machine's directory:
 
 ```meson
 arm_common_ss.add(when: 'CONFIG_IPQ4019', if_true: files('ipq4019.c'))
 subdir('ipq4019')
+```
+
+```kconfig
+config IPQ4019
+    bool
+    default y
+    depends on TCG && ARM
 ```
 
 `hw/arm/ipq4019/meson.build` is **generated**, never edited: during
