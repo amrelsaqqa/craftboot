@@ -244,6 +244,8 @@ void mt7621_board_apply(MT7621State *s, const char *filename);
 void mt7621_spi_init(MT7621State *s);
 void mt7621_nfi_init(MT7621State *s);
 void mt7621_nand_load(MT7621State *s, const char *filename);
+void mt7621_eth_init(MT7621State *s);
+void mt7621_eth_dev_reset(MT7621State *s);
 /* write-all helper for the persistent NAND image */
 int mt7621_pwrite_all(int fd, const void *buf, size_t len, off_t off);
 /* the CM/CPC reset path reprograms the systick compare */
