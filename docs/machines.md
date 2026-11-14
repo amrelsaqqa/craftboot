@@ -13,7 +13,8 @@ sit on the MDIO bus).  That split is the reason a machine is not one file:
   beats preset beats env), so adding a board is a data change, not code.
 
 `ipq4019` (arm) and `mt7621` (mipsel) are both split this way: the first was
-the worked example (eleven modules, `ipq4019.c` down from 11.8k to 2.2k lines),
+the worked example (nine controller modules plus a private header, `ipq4019.c`
+down from 11.8k to 2.2k lines),
 the second applied the rules afterwards (`mt7621.c` 5,469 → 1,082 with twelve
 modules).  Its own notes are in `docs/mipsel/mt7621/modularisation.md`.
 
