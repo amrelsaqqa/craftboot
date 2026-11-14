@@ -27,6 +27,34 @@ used everywhere else.  `MT7621_DL` overrides it for experiments.  This is a
 guest bug, not a cache-coherency gap: no `cache` instruction executes, the
 line size is only a number to the bootloader.
 
+### Measured, 2026-11-15
+
+A gdb probe of both Breed images on this machine (`full.bin`, r1286, and
+mc-g500, r1280) shows the same allocator arithmetic:
+
+| Dl | line Breed caches | first `malloc(0x400)` | second identical call |
+|---|---|---|---|
+| 2 | 8 | `n = 0x40f` -> `0x8fddd6f8` | `0x8fdddb10` (ok) |
+| 4 | 32 | `n = 0x43f` -> `0x8fddd6f8` | `0` (NULL) |
+
+`n = size - 1 + 2 * line` is what the wrapper requests; `malloc` is a
+dlmalloc-style allocator that rounds chunks to 8 bytes and never returns a
+pointer aligned to more than that. The clear is
+`memset(round_up(p, line), 0, n)`: at line = 8 the pointer is already aligned
+and the clear ends one byte short of the next chunk, at line = 32 it starts 8
+bytes into the allocation and ends inside the next chunk's header, so the
+second allocation fails. `tools/mipsel/mt7621/breed-dl-probe.sh` reproduces the
+table.
+
+**Open question.** The same dump boots at Dl = 4 on the real board, so the
+hardware must hand Breed a DMA allocation that starts on a cache-line boundary
+(or an allocator whose chunk layout absorbs the overrun). What the model
+controls there is the heap base and nothing else; until that is measured on
+hardware (the pointer returned by the first 0x400 DMA allocation, and
+`Config1` as the device reports it), `board=lg-gapm7200` keeps reporting
+`Dl = 2` and `MT7621_DL` overrides it for experiments. U-Boot and RouterBOOT
+are unaffected: both boot this model at `Dl = 4`.
+
 ## 2. DSA receive path: `fport` encoding and the delayed RX interrupt
 
 The frame engine fills RX descriptor word 3 with the receiving port, and the
