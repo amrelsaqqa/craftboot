@@ -204,6 +204,13 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         unsigned k;
 
         if (!hit) {
+            /*
+             * A store that misses allocates too: measured, this firmware needs
+             * it - with no write allocate, Breed's allocator header reads the
+             * zero its DMA clear left in memory and the boot stops at "unable
+             * to allocate fifos" - which is what a write-through write-allocate
+             * L1D does.
+             */
             line = dcache_fill(s, pa + done);
             dcache_misses++;
         } else {
