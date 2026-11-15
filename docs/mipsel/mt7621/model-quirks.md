@@ -282,12 +282,33 @@ reason precisely:
 - round-robin insertion was replaced by a **FIFO with move-to-front on a hit**,
   which is the cheap LRU approximation.
 
-That still fails: at Breed's DMA clear the model finds the set holding the
-neighbouring lines (`0x7eeb8c, 0x7eec8c, 0x7eed8c`) but not the header line
-itself (`0x7eee8c`), which four insertions pushed out.  The C model keeps it
-because it ages on *every* access with true LRU.  So the next increment is
-2-bit age counters per way (true LRU inline) - more codegen and more TB bloat -
-or a PLRU tree per set (3 bits, cheaper, still not LRU).
+That still failed for a reason worth recording: at Breed's DMA clear the set
+held the neighbouring lines but not the header, which four insertions had
+pushed out - because stores on a page that already holds a stale record take
+the *slow* path, so the generated code never sees them.  Once the model's own
+store path also recorded residency, Breed booted on the tracker.
+
+It was still withdrawn, on measurement rather than principle:
+
+| | `br-lan: link becomes ready` |
+|---|---|
+| no cache model | 41.1 s |
+| inline tracker (loads+stores, move-to-front) | **85.5 s** |
+| exact model with the per-store slow path | 71 s |
+
+Move-to-front costs four compares plus up to eight memory moves and two stack
+parkings *per access*, on both the load and the store path, which is more than
+the 40 ns slow-path entry it replaces.  Two consequences for anyone picking
+this up:
+
+- a reserved host register is not an option: taking one register out of
+  `tcg_target_available_regs` breaks TCG's constraint sets and QEMU dies with
+  no diagnostic.  The emitted code must live with `TCG_REG_L0`/`L1` plus the
+  host stack;
+- the inline update has to be a few instructions, not tens.  That means a
+  **PLRU bit tree** (three bits per set, updated with and/or shifts on a hit,
+  ~6 instructions) rather than move-to-front, and recording stores only if the
+  load side cannot be made that cheap.
 
 So the honest position is: **about 1.48-1.75x is what an exact per-access cache
 costs in this TCG**.  The 1.0x ceiling requires either assuming residency
