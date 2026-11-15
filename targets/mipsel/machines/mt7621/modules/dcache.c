@@ -287,15 +287,23 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
     line->lru = ++s->dcache.clock;
 
     if (is_write) {
-        v = value ? *value : 0;
-        if (target_big_endian()) {
-            unsigned k;
+        /*
+         * A clean line's copy is never read: the model serves memory for it,
+         * and a stale snapshot re-reads memory at the moment it is taken.  So
+         * the bytes only have to be written into a line that is *already*
+         * stale, where the cache copy is what a later load must see.
+         */
+        if (line->stale) {
+            v = value ? *value : 0;
+            if (target_big_endian()) {
+                unsigned k;
 
-            for (k = 0; k < size; k++) {
-                line->data[off + k] = (uint8_t)(v >> (8 * k));
+                for (k = 0; k < size; k++) {
+                    line->data[off + k] = (uint8_t)(v >> (8 * k));
+                }
+            } else {
+                memcpy(line->data + off, &v, size);
             }
-        } else {
-            memcpy(line->data + off, &v, size);
         }
         /*
          * Write-through: the line is updated and QEMU performs the store, so

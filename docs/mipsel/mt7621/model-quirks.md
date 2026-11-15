@@ -222,6 +222,37 @@ bypass-capable at `tlb_fill()` time and flushing the TLB from there storms
 during early init.  It is also an approximation: a page the guest only ever
 touches through cached mappings would get no staleness at all.
 
+### The way to exactness at speed, scoped
+
+The exact way to know residency without a slow path per store is to let the
+emulated cache track itself in generated code, which is what a real cache does
+per access.  Design, in stages:
+
+1. **Reserve one host register** for the model (a callee-saved one, already
+   pushed by TCG's prologue), remove it from `tcg_target_available_regs` so the
+   allocator never hands it to a guest value, and keep the tracker base there.
+2. **Inline on both loads and stores.** From `haddr` (`base + index + ofs`,
+   already computed by `prepare_host_addr`): subtract the RAM base, bounds
+   check, shift to a line number, mask to a set.  Then the four ways of that
+   set are one 16-byte SIMD compare against the line (`pcmpeqd` +
+   `pmovmskb`), so "resident?" is one branch.
+3. **On a miss, insert** into the set's round-robin way (a two-bit counter per
+   set, incremented inline).  Round-robin rather than LRU is a replacement
+   policy choice, not a bias: it is what many real caches do, and it keeps the
+   tracker's capacity equal to the hardware's 1024 lines.
+4. **The C model shrinks** to what the inline tracker cannot do: snapshot the
+   pre-store bytes when an uncached store hits a line the tracker says is
+   resident, serve loads on pages that hold such a snapshot, and drop both on
+   `cache`/`synci` (which must also clear the tracker's tag, so an invalidated
+   line stops counting as resident).
+5. **Validation before trust**: while both mechanisms exist, have the C model
+   (still seeing every store) compare its own residency against the tracker on
+   each store and count disagreements.  They must agree except immediately
+   after an invalidation, which is a bug in the wrong direction.
+
+Estimated cost: ~10-15 instructions per access on the fast path, i.e. well
+under the 40 ns slow-path entry it replaces.
+
 So the honest position is: **about 1.48-1.75x is what an exact per-access cache
 costs in this TCG**.  The 1.0x ceiling requires either assuming residency
 (which invents stale values, the failure this model exists to prevent) or
