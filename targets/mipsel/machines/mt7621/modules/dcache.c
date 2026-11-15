@@ -1,364 +1,306 @@
 /*
- * MT7621A (MIPS 1004Kc) data cache model.
+ * MT7621A (MIPS 1004Kc) L1 data cache model.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * QEMU has no cache model: KSEG0 (cached) and KSEG1 (uncached) both read and
- * write one copy of DRAM.  On silicon they do not.  A store through KSEG1 (the
- * DMA aliases, 0xA0000000|p) goes straight to memory and does not disturb the
- * copy of that line the cache holds from earlier KSEG0 traffic.
+ * write the same RAM.  On silicon they do not.  A store through KSEG1 (the DMA
+ * aliases, 0xA0000000|p) goes straight to memory and leaves whatever the cache
+ * holds for that line untouched.
  *
- * That difference is observable in the firmware this machine runs.  Breed's
- * DMA wrapper allocates a buffer, rounds the pointer up to the cache line size
- * and clears n = size - 1 + 2*line bytes from the rounded pointer *through the
- * uncached alias*.  When the rounded pointer is not line aligned the clear
- * runs a few bytes past the allocation, into the next chunk's size field -
- * which the allocator wrote through KSEG0 moments earlier.  On hardware the
- * cache still returns the old size, so the next malloc finds a valid block and
- * the boot continues; without a cache model the zero is immediately visible,
- * the allocator sees a zero-sized block and gives up ("unable to allocate
- * fifos").
+ * That difference is observable in the firmware this machine runs.  Breed's DMA
+ * wrapper allocates a buffer, rounds the pointer up to the cache line size and
+ * clears n = size - 1 + 2*line bytes from the rounded pointer *through the
+ * uncached alias*.  When the rounded pointer is not line aligned the clear runs
+ * a few bytes past the allocation, into the next chunk's size field - which the
+ * allocator wrote through KSEG0 moments earlier.  On hardware the cache still
+ * holds the old size, so the next malloc finds a valid block and the boot
+ * continues; without a cache the zero is immediately visible, the allocator
+ * sees a zero-sized block and gives up ("unable to allocate fifos").
  *
- * How it is modelled
- * ------------------
- * The 1004Kc's L1D is write-through, which is why the firmware can write code
- * through a cached mapping and execute it without a cache operation: memory
- * always holds the latest stores.  So there is exactly one DRAM here, and the
- * cache is a shadow of what an uncached write has made stale:
+ * This is therefore a real L1D, not an approximation of one:
  *
- *   - uncached stores are intercepted (they are rare: DMA buffers); the page's
- *     current contents are saved in a shadow before the store reaches memory,
- *     and the page is marked shadowed;
- *   - cached accesses to a shadowed page are served from the shadow, so they
- *     keep seeing the pre-store value - the line the DMA clear left behind on
- *     hardware; cached stores are written through to both;
- *   - every other cached access goes through QEMU's normal fast path into
- *     memory, which is always up to date because the part is write-through;
- *   - hit invalidate / writeback-invalidate drop the shadowed copy (memory is
- *     authoritative again); index operations drop every shadow.  Writeback is
- *     a no-op: a write-through cache never holds data memory does not have.
+ *   - 32 KiB, 4-way, line size from Config1.Dl (Dl=4 -> 32 bytes, as the board
+ *     reports), true LRU within a set;
+ *   - every access the guest makes through a cacheable mapping goes through it
+ *     (target/mips forces those pages onto the slow path), so hits, misses,
+ *     fills and evictions are the ones the hardware would make;
+ *   - a store is write-through: the line is updated here and the store itself
+ *     is handed back to QEMU, which writes memory as usual.  The firmware
+ *     writes relocated code through KSEG0 and executes it without a cache or
+ *     synci instruction, so stores have to reach memory; performing that write
+ *     inside the helper instead would skip QEMU's dirty and translated-block
+ *     bookkeeping, and invalidating a TB from here makes QEMU re-execute the
+ *     instruction, so the store would land twice;
+ *   - both KSEG1 and device accesses bypass the cache entirely: they reach
+ *     memory and never disturb a line, which is exactly how an uncached store
+ *     leaves a stale copy behind;
+ *   - `cache` instructions are applied for real: hit invalidate and hit
+ *     writeback-invalidate drop the line (writeback is a no-op in a
+ *     write-through cache), index operations invalidate the addressed set.
+ *     synci arrives here as a hit writeback-invalidate.
  *
- * The slow path is paid only on pages an uncached write touched - a couple in
- * a boot, not every access.
+ * Nothing here is tuned to a guest.  There is no staleness window, no ageing
+ * and no "page was written" heuristic: whether a read sees an old value is
+ * decided by the same rules the silicon uses - is the line resident, and has
+ * anything invalidated it since.
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-dcache.h"
 #include "exec/mips-dcache.h"
-#include "exec/cputlb.h"
-#include "system/memory.h"
-#include "mt7621.h"
-
 #include "system/physmem.h"
 #include "exec/translation-block.h"
-#include "exec/guest-cycles.h"
+#include "mt7621.h"
 
-#define MT7621_PAGE 4096
-#define MT7621_DCACHE_LINE 32
-#define MT7621_LINES_PER_PAGE (MT7621_PAGE / MT7621_DCACHE_LINE)
+/* 1004Kc L1 D-cache: 32 KiB, 4-way. */
+#define MT7621_DCACHE_BYTES   (32 * KiB)
+#define MT7621_DCACHE_WAYS    4
+#define MT7621_DCACHE_MAXLINE 64
 
-/*
- * How long a line stays stale.  A 32 KiB 4-way L1D turns over constantly, so a
- * stale line survives only until the cache needs its way again - a handful of
- * lines in practice.  Keeping a small window is what makes this faithful: the
- * firmware's DMA clear only needs the header line to stay stale across the few
- * instructions until the next malloc, while anything older reverts to memory.
- */
-#define MT7621_STALE_WINDOW 64
-
-/*
- * A stale line also ages out with guest progress: the L1D is turned over by
- * everything the CPU does, not just by more uncached stores.  Without this a
- * single stale line can outlive the object that owned it (which is how a slab
- * page ends up with a pointer from an earlier life).
- */
-/*
- * How long a line stays stale, in retired instructions.  It has to cover the
- * firmware's DMA clear (a ~0x43f-byte store loop plus the driver path that
- * follows it) - measured: below ~100k Breed's own allocation fails and the eth
- * probe dereferences a NULL buffer - while still expiring the way a real L1D
- * does, so kernel and userspace never read a line from an earlier life.
- */
-#define MT7621_STALE_MAX_AGE 200000
-
-/* Per page: the stale copy of each line an uncached write touched. */
-struct MT7621ShadowPage {
-    uint8_t data[MT7621_PAGE];
-    uint8_t line[MT7621_LINES_PER_PAGE];
-    uint64_t gen[MT7621_LINES_PER_PAGE];
-};
-
-static uint64_t dcache_progress;
-/* pages whose cached mappings must be re-translated, flushed outside helpers */
-static hwaddr dcache_pending_flush[64];
-static unsigned dcache_pending_flush_n;
-static uint64_t dcache_stale_age = MT7621_STALE_MAX_AGE;
-
-static void mt7621_dcache_progress(CPUState *cs, unsigned insns)
-{
-    dcache_progress += insns;
-    if (dcache_pending_flush_n) {
-        dcache_pending_flush_n = 0;
-        tlb_flush(cs);
-    }
-}
-
-/* Is this line still stale, or has the cache turned over since? */
-static inline bool dcache_line_stale(struct MT7621ShadowPage *sp, unsigned line)
-{
-    if (!sp->line[line]) {
-        return false;
-    }
-    if (dcache_progress - sp->gen[line] > dcache_stale_age) {
-        sp->line[line] = 0;
-        return false;
-    }
-    return true;
-}
-
-/* implemented in target/mips; declared here so the machine can ask */
-bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
-                               MMUAccessType access_type, int mmu_idx);
+/* mips_mapping_is_cacheable() lives in target/mips/system/physaddr.c */
 
 static MT7621State *dcache_state;
-static unsigned dcache_pages;
 
-typedef struct MT7621StaleFifo {
-    uint32_t key[MT7621_STALE_WINDOW];  /* physical line address >> 5 */
-    unsigned head;
-    unsigned count;
-    unsigned limit;                     /* MT7621_STALE_WINDOW override */
-} MT7621StaleFifo;
+/* Counters, reported with MT7621_STALETRACE=1 (diagnostics only). */
+static bool dcache_trace;
+static uint64_t dcache_hits, dcache_misses, dcache_fills, dcache_invals;
+static uint64_t dcache_stores;
 
-static inline unsigned dcache_line(hwaddr pa)
-{
-    return (pa % MT7621_PAGE) / MT7621_DCACHE_LINE;
-}
-
-static MT7621StaleFifo stale_fifo;
-
-/* Evict the oldest stale line: it is out of the cache, memory is the truth. */
-static void dcache_stale_push(MT7621State *s, hwaddr pa)
-{
-    uint32_t key = (uint32_t)(pa >> 5);
-
-    if (!stale_fifo.limit) {
-        return;                 /* staleness disabled: pure write-through */
-    }
-    stale_fifo.key[stale_fifo.head] = key;
-    stale_fifo.head = (stale_fifo.head + 1) % MT7621_STALE_WINDOW;
-    if (stale_fifo.count < stale_fifo.limit) {
-        stale_fifo.count++;
-        return;
-    }
-    {
-        uint32_t old = stale_fifo.key[stale_fifo.head];
-        hwaddr p = (hwaddr)old << 5;
-        struct MT7621ShadowPage *sp =
-            (struct MT7621ShadowPage *)s->dcache.shadow[p / MT7621_PAGE];
-
-        if (sp) {
-            sp->line[dcache_line(p)] = 0;
-        }
-    }
-}
+/*
+ * MT7621_DSTALE=1 reports reads that were served from a resident line whose
+ * bytes no longer match memory, i.e. exactly the reads the guest would not
+ * make without a cache.  It is how the model's staleness is audited.
+ */
+static bool dcache_stale_on;
+static int dcache_stale_budget = 200;
 
 static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
     return (uint8_t *)s->dcache.ram + pa;
 }
 
-
-/*
- * Has the CPU written this page?  QEMU marks a RAM page dirty on the first CPU
- * store after it was clean, which is exactly the hint needed here: a line can
- * only be in the cache if the CPU touched the page, and only such lines may
- * become stale when a store bypasses the cache.
- */
-static inline bool dcache_page_cpu_written(hwaddr pa)
+/* The resident line for this physical address, or the set's first way. */
+static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
 {
-    return physical_memory_get_dirty_flag(pa, DIRTY_MEMORY_MIGRATION);
+    unsigned shift = s->dcache.line_shift;
+    MT7621DLine *line = &s->dcache.lines[((pa >> shift) % s->dcache.nsets) *
+                                          MT7621_DCACHE_WAYS];
+    uint64_t tag = pa >> shift;
+    int i;
+
+    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
+        if (line[i].valid && line[i].tag == tag) {
+            *hit = true;
+            return &line[i];
+        }
+    }
+    *hit = false;
+    return line;
 }
 
-static bool dcache_pa(CPUState *cs, vaddr addr, hwaddr *pa)
+/* Refill a line from memory, replacing the least recently used way. */
+static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
 {
-    if (addr >= 0x80000000u && addr < 0xc0000000u) {
-        *pa = addr & 0x1fffffff;
-        return true;
+    unsigned shift = s->dcache.line_shift;
+    unsigned size = s->dcache.line_size;
+    MT7621DLine *line = &s->dcache.lines[((pa >> shift) % s->dcache.nsets) *
+                                          MT7621_DCACHE_WAYS];
+    MT7621DLine *victim = &line[0];
+    hwaddr base = (pa >> shift) << shift;
+    unsigned n = size;
+    int i;
+
+    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
+        if (!line[i].valid) {
+            victim = &line[i];
+            break;
+        }
+        if (line[i].lru < victim->lru) {
+            victim = &line[i];
+        }
     }
-    *pa = cpu_get_phys_page_debug(cs, addr);
-    return *pa != (hwaddr)-1;
+    if (base + size > s->dcache.size) {
+        n = s->dcache.size - base;      /* the last partial line */
+    }
+    if (n) {
+        memcpy(victim->data, dcache_ram(s, base), n);
+    }
+    if (n < size) {
+        memset(victim->data + n, 0, size - n);
+    }
+    victim->tag = pa >> shift;
+    victim->valid = true;
+    dcache_fills++;
+    return victim;
 }
 
-bool mt7621_dcache_page_slow(CPUState *cs, hwaddr pa)
+/* Translate a data address to a physical one, or -1. */
+static hwaddr dcache_pa(CPUState *cs, vaddr addr)
 {
-    MT7621State *s = dcache_state;
-
-    if (getenv("MT7621_DCACHE_NOOP")) {
-        return false;
+    if (addr >= KSEG0_BASE && addr < KSEG2_BASE) {
+        return addr & 0x1fffffff;       /* kseg0/kseg1 are unmapped */
     }
-    return s && s->dcache.enabled && pa < s->dcache.size &&
-           (uint8_t *)s->dcache.shadow[pa / MT7621_PAGE] != NULL;
-}
-
-/*
- * An uncached store: for every line it touches on a page the CPU has written,
- * keep what the cache holds (the line as it was) and mark it stale.  Lines the
- * CPU never touched are left alone - memory is the cache's content for them.
- */
-static void dcache_uncached_store(CPUState *cs, hwaddr pa, unsigned size,
-                                  uint64_t value)
-{
-    MT7621State *s = dcache_state;
-    unsigned i;
-
-    for (i = 0; i < size; i++) {
-        hwaddr p = pa + i;
-        unsigned page = p / MT7621_PAGE;
-        unsigned line = dcache_line(p);
-        struct MT7621ShadowPage *sp;
-
-        if (page >= dcache_pages) {
-            continue;
-        }
-        sp = (struct MT7621ShadowPage *)s->dcache.shadow[page];
-        if (!sp && (getenv("MT7621_DCACHE_ALWAYS_SHADOW") ||
-                    dcache_page_cpu_written(page * MT7621_PAGE))) {
-            sp = g_new0(struct MT7621ShadowPage, 1);
-            s->dcache.shadow[page] = (uint8_t *)sp;
-            /* cached mappings of this page must now come through the model */
-            tlb_flush(cs);
-        }
-        if (sp && !sp->line[line]) {
-            memcpy(sp->data + line * MT7621_DCACHE_LINE,
-                   dcache_ram(s, page * MT7621_PAGE + line * MT7621_DCACHE_LINE),
-                   MT7621_DCACHE_LINE);
-            sp->line[line] = 1;
-            sp->gen[line] = dcache_progress;
-            if (getenv("MT7621_DCACHEDBG")) {
-                static int budget = 400;
-                if (budget-- > 0) {
-                    fprintf(stderr, "dcache: stale line pa=%08x\n",
-                            (unsigned)p);
-                }
-            }
-            dcache_stale_push(s, p);
-        }
-        dcache_ram(s, p)[0] = (uint8_t)(value >> (i * 8));
-    }
+    return cpu_get_phys_page_debug(cs, addr);
 }
 
 /*
- * The slow path.  Uncached stores create shadows; cached accesses to a
- * shadowed page are served from the shadow (and still written through to
- * memory, because the part is write-through).
+ * Slow-path data access.  Only cacheable mappings reach this (uncached pages
+ * and device memory keep QEMU's own path), and the access may cross a line, so
+ * it is served a line at a time.
  */
-bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
-                          bool is_write, uint64_t *value)
+static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
+                                 bool is_write, uint64_t *value)
 {
     MT7621State *s = dcache_state;
-    CPUMIPSState *env;
     hwaddr pa;
-    struct MT7621ShadowPage *sp;
-    uint64_t v = value ? *value : 0;
+    uint64_t w = value ? *value : 0;
     uint64_t r = 0;
-    unsigned i;
-    bool cached;
+    unsigned done = 0;
 
-    if (!s || !s->dcache.enabled || getenv("MT7621_DCACHE_NOOP")) {
+    if (!s || !s->dcache.enabled || size == 0 || size > 8) {
         return false;
     }
-    if (getenv("MT7621_DCACHEHEAP")) {
-        static int armed, budget;
-        if (!armed && addr >= 0x8fddd180 && addr < 0x8fddd200) {
-            armed = 1;
-            budget = 25;
-            fprintf(stderr, "dcache heap: == clear starts\n");
-        }
-        if (armed && budget > 0) {
-            budget--;
-            fprintf(stderr, "dcache heap: seq %c addr=%08x size=%u\n",
-                    is_write ? 'w' : 'r', (unsigned)addr, size);
-        }
-    }
-    if (getenv("MT7621_DCACHECALL")) {
-        static int budget = 12;
-        if (budget-- > 0) {
-            fprintf(stderr, "dcache call: %c addr=%08x size=%u\n",
-                    is_write ? 'w' : 'r', (unsigned)addr, size);
-        }
-    }
-    env = cpu_env(cs);
-    if (!dcache_pa(cs, addr, &pa) || pa + size > s->dcache.size) {
+    /*
+     * This hook also runs on an ordinary TLB miss, not only for pages the
+     * target marked force-slow, so the mapping's cacheability has to be
+     * checked here: an uncached access (KSEG1, a device mapping, an uncached
+     * TLB page) must go to memory and never touch a line.
+     */
+    if (!mips_mapping_is_cacheable(cpu_env(cs), addr,
+                                   is_write ? MMU_DATA_STORE : MMU_DATA_LOAD,
+                                   0)) {
         return false;
     }
-    cached = mips_mapping_is_cacheable(env, addr,
-                                       is_write ? MMU_DATA_STORE
-                                                : MMU_DATA_LOAD, 0);
-
-    if (!cached) {
-        if (!is_write) {
-            return false;       /* uncached read: nothing to model */
+    pa = dcache_pa(cs, addr);
+    if (pa == (hwaddr)-1) {
+        return false;
+    }
+    /*
+     * The DRAM controller only decodes the bits the populated chips need, so
+     * the machine maps the same RAM again above the installed size (that is
+     * how Breed measures the size: write through an alias, read it back).  An
+     * alias is the same physical line, so index the cache with the wrapped
+     * address - the cache is physically indexed, and the guest's mirror probe
+     * only works if both addresses land on one line.
+     */
+    if (pa >= s->dcache.size) {
+        if (pa >= s->dcache.alias_limit) {
+            return false;
         }
-        dcache_uncached_store(cs, pa, size, v);
-        /*
-         * The store was written here, not by QEMU, so tell QEMU about it:
-         * mark the page dirty and drop any translated block covering it.  A
-         * guest that writes code or data through the uncached alias (or a
-         * device that shares the page) would otherwise execute a stale
-         * translation.
-         */
-        physical_memory_set_dirty_range(pa, size, DIRTY_CLIENTS_NOCODE);
-        tb_invalidate_phys_range(cs, pa, pa + size);
-        /*
-         * Uncached stores target DMA buffers, never code, so performing them
-         * here is safe: nothing needs a translated-block invalidation for
-         * them.  Cached stores (below) do have to go back through QEMU, since
-         * that is how the guest's relocated code becomes executable.
-         */
-        return true;
+        pa %= s->dcache.size;
+    }
+    if (pa + size > s->dcache.size) {
+        return false;           /* straddles the top of DRAM: let QEMU store */
     }
 
-    sp = (struct MT7621ShadowPage *)s->dcache.shadow[pa / MT7621_PAGE];
-    if (!sp) {
-        return false;           /* not shadowed: fast path is right */
-    }
-    if (is_write) {
-        for (i = 0; i < size; i++) {
-            hwaddr p = pa + i;
-            unsigned line = dcache_line(p);
+    while (done < size) {
+        unsigned off = (pa + done) & (s->dcache.line_size - 1);
+        unsigned n = MIN(size - done, s->dcache.line_size - off);
+        bool hit;
+        MT7621DLine *line = dcache_lookup(s, pa + done, &hit);
+        unsigned k;
 
-            if (dcache_line_stale(sp, line)) {
-                sp->data[p % MT7621_PAGE] = (uint8_t)(v >> (i * 8));
-            }
-        }
-        return false;           /* memory is written by the normal path */
-    }
-    for (i = 0; i < size; i++) {
-        hwaddr p = pa + i;
+        if (!hit) {
+            line = dcache_fill(s, pa + done);
+            dcache_misses++;
+        } else {
+            dcache_hits++;
+            if (dcache_stale_on && !is_write) {
+                unsigned j;
+                bool differs = false;
 
-        if (dcache_line_stale(sp, dcache_line(p))) {
-            if (getenv("MT7621_DCACHEDBG")) {
-                static int budget = 400;
-                if (budget-- > 0) {
-                    fprintf(stderr, "dcache: stale read pa=%08x\n",
-                            (unsigned)p);
+                for (j = 0; j < n; j++) {
+                    if (line->data[off + j] != dcache_ram(s, pa + done + j)[0]) {
+                        differs = true;
+                        break;
+                    }
+                }
+                if (differs && dcache_stale_budget-- > 0) {
+                    fprintf(stderr, "dstale: pa=%08x va=%08x pc=%08x "
+                            "segctl1=%08x cache=%02x%02x%02x%02x "
+                            "mem=%02x%02x%02x%02x\n",
+                            (unsigned)(pa + done), (unsigned)addr,
+                            (unsigned)cpu_env(cs)->active_tc.PC,
+                            (uint32_t)cpu_env(cs)->CP0_SegCtl1,
+                            line->data[off + 3], line->data[off + 2],
+                            line->data[off + 1], line->data[off],
+                            dcache_ram(s, pa + done + 3)[0],
+                            dcache_ram(s, pa + done + 2)[0],
+                            dcache_ram(s, pa + done + 1)[0],
+                            dcache_ram(s, pa + done)[0]);
                 }
             }
-            r |= (uint64_t)sp->data[p % MT7621_PAGE] << (i * 8);
-        } else {
-            r |= (uint64_t)dcache_ram(s, p)[0] << (i * 8);
         }
+        line->lru = ++s->dcache.clock;
+        for (k = 0; k < n; k++) {
+            if (is_write) {
+                line->data[off + k] = (uint8_t)(w >> ((done + k) * 8));
+            } else {
+                r |= (uint64_t)line->data[off + k] << ((done + k) * 8);
+            }
+        }
+        done += n;
+    }
+
+    if (is_write) {
+        /*
+         * Write-through: the line above is updated, and QEMU performs the
+         * store to memory exactly as it would without a cache model.  Doing
+         * that write here instead would skip QEMU's dirty tracking and its
+         * translated-block bookkeeping for code pages - and invalidating a TB
+         * from inside a store helper makes QEMU re-execute the instruction, so
+         * the store would happen twice.
+         */
+        dcache_stores++;
+        return false;
     }
     *value = r;
     return true;
 }
 
+/* Drop a line: memory is authoritative again. */
+static void dcache_invalidate_line(MT7621State *s, hwaddr pa)
+{
+    bool hit;
+    MT7621DLine *line = dcache_lookup(s, pa, &hit);
+
+    if (hit) {
+        line->valid = false;
+        dcache_invals++;
+    }
+}
+
+/* Invalidate every way of the set this address indexes. */
+static void dcache_invalidate_set(MT7621State *s, hwaddr pa)
+{
+    MT7621DLine *line = &s->dcache.lines[((pa >> s->dcache.line_shift) %
+                                          s->dcache.nsets) * MT7621_DCACHE_WAYS];
+    int i;
+
+    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
+        if (line[i].valid) {
+            line[i].valid = false;
+            dcache_invals++;
+        }
+    }
+}
+
+static void dcache_flush_all(MT7621State *s)
+{
+    unsigned n = s->dcache.nsets * MT7621_DCACHE_WAYS;
+    unsigned i;
+
+    for (i = 0; i < n; i++) {
+        s->dcache.lines[i].valid = false;
+    }
+}
+
 /*
- * Cache operations.  A write-through cache never has dirty data to write
- * back, so writeback is a no-op; invalidate means "drop the shadowed copy,
- * memory is authoritative again".
+ * Apply a `cache` instruction to the data side.  Index operations select a set
+ * by address; hit operations name the line, so the address is translated here.
  */
 void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
                             unsigned op)
@@ -366,57 +308,76 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
     MT7621State *s = dcache_state;
     hwaddr pa;
 
-    if (!s || !s->dcache.enabled || type == 0) {
-        return;                 /* the icache shadow owns the I side */
+    if (!s || !s->dcache.enabled) {
+        return;
+    }
+    if (type == 0) {
+        /* primary instruction cache: the icache shadow owns that side */
+        return;
     }
     if (op <= 3) {
-        unsigned page;
-
         if (op == 1) {
-            return;             /* index load tag */
+            return;             /* index load tag: nothing reads tags back */
         }
-        /* whole-cache operation: memory is authoritative again */
-        for (page = 0; page < dcache_pages; page++) {
-            g_free(s->dcache.shadow[page]);
-            s->dcache.shadow[page] = NULL;
-        }
+        dcache_invalidate_set(s, addr);
         return;
     }
-    if (op == 6) {              /* hit writeback: memory is already current */
+    if (op == 6) {
+        return;                 /* hit writeback: nothing is ever dirty */
+    }
+    if (op != 4 && op != 5) {
         return;
     }
-    if ((op == 4 || op == 5) && dcache_pa(cs, addr, &pa) &&
-        pa < s->dcache.size) {
-        struct MT7621ShadowPage *sp =
-            (struct MT7621ShadowPage *)s->dcache.shadow[pa / MT7621_PAGE];
-
-        if (sp) {
-            sp->line[dcache_line(pa)] = 0;
-        }
+    pa = dcache_pa(cs, addr);
+    if (pa != (hwaddr)-1) {
+        dcache_invalidate_line(s, pa);
     }
 }
 
-
 /*
- * A guest reset invalidates the cache: nothing survives it.  Called from the
- * machine's reset, which is what a guest reboot ends up triggering.
+ * Geometry follows the Dl the machine presents (Breed derives the line size as
+ * 1 << (Dl + 1): Dl=2 -> 8, Dl=4 -> 32, which is what the board reports), and a
+ * reset leaves the cache empty.
  */
 void mt7621_dcache_reset(MT7621State *s)
 {
-    unsigned page;
+    CPUState *cs = qemu_get_cpu(0);
+    unsigned dl, line;
 
-    if (!s->dcache.enabled || !s->dcache.shadow) {
+    if (!s->dcache.enabled || !s->dcache.lines) {
         return;
     }
-    for (page = 0; page < dcache_pages; page++) {
-        g_free(s->dcache.shadow[page]);
-        s->dcache.shadow[page] = NULL;
+    if (!cs) {
+        return;
     }
-    memset(&stale_fifo, 0, sizeof(stale_fifo));
-    stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
-                       ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
-                       : MT7621_STALE_WINDOW;
-    dcache_pending_flush_n = 0;
+    dl = (cpu_env(cs)->CP0_Config1 >> 10) & 7;
+    line = 1u << (dl + 1);
+    if (line < 4 || line > MT7621_DCACHE_MAXLINE) {
+        line = 32;
+    }
+    s->dcache.line_size = line;
+    s->dcache.line_shift = ctz32(line);
+    s->dcache.nsets = MT7621_DCACHE_BYTES / (line * MT7621_DCACHE_WAYS);
+    dcache_flush_all(s);
+}
+
+static void dcache_report(void)
+{
+    fprintf(stderr, "dcache: hits=%" PRIu64 " misses=%" PRIu64 " fills=%"
+            PRIu64 " stores=%" PRIu64 " invalidates=%" PRIu64 " lines=%u/%u\n",
+            dcache_hits, dcache_misses, dcache_fills, dcache_stores,
+            dcache_invals, dcache_state->dcache.nsets * MT7621_DCACHE_WAYS,
+            dcache_state->dcache.nsets * MT7621_DCACHE_WAYS);
+}
+
+/* MT7621_STALETRACE=1: report the counters as the guest runs. */
+static void dcache_tick(void *opaque)
+{
+    MT7621State *s = opaque;
+
+    dcache_report();
+    timer_mod(s->dcache.timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 15000);
 }
 
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
@@ -425,25 +386,27 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
         return;
     }
     dcache_state = s;
-    if (getenv("MT7621_STALE_AGE")) {
-        dcache_stale_age = strtoul(getenv("MT7621_STALE_AGE"), NULL, 0);
-    }
-    stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
-                       ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
-                       : MT7621_STALE_WINDOW;
-    if (stale_fifo.limit > MT7621_STALE_WINDOW) {
-        stale_fifo.limit = MT7621_STALE_WINDOW;
-    }
-    dcache_pages = ram_size / MT7621_PAGE;
+    dcache_trace = getenv("MT7621_STALETRACE") != NULL;
+    dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
-    s->dcache.shadow = (uint8_t **)g_new0(struct MT7621ShadowPage *,
-                                          dcache_pages);
     s->dcache.size = ram_size;
+    if (!s->dcache.alias_limit) {
+        s->dcache.alias_limit = ram_size;
+    }
+    /* enough lines for the smallest line size the encoding allows (4 B) */
+    s->dcache.lines = g_new0(MT7621DLine, MT7621_DCACHE_BYTES / 4);
     s->dcache.enabled = true;
+    /* Defaults until the CPU's Config1 is available; reset refines them. */
+    s->dcache.line_size = 32;
+    s->dcache.line_shift = 5;
+    s->dcache.nsets = MT7621_DCACHE_BYTES / (32 * MT7621_DCACHE_WAYS);
 
-    guest_cycles_hook = mt7621_dcache_progress;
-    cpu_dcache_page_slow = mt7621_dcache_page_slow;
     cpu_dcache_access_handler = mt7621_dcache_access;
     mips_dcache_op = mt7621_dcache_cache_op;
-    fprintf(stderr, "mt7621: write-through data cache model enabled\n");
+    if (dcache_trace) {
+        s->dcache.timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, dcache_tick, s);
+        timer_mod(s->dcache.timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 15000);
+    }
+    fprintf(stderr, "mt7621: L1 data cache model enabled (32 KiB, 4-way)\n");
 }

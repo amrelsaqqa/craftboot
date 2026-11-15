@@ -1,7 +1,7 @@
 From effd08ded84c98a3779e62a21ec8fdce35b3a9a7 Mon Sep 17 00:00:00 2001
 From: dev <dev@local>
 Date: Sun, 15 Nov 2026 13:53:09 +0200
-Subject: [PATCH 1/2] mt7621: model the 1004Kc L1 data cache
+Subject: [PATCH 1/3] mt7621: model the 1004Kc L1 data cache
 
 The model had no data cache, so KSEG0 and KSEG1 both hit the same RAM.  On
 silicon they do not: a cached store lands in the L1D and reaches DRAM through
@@ -495,7 +495,7 @@ index 7a6804a..60ed2d2 100644
 From 137b419f6c1ab7ad42df652800ddb1a47b0b5ba8 Mon Sep 17 00:00:00 2001
 From: dev <dev@local>
 Date: Sun, 15 Nov 2026 14:28:34 +0200
-Subject: [PATCH 2/2] mt7621: keep the data cache coherent with ll/sc
+Subject: [PATCH 2/3] mt7621: keep the data cache coherent with ll/sc
 
 A store-conditional is a tcg_gen_atomic_cmpxchg: it writes memory directly and
 never passes through the cache model, so the resident line stayed stale and
@@ -559,3 +559,173 @@ index 60ed2d2..07d6b20 100644
 -- 
 2.56.1
 
+
+From d97cda0884835364da6ad46fd34020e839b3a871 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Sun, 15 Nov 2026 18:49:01 +0200
+Subject: [PATCH 3/3] mt7621: force the slow path for real, and decide cacheability from the mapping
+
+
+Forcing every cacheable data access onto the slow path never worked:
+TLB_FORCE_SLOW is 1 << 8, but CPUTLBEntryFull.slow_flags[] and
+tlb_fill_flags are uint8_t, so storing it there kept zero and no access was
+ever forced.  A machine cache model therefore saw only TLB misses and the
+accesses right after its own flush, which made it look erratic and made
+-icount look necessary.
+
+Carry the request in MemTxAttrs.force_slow and have tlb_set_compare() turn it
+into TLB_FORCE_SLOW in the comparator.
+
+Cacheability also has to follow the actual translation.  kseg0..kseg3 are
+direct segments on a 32-bit MIPS and take C from SegmentControl; only useg and
+sseg can be TLB mapped.  Deciding by address range alone made KSEG1 look
+cached, so an uncached access was served by the cache model - and Breed's DRAM
+probe (write through KSEG1, read back) then observed the cache and measured
+448 MiB on a 256 MiB board, which aliases physical memory onto itself.
+
+The handler is entered on an ordinary TLB miss as well, so the model checks the
+mapping's cacheability itself rather than assuming it was force-slowed.
+
+---
+ accel/tcg/cputlb.c                  |   2 +-
+ include/exec/memattrs.h             |   8 +++++---
+ target/mips/system/physaddr.c       |  51 ++++++++++++++++++++++++++++++---------------------
+ target/mips/tcg/system/tlb_helper.c |  14 ++++++++++----
+ 4 files changed, 46 insertions(+), 29 deletions(-)
+
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index 24a95f6..6d69241 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -1003,7 +1003,7 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
+     if (enable) {
+         address |= flags & TLB_FLAGS_MASK;
+         flags &= TLB_SLOW_FLAGS_MASK;
+-        if (flags) {
++        if (flags || full->attrs.force_slow) {
+             address |= TLB_FORCE_SLOW;
+         }
+     } else {
+diff --git a/include/exec/memattrs.h b/include/exec/memattrs.h
+index 4258b9d..d7fecf3 100644
+--- a/include/exec/memattrs.h
++++ b/include/exec/memattrs.h
+@@ -57,10 +57,12 @@ typedef struct MemTxAttrs {
+     /* PCI - IOMMU operations, see PCIAddressType */
+     unsigned int address_type:1;
+     /*
+-     * MIPS: the access is uncached (C field 0/1/2 in the mapping, e.g. KSEG1
+-     * or an uncached TLB page), so it bypasses the model's data cache.
++     * The target wants this page's data accesses served by the slow path even
++     * though the translation is valid - a machine cache model, for instance,
++     * has to see every access a cacheable page makes.  Honoured by
++     * tlb_set_page_full() when it builds the TLB comparator.
+      */
+-    unsigned int dcache_bypass:1;
++    unsigned int force_slow:1;
+ 
+     /*
+      * Bus masters which don't specify any attributes will get this
+diff --git a/target/mips/system/physaddr.c b/target/mips/system/physaddr.c
+index d49a83d..3960e7d 100644
+--- a/target/mips/system/physaddr.c
++++ b/target/mips/system/physaddr.c
+@@ -272,34 +272,43 @@ static unsigned int tlb_page_cacheability(CPUMIPSState *env, target_ulong addres
+     return 3;                   /* not mapped: behave as cacheable */
+ }
+ 
+-static unsigned int segment_cacheability(CPUMIPSState *env, target_ulong address)
++static unsigned int segctl_cacheability(uint16_t segctl)
+ {
+-    uint64_t segctl;
+-
+-    if (address < KSEG1_BASE) {
+-        segctl = env->CP0_SegCtl1 >> 16;         /* kseg0 */
+-    } else if (address < KSEG2_BASE) {
+-        segctl = env->CP0_SegCtl1;              /* kseg1 */
+-    } else if (address < KSEG3_BASE) {
+-        segctl = env->CP0_SegCtl0 >> 16;        /* kseg2 */
+-    } else {
+-        segctl = env->CP0_SegCtl0;              /* kseg3 */
+-    }
+     return (segctl & CP0SC_C_MASK) >> CP0SC_C;
+ }
+ 
++/*
++ * The C (cacheability) field of the mapping for @address.  kseg0..kseg3 are
++ * direct segments on a 32-bit MIPS and carry C in SegmentControl; only useg
++ * and sseg can be TLB mapped, so only those consult the addressing mode and
++ * the TLB entry.  Getting this wrong is not academic: a KSEG1 access is
++ * uncached by definition, and treating it as cached makes a bootloader's DRAM
++ * probe (write through KSEG1, read back) observe the cache instead of memory,
++ * so it measures the wrong DRAM size.
++ */
+ bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
+                                MMUAccessType access_type, int mmu_idx)
+ {
+-    unsigned int c;
++    uint16_t segctl;
+ 
+-    if (address < KSEG0_BASE) {
+-        /* useg/xuseg: resolved through the TLB */
+-        c = tlb_page_cacheability(env, address);
+-    } else {
+-        c = segment_cacheability(env, address);
+-    }
+     (void)access_type;
+-    (void)mmu_idx;
+-    return c >= 3;
++    if (address <= USEG_LIMIT) {
++        segctl = (address >= 0x40000000UL) ? env->CP0_SegCtl2
++                                           : (env->CP0_SegCtl2 >> 16);
++        if (is_seg_am_mapped((segctl & CP0SC_AM_MASK) >> CP0SC_AM,
++                             (segctl >> CP0SC_EU) & 1, mmu_idx) == 1) {
++            return tlb_page_cacheability(env, address) >= 3;
++        }
++        return segctl_cacheability(segctl) >= 3;
++    }
++    if (address < KSEG1_BASE) {
++        return segctl_cacheability(env->CP0_SegCtl1 >> 16) >= 3;  /* kseg0 */
++    }
++    if (address < KSEG2_BASE) {
++        return segctl_cacheability(env->CP0_SegCtl1) >= 3;        /* kseg1 */
++    }
++    if (address < KSEG3_BASE) {
++        return segctl_cacheability(env->CP0_SegCtl0 >> 16) >= 3;  /* sseg  */
++    }
++    return segctl_cacheability(env->CP0_SegCtl0) >= 3;            /* kseg3 */
+ }
+diff --git a/target/mips/tcg/system/tlb_helper.c b/target/mips/tcg/system/tlb_helper.c
+index fe85244..a81ccba 100644
+--- a/target/mips/tcg/system/tlb_helper.c
++++ b/target/mips/tcg/system/tlb_helper.c
+@@ -28,6 +28,7 @@
+ #include "accel/tcg/cpu-ldst.h"
+ #include "exec/log.h"
+ #include "exec/helper-proto.h"
++#include "exec/cpu-dcache.h"
+ #include "exec/tlb-flags.h"
+ 
+ /* TLB management */
+@@ -948,10 +949,15 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+          * machine cache model can serve them (instruction fetch always reads
+          * RAM, and always executes there).
+          */
+-        full.attrs.dcache_bypass = !cached;
+-        if (cached) {
+-            full.slow_flags[MMU_DATA_LOAD] = TLB_FORCE_SLOW;
+-            full.slow_flags[MMU_DATA_STORE] = TLB_FORCE_SLOW;
++        if (cached && cpu_dcache_access_handler) {
++            /*
++             * A machine cache model serves the cacheable side: hits, misses,
++             * fills and evictions all have to be the ones the hardware would
++             * make, so every such access takes the slow path.  Uncached and
++             * device accesses keep QEMU's own path and never touch a line -
++             * which is what makes an uncached store leave a stale copy.
++             */
++            full.attrs.force_slow = true;
+         }
+         tlb_set_page_full(cs, mmu_idx, address & TARGET_PAGE_MASK, &full);
+         return true;
+-- 
+2.39.2

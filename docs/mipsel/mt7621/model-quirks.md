@@ -129,36 +129,62 @@ reads the header through the **cached** one; on silicon the line stays in the
 L1D, so the allocator still sees the old size and the overrun costs nothing.
 QEMU had no cache, so the zero was immediately visible.
 
-The machine now models the 1004Kc L1 data cache (`MT7621_DCACHE=1`,
+The machine now models the 1004Kc L1 data cache for real (`MT7621_DCACHE=1`,
 `modules/dcache.c`, `patches/0005-mt7621-data-cache-model.patch`):
 
-- 32 KiB, 4-way, line size from `Config1.Dl`; PIPT, equivalent to the core's
-  VIPT for these parameters.
-- **Write-through**: the firmware writes relocated code through KSEG0 and runs
-  it without ever issuing a `cache` or `synci` instruction (measured: zero
-  cache instructions in Breed's whole boot), so stores must reach memory.
-  Reads are served from the resident line, which is what leaves a stale copy
-  behind after an uncached write - the behaviour the board shows.
-- Cacheable pages are forced through the TCG slow path and served from the
-  cache; uncached pages, device accesses and instruction fetch still use RAM.
-- `cache` instructions and `synci` are applied to it (hit writeback/invalidate,
-  index invalidate / store tag per set).
+- 32 KiB, 4-way, 256 sets, line size from `Config1.Dl`, true LRU per set.  A
+  miss fills from memory and, because a store may miss too, a store allocates
+  the line (write-allocate) as well as writing memory.
+- **Write-through**, and the memory write is performed by QEMU, not by the
+  model: doing it in the helper skips QEMU's dirty/TB bookkeeping, and
+  invalidating a TB from inside a store helper makes QEMU re-execute the
+  instruction, so the store lands twice.  That double store was what zeroed the
+  chunk header the allocator had just written (measured: every address written
+  twice in the window trace).
+- Uncached accesses (KSEG1, device mappings, uncached TLB pages) never reach
+  the model; they go to memory and leave whatever the cache holds untouched -
+  which is exactly why Breed's clear leaves a stale line behind.
+- DRAM aliases: the machine mirrors RAM above the installed size so that Breed
+  can measure it.  An alias is the same physical line, so the model indexes
+  with the **wrapped** address; otherwise the mirror probe reads the cache and
+  Breed measures 448 MiB instead of 256 MiB.
+- `cache` instructions and `synci` are applied: hit invalidate and hit
+  writeback-invalidate drop the line (writeback is a no-op in a write-through
+  cache), index operations invalidate the addressed set.  `ll`/`sc` bypass the
+  cache by construction (QEMU masks `TLB_FORCE_SLOW` in the atomic path), so
+  `sc` is followed by a line invalidate in `gen_st_cond`.
 
-Measured with `MT7621_DCACHE=1 -icount shift=auto`:
+How an access is routed: `mips_cpu_tlb_fill()` sets `MemTxAttrs.force_slow` for
+a cacheable page, and `tlb_set_page_full()` turns that into `TLB_FORCE_SLOW` in
+the TLB comparator, so every data access to that page takes the slow path where
+the model serves it.  Two details matter and both were bugs first:
+
+- `TLB_FORCE_SLOW` is `1 << 8`, but `CPUTLBEntryFull.slow_flags[]` is `uint8_t`,
+  so the original code stored zero there and *nothing was ever forced*.  The
+  cache therefore only saw TLB misses and the accesses after its own flush -
+  which is why the model appeared to need `-icount` and behaved erratically.
+  The request now travels in `MemTxAttrs.force_slow`, which
+  `tlb_set_compare()` honours.
+- the handler also runs on an ordinary TLB miss, so it checks the mapping's
+  cacheability itself.  Cacheability comes from the segment/page tables:
+  kseg0..kseg3 use their `SegCtl` `C` field, useg/sseg consult the addressing
+  mode and then the TLB entry's `C`.  Treating an address by its numeric range
+  alone made **KSEG1 look cached**, and Breed's DRAM probe (write through
+  KSEG1, read back) then observed the cache and measured 448 MiB.
+
+Measured with `MT7621_DCACHE=1`, no `-icount`:
 
 | run | result |
 |---|---|
-| `Dl=2` | Breed, then Linux, same flash line |
-| `Dl=4` | Breed, then Linux - **the hardware value, no override** |
+| `Dl=2` | Breed, Linux, shell |
+| `Dl=4` | Breed, Linux, shell - **the hardware value, no override** |
 
-`-icount shift=auto` is needed because the machine's timers are wall-clock
-based: the guest is about twice as slow with the cache on, and without icount
-its timer interrupts outpace it (it livelocks in the handler).  That is a
-timing-model issue, not a cache one.
-
-The cache is opt-in for now, so the default boot keeps the `Dl = 2` line
-above; once the timers follow guest progress the cache can become the default
-and the override can go.
+An earlier approximation (a per-page "shadow" of lines touched by uncached
+stores, aged by an instruction count) is gone.  It was tuned until it happened
+to work and it served bytes from earlier lives of recycled pages - the kernel
+read `add@/module/` from memory while the shadow handed it the binary contents
+the page had held before.  Nothing in the model is tuned to a guest now:
+whether a read sees an old value is decided only by residency and invalidation.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 

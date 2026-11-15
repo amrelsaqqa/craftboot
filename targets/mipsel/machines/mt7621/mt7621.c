@@ -965,7 +965,14 @@ static void mt7621_machine_init(MachineState *machine)
                                     &s->ram_alias[i]);
     }
 
-    /* L1 D-cache model over RAM and its aliases (MT7621_DCACHE=1) */
+    /*
+     * L1 D-cache model over RAM and its aliases (MT7621_DCACHE=1).  The
+     * aliases only exist below the peripheral window; above it the address
+     * space belongs to devices and the boot flash, which are never cached in
+     * DRAM even when the guest reaches them through a KSEG0 mapping.
+     */
+    s->dcache.alias_limit = MIN((hwaddr)(s->ram_alias_count + 1) * ram_size,
+                                (hwaddr)MT7621_PERIPH_BASE);
     mt7621_dcache_init(s, ram_size);
 
     /*

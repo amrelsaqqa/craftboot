@@ -65,15 +65,13 @@ typedef enum MT7621Board {
 #define DRAMC_WORDS             (0x1000 / 4)
 #define NFI_WORDS               (0x1000 / 4)
 
+/* One L1D line: tag, LRU stamp and the resident copy of the bytes. */
 typedef struct MT7621DLine {
     uint64_t tag;
     bool valid;
-    bool dirty;
     uint64_t lru;
-    uint8_t data[64];
+    uint8_t data[64];           /* MT7621_DCACHE_MAXLINE */
 } MT7621DLine;
-
-typedef struct MT7621ShadowPage MT7621ShadowPage;
 
 struct MT7621State {
     MachineState parent;
@@ -203,12 +201,21 @@ struct MT7621State {
     uint64_t flash_size;
     MemoryRegion flash_mr;
     bool spi_nor;
-    /* write-through D-cache model (MT7621_DCACHE=1) with a page shadow */
+    /*
+     * L1 data cache model (MT7621_DCACHE=1): a real 32 KiB 4-way write-through
+     * cache, sized from Config1, that serves every cacheable data access.
+     */
     struct {
         bool enabled;
-        uint64_t size;
+        uint64_t size;          /* DRAM size */
+        uint64_t alias_limit;   /* end of DRAM plus its wraparound aliases */
         void *ram;              /* host pointer to DRAM */
-        uint8_t **shadow;       /* per page: stale lines (MT7621ShadowPage) */
+        MT7621DLine *lines;     /* nsets * MT7621_DCACHE_WAYS entries */
+        unsigned line_size;
+        unsigned line_shift;
+        unsigned nsets;
+        uint64_t clock;         /* LRU stamp source */
+        QEMUTimer *timer;       /* diagnostics only */
     } dcache;
     /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
     uint8_t nand_id[8];
