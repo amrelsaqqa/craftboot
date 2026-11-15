@@ -27,6 +27,30 @@ used everywhere else.  `MT7621_DL` overrides it for experiments.  This is a
 guest bug, not a cache-coherency gap: no `cache` instruction executes, the
 line size is only a number to the bootloader.
 
+### Compared against real hardware, 2026-11-15
+
+A B70 running Breed r1286 (the image in `full.bin`) was queried over its shell.
+Every modelled input matches:
+
+| field | hardware | model |
+|---|---|---|
+| Clocks | CPU 880, DDR 1200, Bus 220, Ref 40 | same |
+| DRAM | 256MB, `80000000-8fffffff` | same |
+| Kernel | 248KB, `8ffc0000-8fffe25f` | same |
+| Boot parameters | 256KB, `8fd7be3c-8fdbbe3b` | same |
+| Managed memory | 2MB, `8fdbbf3c-8ffbbf3b` | same |
+| Cached DMA line size (`0x8fffc624`) | 32 | 32 |
+
+Only "Managed memory used" differs: 860.87KB on the device vs 410.89KB in the
+model.  A heap dump at the shell shows why that says nothing about boot time:
+by then the device's heap holds a DHCP exchange (`192.168.206.91 ->
+192.168.1.1`) and the telnet/console buffers, which overwrite the region the
+model still uses for its boot-time descriptor chain.  The device has no UART
+header, so a serial-console `sysinfo` (no network traffic) is not available.
+
+That leaves dynamic allocation *ordering* around the ring allocation as the
+only unmeasured variable; every static input the model can expose is identical.
+
 ### Measured, 2026-11-15
 
 A gdb probe of both Breed images on this machine (`full.bin`, r1286, and
