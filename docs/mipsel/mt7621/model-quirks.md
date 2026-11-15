@@ -196,41 +196,27 @@ target for the next step: keep the store in the fast path and record the
 stored line's tag there.
 
 That step is host code generation, not machine code: `tgen_qemu_st()` in
-`tcg/i386/tcg-target.c.inc` emits the fast store itself, so the recording
-would be ~10 hand-written x86 instructions (LEA the host address, subtract the
-RAM base, bounds-check, shift to a line number, mask into the log, store the
-tag) using `TCG_REG_L0`/`L1` and the dead guest-address register as scratch,
-after the store.  The hazard is that it runs on the fast path of every guest
-store, so a mistake corrupts guest memory broadly and silently - unlike every
-change so far, which could only get the cache wrong.  It needs its own test
-pass (all four boot cases plus a memory-torture run) rather than a smoke test.
+`tcg/i386/tcg-target.c.inc` emits the fast store itself, so recording a line
+would be ~11 hand-written x86 instructions (LEA the host address, subtract the
+RAM base, bounds check, shift to a line number, store the tag) using only the
+two reserved scratch registers.  That was implemented and compiled, and then
+withdrawn, because it cannot be exact:
 
-That is with **loads left on QEMU's fast path everywhere except pages that hold
-a stale line**.  The routing is what makes it affordable, and it is exact:
+- the log can only record **stores**; the real cache also fills and evicts on
+  **loads**, and loads are the bulk of the traffic.  So a line that the cache
+  evicted long ago stays marked in the log, and the model would then serve a
+  stale copy for a line the hardware no longer holds - invented staleness,
+  exactly the failure mode this model exists to avoid;
+- bounding that with a window ("stored within the last N stores") is the
+  ageing heuristic again, and evicting from the log by store pressure alone
+  still forgets more slowly than the cache does.
 
-- a store is offered to the model on every cacheable page, because a store is
-  what makes a line resident (write-allocate);
-- an uncached store is offered too - it is the only thing that can make a
-  resident line stale, and the model keeps the pre-store bytes when it lands on
-  a line it holds;
-- a load is only routed to the model for a page whose stale-line count is
-  non-zero.  Everywhere else every resident line equals memory (the part is
-  write-through), so QEMU's own load path returns exactly what the hardware
-  would, at full speed.  When a page gains its first stale line the TLB is
-  flushed once so its loads start coming through the model.
-
-The request travels as a 2-bit field in `MemTxAttrs` (`dcache`: none / stores /
-loads+stores / uncached store), decided in `mips_cpu_tlb_fill()` where both the
-mapping's cacheability and the model's per-page state are known, and honoured in
-`tlb_set_compare()`.
-
-Residency is tracked for lines the CPU *stored*.  A line that was resident only
-because it was read is therefore treated as absent, so the model can
-under-report staleness - the guest then reads memory, which is newer - but it
-can never invent an old value for a line the cache did not hold.  That
-direction matters: the earlier approximation (mark every line an uncached store
-touches, aged by an instruction count) invented staleness and the kernel read
-`add@/module/` out of a page whose shadow still held binary data.
+Making residency exact therefore needs an inline *cache lookup* on every load
+and store - tag compares and a copy in generated code instead of one helper
+call - which is a real TCG cache model, and it would itself cost something.
+So the honest position is: **about 1.48-1.75x is what an exact per-access cache
+costs in this TCG**, the ceiling of 1.0x is only reachable by approximating
+residency, and the model in the tree pays the exact price.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 
