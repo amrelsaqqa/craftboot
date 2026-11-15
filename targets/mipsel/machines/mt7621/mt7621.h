@@ -291,5 +291,6 @@ extern const MemoryRegionOps mt7621_reg_ops;
 
 /* modules/dcache.c */
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size);
+void mt7621_dcache_reset(MT7621State *s);
 void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
                             unsigned op);

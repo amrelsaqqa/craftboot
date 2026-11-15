@@ -51,6 +51,7 @@
 #include "mt7621.h"
 
 #include "system/physmem.h"
+#include "exec/guest-cycles.h"
 
 #define MT7621_PAGE 4096
 #define MT7621_DCACHE_LINE 32
@@ -65,11 +66,48 @@
  */
 #define MT7621_STALE_WINDOW 64
 
+/*
+ * A stale line also ages out with guest progress: the L1D is turned over by
+ * everything the CPU does, not just by more uncached stores.  Without this a
+ * single stale line can outlive the object that owned it (which is how a slab
+ * page ends up with a pointer from an earlier life).
+ */
+/*
+ * How long a line stays stale, in retired instructions.  It has to cover the
+ * firmware's DMA clear (a ~0x43f-byte store loop plus the driver path that
+ * follows it) - measured: below ~100k Breed's own allocation fails and the eth
+ * probe dereferences a NULL buffer - while still expiring the way a real L1D
+ * does, so kernel and userspace never read a line from an earlier life.
+ */
+#define MT7621_STALE_MAX_AGE 200000
+
 /* Per page: the stale copy of each line an uncached write touched. */
 struct MT7621ShadowPage {
     uint8_t data[MT7621_PAGE];
     uint8_t line[MT7621_LINES_PER_PAGE];
+    uint64_t gen[MT7621_LINES_PER_PAGE];
 };
+
+static uint64_t dcache_progress;
+static uint64_t dcache_stale_age = MT7621_STALE_MAX_AGE;
+
+static void mt7621_dcache_progress(CPUState *cs, unsigned insns)
+{
+    dcache_progress += insns;
+}
+
+/* Is this line still stale, or has the cache turned over since? */
+static inline bool dcache_line_stale(struct MT7621ShadowPage *sp, unsigned line)
+{
+    if (!sp->line[line]) {
+        return false;
+    }
+    if (dcache_progress - sp->gen[line] > dcache_stale_age) {
+        sp->line[line] = 0;
+        return false;
+    }
+    return true;
+}
 
 /* implemented in target/mips; declared here so the machine can ask */
 bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
@@ -181,7 +219,7 @@ static void dcache_uncached_store(CPUState *cs, hwaddr pa, unsigned size,
                     dcache_page_cpu_written(page * MT7621_PAGE))) {
             sp = g_new0(struct MT7621ShadowPage, 1);
             s->dcache.shadow[page] = (uint8_t *)sp;
-            /* reads of this page must now come through the model */
+            /* cached mappings of this page must now come through the model */
             tlb_flush(cs);
         }
         if (sp && !sp->line[line]) {
@@ -189,6 +227,7 @@ static void dcache_uncached_store(CPUState *cs, hwaddr pa, unsigned size,
                    dcache_ram(s, page * MT7621_PAGE + line * MT7621_DCACHE_LINE),
                    MT7621_DCACHE_LINE);
             sp->line[line] = 1;
+            sp->gen[line] = dcache_progress;
             if (getenv("MT7621_DCACHEDBG")) {
                 static int budget = 400;
                 if (budget-- > 0) {
@@ -222,10 +261,16 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
     if (!s || !s->dcache.enabled || getenv("MT7621_DCACHE_NOOP")) {
         return false;
     }
-    if (getenv("MT7621_DCACHEHEAP") && (addr >= 0xafdd0000 && addr < 0xafde0000) || (addr >= 0x8fdd0000 && addr < 0x8fde0000)) {
-        static int budget = 40;
-        if (budget-- > 0) {
-            fprintf(stderr, "dcache heap: %c addr=%08x size=%u\n",
+    if (getenv("MT7621_DCACHEHEAP")) {
+        static int armed, budget;
+        if (!armed && addr >= 0x8fddd180 && addr < 0x8fddd200) {
+            armed = 1;
+            budget = 25;
+            fprintf(stderr, "dcache heap: == clear starts\n");
+        }
+        if (armed && budget > 0) {
+            budget--;
+            fprintf(stderr, "dcache heap: seq %c addr=%08x size=%u\n",
                     is_write ? 'w' : 'r', (unsigned)addr, size);
         }
     }
@@ -250,11 +295,12 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         }
         dcache_uncached_store(cs, pa, size, v);
         /*
-         * The store itself is left to QEMU: writing memory behind its back
-         * would skip the dirty tracking that invalidates translated blocks,
-         * and the guest executes code it has just written.
+         * Uncached stores target DMA buffers, never code, so performing them
+         * here is safe: nothing needs a translated-block invalidation for
+         * them.  Cached stores (below) do have to go back through QEMU, since
+         * that is how the guest's relocated code becomes executable.
          */
-        return false;
+        return true;
     }
 
     sp = (struct MT7621ShadowPage *)s->dcache.shadow[pa / MT7621_PAGE];
@@ -266,7 +312,7 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
             hwaddr p = pa + i;
             unsigned line = dcache_line(p);
 
-            if (sp->line[line]) {
+            if (dcache_line_stale(sp, line)) {
                 sp->data[p % MT7621_PAGE] = (uint8_t)(v >> (i * 8));
             }
         }
@@ -275,7 +321,7 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
     for (i = 0; i < size; i++) {
         hwaddr p = pa + i;
 
-        if (sp->line[dcache_line(p)]) {
+        if (dcache_line_stale(sp, dcache_line(p))) {
             if (getenv("MT7621_DCACHEDBG")) {
                 static int budget = 400;
                 if (budget-- > 0) {
@@ -317,7 +363,6 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
             g_free(s->dcache.shadow[page]);
             s->dcache.shadow[page] = NULL;
         }
-        tlb_flush(cs);
         return;
     }
     if (op == 6) {              /* hit writeback: memory is already current */
@@ -334,12 +379,33 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
     }
 }
 
+/* A reset invalidates the cache: nothing is stale any more. */
+void mt7621_dcache_reset(MT7621State *s)
+{
+    unsigned page;
+
+    if (!s->dcache.enabled) {
+        return;
+    }
+    for (page = 0; page < dcache_pages; page++) {
+        g_free(s->dcache.shadow[page]);
+        s->dcache.shadow[page] = NULL;
+    }
+    memset(&stale_fifo, 0, sizeof(stale_fifo));
+    stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
+                       ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
+                       : MT7621_STALE_WINDOW;
+}
+
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
 {
     if (!getenv("MT7621_DCACHE")) {
         return;
     }
     dcache_state = s;
+    if (getenv("MT7621_STALE_AGE")) {
+        dcache_stale_age = strtoul(getenv("MT7621_STALE_AGE"), NULL, 0);
+    }
     stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
                        ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
                        : MT7621_STALE_WINDOW;
@@ -353,6 +419,7 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     s->dcache.size = ram_size;
     s->dcache.enabled = true;
 
+    guest_cycles_hook = mt7621_dcache_progress;
     cpu_dcache_page_slow = mt7621_dcache_page_slow;
     cpu_dcache_access_handler = mt7621_dcache_access;
     mips_dcache_op = mt7621_dcache_cache_op;
