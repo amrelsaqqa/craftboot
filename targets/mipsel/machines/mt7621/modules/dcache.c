@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * QEMU has no cache model: KSEG0 (cached) and KSEG1 (uncached) both read and
- * write the same RAM.  On silicon they do not.  A store through KSEG1 (the
- * DMA aliases, 0xA0000000|p) goes straight to memory and does not update the
- * copy of that line that the cache holds from earlier KSEG0 traffic.
+ * write one copy of DRAM.  On silicon they do not.  A store through KSEG1 (the
+ * DMA aliases, 0xA0000000|p) goes straight to memory and does not disturb the
+ * copy of that line the cache holds from earlier KSEG0 traffic.
  *
  * That difference is observable in the firmware this machine runs.  Breed's
  * DMA wrapper allocates a buffer, rounds the pointer up to the cache line size
@@ -19,328 +19,209 @@
  * the allocator sees a zero-sized block and gives up ("unable to allocate
  * fifos").
  *
- * Geometry is the 1004Kc's L1D (32 KiB, 4-way, line size from Config1.Dl).
- * The cache is write-through, because the firmware writes relocated code
- * through KSEG0 and executes it without ever issuing a cache or synci
- * instruction - stores have to reach memory for instruction fetch to work.
- * Reads come from the line once it is resident, which is what makes an
- * uncached write leave a stale copy behind, exactly as on the board.
+ * How it is modelled
+ * ------------------
+ * The 1004Kc's L1D is write-through, which is why the firmware can write code
+ * through a cached mapping and execute it without a cache operation: memory
+ * always holds the latest stores.  So there is exactly one DRAM here, and the
+ * cache is a shadow of what an uncached write has made stale:
  *
- * Cached pages are forced through the TCG slow path, where
- * mt7621_dcache_access() serves the data access from here instead of RAM;
- * uncached pages and device accesses never reach it.  `cache` instructions are
- * applied through mt7621_dcache_cache_op() and synci through
- * mt7621_dcache_cache_op(type=data, op=hit writeback invalidate).
+ *   - uncached stores are intercepted (they are rare: DMA buffers); the page's
+ *     current contents are saved in a shadow before the store reaches memory,
+ *     and the page is marked shadowed;
+ *   - cached accesses to a shadowed page are served from the shadow, so they
+ *     keep seeing the pre-store value - the line the DMA clear left behind on
+ *     hardware; cached stores are written through to both;
+ *   - every other cached access goes through QEMU's normal fast path into
+ *     memory, which is always up to date because the part is write-through;
+ *   - hit invalidate / writeback-invalidate drop the shadowed copy (memory is
+ *     authoritative again); index operations drop every shadow.  Writeback is
+ *     a no-op: a write-through cache never holds data memory does not have.
+ *
+ * The slow path is paid only on pages an uncached write touched - a couple in
+ * a boot, not every access.
  */
 
 #include "qemu/osdep.h"
-#include "qemu/units.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-dcache.h"
 #include "exec/mips-dcache.h"
+#include "exec/cputlb.h"
 #include "system/memory.h"
 #include "mt7621.h"
 
-/* 1004Kc L1 D-cache: 32 KiB, 4-way. */
-#define MT7621_DCACHE_BYTES   (32 * KiB)
-#define MT7621_DCACHE_WAYS    4
-#define MT7621_DCACHE_MAXLINE 64
-
-#define KSEG0_BASE 0x80000000u
-#define KSEG2_BASE 0xc0000000u
+#define MT7621_PAGE 4096
+#define MT7621_DCACHE_LINE 32
 
 /* implemented in target/mips; declared here so the machine can ask */
 bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
                                MMUAccessType access_type, int mmu_idx);
 
 static MT7621State *dcache_state;
+static unsigned dcache_pages;
 
-static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
+static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
-    unsigned shift = s->dcache.line_shift;
-    unsigned set = (pa >> shift) & (s->dcache.nsets - 1);
-    MT7621DLine *line = &s->dcache.lines[set * MT7621_DCACHE_WAYS];
-    uint64_t tag = pa >> shift;
-    int i;
-
-    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
-        if (line[i].valid && line[i].tag == tag) {
-            *hit = true;
-            return &line[i];
-        }
-    }
-    *hit = false;
-    return line;
+    return (uint8_t *)s->dcache.ram + pa;
 }
 
-static void dcache_writeback(MT7621State *s, MT7621DLine *line)
+static bool dcache_pa(CPUState *cs, vaddr addr, hwaddr *pa)
 {
-    if (line->valid && line->dirty) {
-        memcpy(s->dcache.ram + (line->tag << s->dcache.line_shift),
-               line->data, s->dcache.line_size);
-        line->dirty = false;
+    if (addr >= 0x80000000u && addr < 0xc0000000u) {
+        *pa = addr & 0x1fffffff;
+        return true;
     }
+    *pa = cpu_get_phys_page_debug(cs, addr);
+    return *pa != (hwaddr)-1;
 }
 
-static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
+bool mt7621_dcache_page_slow(CPUState *cs, hwaddr pa)
 {
-    unsigned shift = s->dcache.line_shift;
-    unsigned set = (pa >> shift) & (s->dcache.nsets - 1);
-    MT7621DLine *line = &s->dcache.lines[set * MT7621_DCACHE_WAYS];
-    MT7621DLine *victim = &line[0];
-    int i;
+    MT7621State *s = dcache_state;
 
-    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
-        if (!line[i].valid) {
-            victim = &line[i];
-            break;
-        }
-        if (line[i].lru < victim->lru) {
-            victim = &line[i];
-        }
-    }
-    if (victim->valid) {
-            dcache_writeback(s, victim);
-    }
-    victim->tag = pa >> shift;
-    victim->valid = true;
-    victim->dirty = false;
-    memcpy(victim->data, s->dcache.ram + ((pa >> shift) << shift),
-           s->dcache.line_size);
-    return victim;
+    return s && s->dcache.enabled && pa < s->dcache.size &&
+           s->dcache.shadow[pa / MT7621_PAGE] != NULL;
 }
 
-static uint8_t dcache_read_byte(MT7621State *s, hwaddr pa)
+/* Save a page's current contents and put it on the slow path. */
+static bool dcache_shadow_page(CPUState *cs, hwaddr pa)
 {
-    bool hit;
-    MT7621DLine *line = dcache_lookup(s, pa, &hit);
+    MT7621State *s = dcache_state;
+    unsigned page = pa / MT7621_PAGE;
+    uint8_t *shadow;
 
-    if (!hit) {
-        line = dcache_fill(s, pa);
+    if (page >= dcache_pages) {
+        return false;
     }
-    line->lru = ++s->dcache.clock;
-    return line->data[pa & (s->dcache.line_size - 1)];
+    if (s->dcache.shadow[page]) {
+        return true;            /* already shadowed */
+    }
+    shadow = g_malloc(MT7621_PAGE);
+    memcpy(shadow, dcache_ram(s, page * MT7621_PAGE), MT7621_PAGE);
+    s->dcache.shadow[page] = shadow;
+    /* cached mappings of this page must now come through the model */
+    tlb_flush(cs);
+    return true;
 }
 
 /*
- * Write-through: the caller also sends the store to the next level.  This is
- * what the guest depends on - it writes relocated code through KSEG0 and
- * executes it without ever issuing a cache or synci instruction, so stores
- * must reach memory.  Reads still come from the line, which is why an
- * uncached write (the DMA clear) leaves the cached copy stale.
+ * The slow path.  Uncached stores create shadows; cached accesses to a
+ * shadowed page are served from the shadow (and still written through to
+ * memory, because the part is write-through).
  */
-static void dcache_store(MT7621State *s, hwaddr pa, uint8_t v)
-{
-    bool hit;
-    MT7621DLine *line = dcache_lookup(s, pa, &hit);
-
-    if (!hit) {
-        line = dcache_fill(s, pa);
-    }
-    line->data[pa & (s->dcache.line_size - 1)] = v;
-    line->dirty = false;
-}
-
-/*
- * Slow-path data access hook.  Only called for data accesses to pages the
- * guest mapped as cacheable; the access may cross a line or a page, so it is
- * served byte by byte through the cache.
- */
-static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
-                                 bool is_write, uint64_t *value)
+bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
+                          bool is_write, uint64_t *value)
 {
     MT7621State *s = dcache_state;
     CPUMIPSState *env;
-    hwaddr pa, p;
-    uint64_t w = value ? *value : 0;
-    uint64_t r = 0;
-    unsigned done = 0, left = size;
+    hwaddr pa;
+    uint8_t *shadow, buf[8];
+    uint64_t v = value ? *value : 0;
+    unsigned i;
+    bool cached;
 
-    if (!s || !s->dcache.enabled || size > 8) {
+    if (!s || !s->dcache.enabled) {
         return false;
     }
     env = cpu_env(cs);
-    if (!mips_mapping_is_cacheable(env, addr,
-                                   is_write ? MMU_DATA_STORE : MMU_DATA_LOAD,
-                                   0)) {
+    if (!dcache_pa(cs, addr, &pa) || pa + size > s->dcache.size) {
         return false;
     }
-    if (addr >= KSEG0_BASE && addr < KSEG2_BASE) {
-        /* kseg0/kseg1 are unmapped: the physical address is a mask */
-        pa = addr & 0x1fffffff;
-    } else {
-        pa = cpu_get_phys_page_debug(cs, addr);
-        if (pa == (hwaddr)-1) {
+    cached = mips_mapping_is_cacheable(env, addr,
+                                       is_write ? MMU_DATA_STORE
+                                                : MMU_DATA_LOAD, 0);
+
+    if (!cached) {
+        if (!is_write) {
+            return false;       /* uncached read: nothing to model */
+        }
+        if (!dcache_shadow_page(cs, pa)) {
             return false;
         }
+        /* the store bypasses the cache: memory only */
+        for (i = 0; i < size; i++) {
+            dcache_ram(s, pa + i)[0] = (uint8_t)(v >> (i * 8));
+        }
+        return true;
     }
 
-    /* Accesses may span a line; MIPS is little endian. */
-    p = pa;
-    while (left) {
-        unsigned line_off = p & (s->dcache.line_size - 1);
-        unsigned n = MIN(left, s->dcache.line_size - line_off);
-        bool hit;
-        MT7621DLine *line = dcache_lookup(s, p, &hit);
-
-        if (!hit) {
-            line = dcache_fill(s, p);
-        }
-        line->lru = ++s->dcache.clock;
-        if (is_write) {
-            memcpy(line->data + line_off, (uint8_t *)&w + done, n);
-        } else {
-            memcpy((uint8_t *)&r + done, line->data + line_off, n);
-        }
-        p += n;
-        left -= n;
-        done += n;
+    shadow = s->dcache.shadow[pa / MT7621_PAGE];
+    if (!shadow) {
+        return false;           /* not shadowed: fast path is right */
     }
-    /*
-     * Write-through: the store also reaches the next level.  The guest writes
-     * relocated code through KSEG0 and executes it without a cache or synci
-     * instruction, so stores must be visible to instruction fetch.  Reads come
-     * from the line, which is why the uncached DMA clear leaves it stale.
-     */
+    shadow += pa % MT7621_PAGE;
     if (is_write) {
-        memcpy(s->dcache.ram + pa, &w, done);
+        for (i = 0; i < size; i++) {
+            shadow[i] = (uint8_t)(v >> (i * 8));
+            dcache_ram(s, pa + i)[0] = shadow[i];   /* write-through */
+        }
     } else {
-        *value = r;
+        memcpy(buf, shadow, size);
+        v = 0;
+        for (i = 0; i < size; i++) {
+            v |= (uint64_t)buf[i] << (i * 8);
+        }
+        *value = v;
     }
     return true;
 }
 
-void mt7621_dcache_invalidate_line(MT7621State *s, hwaddr pa)
-{
-    bool hit;
-    MT7621DLine *line = dcache_lookup(s, pa, &hit);
-
-    if (hit) {
-        line->valid = false;
-        line->dirty = false;
-    }
-}
-
-void mt7621_dcache_writeback_line(MT7621State *s, hwaddr pa)
-{
-    bool hit;
-    MT7621DLine *line = dcache_lookup(s, pa, &hit);
-
-    if (hit) {
-        dcache_writeback(s, line);
-    }
-}
-
-void mt7621_dcache_invalidate_set(MT7621State *s, unsigned set)
-{
-    MT7621DLine *line = &s->dcache.lines[set * MT7621_DCACHE_WAYS];
-    int i;
-
-    for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
-        line[i].valid = false;
-        line[i].dirty = false;
-    }
-}
-
-void mt7621_dcache_flush_all(MT7621State *s, bool invalidate)
-{
-    unsigned n = s->dcache.nsets * MT7621_DCACHE_WAYS;
-    unsigned i;
-
-    for (i = 0; i < n; i++) {
-        dcache_writeback(s, &s->dcache.lines[i]);
-        if (invalidate) {
-            s->dcache.lines[i].valid = false;
-        }
-    }
-}
-
 /*
- * Apply a `cache` instruction to the data side.  Called from target/mips.
- * Index operations select a set by address; hit operations take a virtual
- * address, translated here to the physical line the cache is tagged with.
+ * Cache operations.  A write-through cache never has dirty data to write
+ * back, so writeback is a no-op; invalidate means "drop the shadowed copy,
+ * memory is authoritative again".
  */
 void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
                             unsigned op)
 {
     MT7621State *s = dcache_state;
+    hwaddr pa;
 
-    if (!s || !s->dcache.enabled) {
-        return;
-    }
-    if (type == 0) {
-        /* primary instruction cache: the icache shadow owns that side */
-        return;
+    if (!s || !s->dcache.enabled || type == 0) {
+        return;                 /* the icache shadow owns the I side */
     }
     if (op <= 3) {
-        /* index invalidate / index store tag initialise the cache */
+        unsigned page;
+
         if (op == 1) {
-            return;             /* index load tag: nothing reads tags back */
+            return;             /* index load tag */
         }
-        mt7621_dcache_invalidate_set(s, (addr >> s->dcache.line_shift) %
-                                        s->dcache.nsets);
+        /* whole-cache operation: memory is authoritative again */
+        for (page = 0; page < dcache_pages; page++) {
+            g_free(s->dcache.shadow[page]);
+            s->dcache.shadow[page] = NULL;
+        }
+        tlb_flush(cs);
         return;
     }
-
-    hwaddr pa = cpu_get_phys_page_debug(cs, addr);
-
-    if (pa == (hwaddr)-1) {
+    if (op == 6) {              /* hit writeback: memory is already current */
         return;
     }
-    switch (op) {
-    case 4:                     /* hit invalidate */
-        mt7621_dcache_invalidate_line(s, pa);
-        break;
-    case 5:                     /* hit writeback invalidate */
-        mt7621_dcache_writeback_line(s, pa);
-        mt7621_dcache_invalidate_line(s, pa);
-        break;
-    case 6:                     /* hit writeback */
-        mt7621_dcache_writeback_line(s, pa);
-        break;
-    default:
-        break;
+    if ((op == 4 || op == 5) && dcache_pa(cs, addr, &pa) &&
+        pa < s->dcache.size) {
+        uint8_t *shadow = s->dcache.shadow[pa / MT7621_PAGE];
+
+        if (shadow) {
+            memcpy(shadow + (pa % MT7621_PAGE),
+                   dcache_ram(s, pa), MT7621_DCACHE_LINE);
+        }
     }
 }
 
-/*
- * (Re)configure the cache from the CPU's Config1, so the geometry follows the
- * Dl the machine presents: Dl=2 -> 8-byte lines, Dl=4 -> 32 like the board.
- */
-void mt7621_dcache_reset(MT7621State *s)
-{
-    CPUState *cs = qemu_get_cpu(0);
-    unsigned dl, line;
-
-    if (!s->dcache.enabled || !cs) {
-        return;
-    }
-    dl = (cpu_env(cs)->CP0_Config1 >> 10) & 7;
-    line = 1u << (dl + 1);      /* Breed's encoding: Dl=2 -> 8, Dl=4 -> 32 */
-    if (line < 4 || line > MT7621_DCACHE_MAXLINE) {
-        line = 32;
-    }
-    s->dcache.line_size = line;
-    s->dcache.line_shift = ctz32(line);
-    s->dcache.nsets = MT7621_DCACHE_BYTES / (line * MT7621_DCACHE_WAYS);
-    mt7621_dcache_flush_all(s, true);
-}
-
-void mt7621_dcache_init(MT7621State *s)
+void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
 {
     if (!getenv("MT7621_DCACHE")) {
         return;
     }
     dcache_state = s;
-    s->dcache.lines = g_new0(MT7621DLine, MT7621_DCACHE_BYTES / 4);
-    s->dcache.enabled = true;
-    s->dcache.line_size = 32;
-    s->dcache.line_shift = 5;
-    s->dcache.nsets = MT7621_DCACHE_BYTES / (32 * MT7621_DCACHE_WAYS);
-
-    /* DRAM as its own address space: fills and writebacks bypass the CPU. */
+    dcache_pages = ram_size / MT7621_PAGE;
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
+    s->dcache.shadow = g_new0(uint8_t *, dcache_pages);
+    s->dcache.size = ram_size;
+    s->dcache.enabled = true;
+
+    cpu_dcache_page_slow = mt7621_dcache_page_slow;
     cpu_dcache_access_handler = mt7621_dcache_access;
     mips_dcache_op = mt7621_dcache_cache_op;
-    fprintf(stderr, "mt7621: L1 data cache model enabled\n");
+    fprintf(stderr, "mt7621: write-through data cache model enabled\n");
 }

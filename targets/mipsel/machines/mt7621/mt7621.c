@@ -727,9 +727,6 @@ static void mt7621_reset(void *opaque)
                 (uint32_t)env->CP0_Config1, dl, 1u << (dl + 1));
     }
 
-    /* Cache geometry follows the Config1.Dl this reset presents. */
-    mt7621_dcache_reset(s);
-
     /* Everything the guest programmed is gone after a real reset. */
     mt7621_eth_dev_reset(s);
     memset(s->nfi_regs, 0, sizeof(s->nfi_regs));
@@ -967,7 +964,7 @@ static void mt7621_machine_init(MachineState *machine)
     }
 
     /* L1 D-cache model over RAM and its aliases (MT7621_DCACHE=1) */
-    mt7621_dcache_init(s);
+    mt7621_dcache_init(s, ram_size);
 
     /*
      * The SoC interrupt controller is a MIPS GIC at 0x1fbc0000 (not the
