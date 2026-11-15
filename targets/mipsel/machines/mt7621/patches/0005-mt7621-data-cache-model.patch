@@ -1,0 +1,493 @@
+From effd08ded84c98a3779e62a21ec8fdce35b3a9a7 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Sun, 15 Nov 2026 13:53:09 +0200
+Subject: [PATCH] mt7621: model the 1004Kc L1 data cache
+
+The model had no data cache, so KSEG0 and KSEG1 both hit the same RAM.  On
+silicon they do not: a cached store lands in the L1D and reaches DRAM through
+the next level, while an uncached store (KSEG1, the DMA aliases) bypasses the
+cache and leaves any cached copy of that line stale.  Breed depends on that
+difference: its DMA wrapper clears a rounded-up pointer through the uncached
+alias and runs a few bytes into the next allocator chunk header; the stale
+cached copy is what keeps the following malloc working.
+
+- memattrs: add MemTxAttrs.dcache_bypass.
+- target/mips: report the mapping's C field (SegmentControl for unmapped
+  segments, the TLB entry for mapped pages), mark uncached accesses, and force
+  cacheable data pages through the TCG slow path so a machine cache can serve
+  them.  synci writes the line back and invalidates it.
+- accel/tcg: an optional cpu_dcache_access_handler hook, called from the load
+  and store slow paths.
+- include/exec: the two hook headers.
+---
+ accel/tcg/cputlb.c                      | 88 +++++++++++++++++++++++++
+ include/exec/cpu-dcache.h               | 26 ++++++++
+ include/exec/memattrs.h                 |  5 ++
+ include/exec/mips-dcache.h              | 21 ++++++
+ target/mips/internal.h                  |  8 +++
+ target/mips/system/physaddr.c           | 63 ++++++++++++++++++
+ target/mips/tcg/system/special_helper.c | 19 ++++++
+ target/mips/tcg/system/tlb_helper.c     | 25 ++++++-
+ target/mips/tcg/system_helper.h.inc     |  1 +
+ target/mips/tcg/translate.c             |  7 +-
+ 10 files changed, 258 insertions(+), 5 deletions(-)
+ create mode 100644 include/exec/cpu-dcache.h
+ create mode 100644 include/exec/mips-dcache.h
+
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index be4473f..24a95f6 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -29,6 +29,7 @@
+ #include "accel/tcg/cpu-ldst-common.h"
+ #include "accel/tcg/cpu-mmu-index.h"
+ #include "exec/cputlb.h"
++#include "exec/cpu-dcache.h"
+ #include "exec/tb-flush.h"
+ #include "system/ram_addr.h"
+ #include "exec/mmu-access-type.h"
+@@ -1831,6 +1832,21 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
+  * Resolve the translation for the page(s) beginning at @addr, for MemOp.size
+  * bytes.  Return true if the lookup crosses a page boundary.
+  */
++CPUDCacheAccessHandler cpu_dcache_access_handler;
++
++/*
++ * Serve a data access from the machine's cache model, when one is
++ * installed and the guest's mapping for @addr is cacheable.  The
++ * handler does its own translation, so this works for accesses that
++ * cross a page or a cache line.
++ */
++static bool dcache_access(CPUState *cpu, vaddr addr, unsigned size,
++                          bool is_write, uint64_t *value)
++{
++    return cpu_dcache_access_handler &&
++           cpu_dcache_access_handler(cpu, addr, size, is_write, value);
++}
++
+ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                        uintptr_t ra, MMUAccessType type, MMULookupLocals *l)
+ {
+@@ -2426,6 +2442,15 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+     bool crosspage;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
++
++    if (access_type != MMU_INST_FETCH) {
++        uint64_t dc_v;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), false,
++                          &dc_v)) {
++            return dc_v;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+     tcg_debug_assert(!crosspage);
+ 
+@@ -2441,6 +2466,15 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+     uint8_t a, b;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
++
++    if (access_type != MMU_INST_FETCH) {
++        uint64_t dc_v;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), false,
++                          &dc_v)) {
++            return dc_v;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+     if (likely(!crosspage)) {
+         return do_ld_2(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
+@@ -2465,6 +2499,15 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+     uint32_t ret;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
++
++    if (access_type != MMU_INST_FETCH) {
++        uint64_t dc_v;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), false,
++                          &dc_v)) {
++            return dc_v;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+     if (likely(!crosspage)) {
+         return do_ld_4(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
+@@ -2486,6 +2529,15 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
+     uint64_t ret;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
++
++    if (access_type != MMU_INST_FETCH) {
++        uint64_t dc_v;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), false,
++                          &dc_v)) {
++            return dc_v;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
+     if (likely(!crosspage)) {
+         return do_ld_8(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
+@@ -2837,6 +2889,15 @@ static void do_st1_mmu(CPUState *cpu, vaddr addr, uint8_t val,
+     bool crosspage;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
++
++    {
++        uint64_t dc_v = val;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), true,
++                          &dc_v)) {
++            return;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+     tcg_debug_assert(!crosspage);
+ 
+@@ -2851,6 +2912,15 @@ static void do_st2_mmu(CPUState *cpu, vaddr addr, uint16_t val,
+     uint8_t a, b;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
++
++    {
++        uint64_t dc_v = val;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), true,
++                          &dc_v)) {
++            return;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+     if (likely(!crosspage)) {
+         do_st_2(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+@@ -2873,6 +2943,15 @@ static void do_st4_mmu(CPUState *cpu, vaddr addr, uint32_t val,
+     bool crosspage;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
++
++    {
++        uint64_t dc_v = val;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), true,
++                          &dc_v)) {
++            return;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+     if (likely(!crosspage)) {
+         do_st_4(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+@@ -2894,6 +2973,15 @@ static void do_st8_mmu(CPUState *cpu, vaddr addr, uint64_t val,
+     bool crosspage;
+ 
+     cpu_req_mo(cpu, TCG_MO_LD_ST | TCG_MO_ST_ST);
++
++    {
++        uint64_t dc_v = val;
++
++        if (dcache_access(cpu, addr, 1u << (get_memop(oi) & MO_SIZE), true,
++                          &dc_v)) {
++            return;
++        }
++    }
+     crosspage = mmu_lookup(cpu, addr, oi, ra, MMU_DATA_STORE, &l);
+     if (likely(!crosspage)) {
+         do_st_8(cpu, &l.page[0], val, l.mmu_idx, l.memop, ra);
+diff --git a/include/exec/cpu-dcache.h b/include/exec/cpu-dcache.h
+new file mode 100644
+index 0000000..a3796d0
+--- /dev/null
++++ b/include/exec/cpu-dcache.h
+@@ -0,0 +1,26 @@
++/*
++ * Optional data cache hook for the TCG slow path.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * A machine that models the CPU's write-back data cache installs
++ * @cpu_dcache_access_handler.  Pages the guest maps as cacheable are forced
++ * through the slow path, and the handler performs the access against the
++ * cache model instead of RAM; uncached and device accesses never reach it.
++ *
++ * The handler translates @addr itself, serves the access from the cache
++ * (filling and evicting as needed) and returns true if it handled it.
++ */
++#ifndef EXEC_CPU_DCACHE_H
++#define EXEC_CPU_DCACHE_H
++
++#include "exec/cpu-common.h"
++#include "exec/hwaddr.h"
++
++typedef bool (*CPUDCacheAccessHandler)(CPUState *cpu, vaddr addr,
++                                       unsigned size, bool is_write,
++                                       uint64_t *value);
++
++extern CPUDCacheAccessHandler cpu_dcache_access_handler;
++
++#endif
+diff --git a/include/exec/memattrs.h b/include/exec/memattrs.h
+index 52ee955..4258b9d 100644
+--- a/include/exec/memattrs.h
++++ b/include/exec/memattrs.h
+@@ -56,6 +56,11 @@ typedef struct MemTxAttrs {
+ 
+     /* PCI - IOMMU operations, see PCIAddressType */
+     unsigned int address_type:1;
++    /*
++     * MIPS: the access is uncached (C field 0/1/2 in the mapping, e.g. KSEG1
++     * or an uncached TLB page), so it bypasses the model's data cache.
++     */
++    unsigned int dcache_bypass:1;
+ 
+     /*
+      * Bus masters which don't specify any attributes will get this
+diff --git a/include/exec/mips-dcache.h b/include/exec/mips-dcache.h
+new file mode 100644
+index 0000000..7d463d9
+--- /dev/null
++++ b/include/exec/mips-dcache.h
+@@ -0,0 +1,21 @@
++/*
++ * MIPS data cache model hook.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ *
++ * A machine can model the CPU's data cache (a machine without a cache model,
++ * i.e. plain QEMU, sees KSEG0 and KSEG1 hit the same bytes).  When it does, it
++ * installs @mips_dcache_op and target/mips calls it for every `cache`
++ * instruction so writeback/invalidate reach the model.
++ */
++#ifndef EXEC_MIPS_DCACHE_H
++#define EXEC_MIPS_DCACHE_H
++
++#include "exec/cpu-common.h"
++
++typedef void (*MIPSDCacheOpHandler)(CPUState *cs, vaddr addr,
++                                    unsigned type, unsigned op);
++
++extern MIPSDCacheOpHandler mips_dcache_op;
++
++#endif
+diff --git a/target/mips/internal.h b/target/mips/internal.h
+index 28eb289..cc9797a 100644
+--- a/target/mips/internal.h
++++ b/target/mips/internal.h
+@@ -112,6 +112,14 @@ enum {
+     TLBRET_MATCH = 0
+ };
+ 
++/*
++ * MIPS C (cacheability) field of the mapping for @address: 0..5.  Segments
++ * that are not TLB-mapped take it from the SegmentControl register, TLB
++ * mapped pages from their entry.  3/4/5 mean cacheable.
++ */
++bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
++                               MMUAccessType access_type, int mmu_idx);
++
+ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
+                          int *prot, target_ulong real_address,
+                          MMUAccessType access_type, int mmu_idx);
+diff --git a/target/mips/system/physaddr.c b/target/mips/system/physaddr.c
+index b8e1a5a..d49a83d 100644
+--- a/target/mips/system/physaddr.c
++++ b/target/mips/system/physaddr.c
+@@ -19,6 +19,7 @@
+ #include "qemu/osdep.h"
+ #include "cpu.h"
+ #include "exec/page-protection.h"
++#include "exec/target_page.h"
+ #include "../internal.h"
+ 
+ static int is_seg_am_mapped(unsigned int am, bool eu, int mmu_idx)
+@@ -240,3 +241,65 @@ hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
+     }
+     return phys_addr;
+ }
++
++/*
++ * The MIPS C (cacheability) field of the mapping for @address.  Unmapped
++ * segments carry it in their SegmentControl register (kseg0 defaults to 3,
++ * kseg1 to 2); TLB mapped pages carry it in the entry they resolve to.  A
++ * qemu model has no caches, so this only matters to a machine that models
++ * one: C >= 3 is cacheable, C <= 2 is uncached.
++ */
++static unsigned int tlb_page_cacheability(CPUMIPSState *env, target_ulong address)
++{
++    uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
++    uint32_t MMID = env->CP0_MemoryMapID;
++    bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
++    uint32_t want = mi ? MMID : (uint32_t)ASID;
++    int i;
++
++    for (i = 0; i < env->tlb->tlb_in_use; i++) {
++        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
++        target_ulong mask = tlb->PageMask | ~(TARGET_PAGE_MASK << 1);
++        target_ulong tag = address & ~mask;
++        target_ulong vpn = tlb->VPN & ~mask;
++        uint32_t have = mi ? tlb->MMID : (uint32_t)tlb->ASID;
++
++        if (tlb->EHINV || !(tlb->G == 1 || have == want) || vpn != tag) {
++            continue;
++        }
++        return (address & mask & ~(mask >> 1)) ? tlb->C1 : tlb->C0;
++    }
++    return 3;                   /* not mapped: behave as cacheable */
++}
++
++static unsigned int segment_cacheability(CPUMIPSState *env, target_ulong address)
++{
++    uint64_t segctl;
++
++    if (address < KSEG1_BASE) {
++        segctl = env->CP0_SegCtl1 >> 16;         /* kseg0 */
++    } else if (address < KSEG2_BASE) {
++        segctl = env->CP0_SegCtl1;              /* kseg1 */
++    } else if (address < KSEG3_BASE) {
++        segctl = env->CP0_SegCtl0 >> 16;        /* kseg2 */
++    } else {
++        segctl = env->CP0_SegCtl0;              /* kseg3 */
++    }
++    return (segctl & CP0SC_C_MASK) >> CP0SC_C;
++}
++
++bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
++                               MMUAccessType access_type, int mmu_idx)
++{
++    unsigned int c;
++
++    if (address < KSEG0_BASE) {
++        /* useg/xuseg: resolved through the TLB */
++        c = tlb_page_cacheability(env, address);
++    } else {
++        c = segment_cacheability(env, address);
++    }
++    (void)access_type;
++    (void)mmu_idx;
++    return c >= 3;
++}
+diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
+index a4d6faa..d135027 100644
+--- a/target/mips/tcg/system/special_helper.c
++++ b/target/mips/tcg/system/special_helper.c
+@@ -20,6 +20,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "exec/icache-shadow.h"
++#include "exec/mips-dcache.h"
+ #include "qemu/log.h"
+ #include "cpu.h"
+ #include "exec/helper-proto.h"
+@@ -154,6 +155,20 @@ void helper_icache_shadow_flush(CPUMIPSState *env, target_ulong addr)
+     icache_shadow_invalidate(addr);
+ }
+ 
++MIPSDCacheOpHandler mips_dcache_op;
++
++/*
++ * synci: the instruction stream was written through the data cache, so write
++ * that line back and invalidate it before anything is fetched from it.
++ */
++void helper_mips_dcache_synci(CPUMIPSState *env, target_ulong addr)
++{
++    if (mips_dcache_op) {
++        mips_dcache_op(env_cpu(env), addr, 1 /* primary data */,
++                       5 /* hit writeback invalidate */);
++    }
++}
++
+ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
+ {
+     if (getenv("MT7621_CACHLOG")) {
+@@ -176,6 +191,10 @@ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
+     uint32_t cache_operation = extract32(op, 2, 3);
+     target_ulong index = addr & 0x1fffffff;
+ 
++    if (mips_dcache_op) {
++        mips_dcache_op(env_cpu(env), addr, cache_type, cache_operation);
++    }
++
+     switch (cache_operation) {
+     case 0b010: /* Index Store Tag */
+         memory_region_dispatch_write(env->itc_tag, index, env->CP0_TagLo,
+diff --git a/target/mips/tcg/system/tlb_helper.c b/target/mips/tcg/system/tlb_helper.c
+index f546d4f..fe85244 100644
+--- a/target/mips/tcg/system/tlb_helper.c
++++ b/target/mips/tcg/system/tlb_helper.c
+@@ -28,6 +28,7 @@
+ #include "accel/tcg/cpu-ldst.h"
+ #include "exec/log.h"
+ #include "exec/helper-proto.h"
++#include "exec/tlb-flags.h"
+ 
+ /* TLB management */
+ static void r4k_mips_tlb_flush_extra(CPUMIPSState *env, int first)
+@@ -932,9 +933,27 @@ bool mips_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+         break;
+     }
+     if (ret == TLBRET_MATCH) {
+-        tlb_set_page(cs, address & TARGET_PAGE_MASK,
+-                     physical & TARGET_PAGE_MASK, prot,
+-                     mmu_idx, TARGET_PAGE_SIZE);
++        CPUTLBEntryFull full = {
++            .phys_addr = physical & TARGET_PAGE_MASK,
++            .prot = prot,
++            .lg_page_size = ctz64(TARGET_PAGE_SIZE),
++        };
++        bool cached = access_type != MMU_INST_FETCH &&
++                      mips_mapping_is_cacheable(env, address, access_type,
++                                                mmu_idx);
++
++        /*
++         * Carry the mapping's cacheability to the memory system, and for
++         * cacheable pages force data accesses through the slow path so a
++         * machine cache model can serve them (instruction fetch always reads
++         * RAM, and always executes there).
++         */
++        full.attrs.dcache_bypass = !cached;
++        if (cached) {
++            full.slow_flags[MMU_DATA_LOAD] = TLB_FORCE_SLOW;
++            full.slow_flags[MMU_DATA_STORE] = TLB_FORCE_SLOW;
++        }
++        tlb_set_page_full(cs, mmu_idx, address & TARGET_PAGE_MASK, &full);
+         return true;
+     }
+ #if !defined(TARGET_MIPS64)
+diff --git a/target/mips/tcg/system_helper.h.inc b/target/mips/tcg/system_helper.h.inc
+index 12ec343..8a9e43f 100644
+--- a/target/mips/tcg/system_helper.h.inc
++++ b/target/mips/tcg/system_helper.h.inc
+@@ -176,6 +176,7 @@ DEF_HELPER_1(eretnc, void, env)
+ DEF_HELPER_1(deret, void, env)
+ DEF_HELPER_3(cache, void, env, tl, i32)
+ DEF_HELPER_2(icache_shadow_flush, void, env, tl)
++DEF_HELPER_2(mips_dcache_synci, void, env, tl)
+ 
+ #ifdef TARGET_MIPS64
+ /* Longson CSR */
+diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+index 7a6804a..60ed2d2 100644
+--- a/target/mips/tcg/translate.c
++++ b/target/mips/tcg/translate.c
+@@ -14400,11 +14400,14 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
+              * immediately.
+              */
+ #ifndef CONFIG_USER_ONLY
+-            if (icache_shadow_active()) {
++            {
+                 TCGv isa = tcg_temp_new();
+ 
+                 gen_base_offset_addr(ctx, isa, rs, imm);
+-                gen_helper_icache_shadow_flush(tcg_env, isa);
++                if (icache_shadow_active()) {
++                    gen_helper_icache_shadow_flush(tcg_env, isa);
++                }
++                gen_helper_mips_dcache_synci(tcg_env, isa);
+             }
+ #endif
+             ctx->base.is_jmp = DISAS_STOP;
+-- 
+2.56.1
+

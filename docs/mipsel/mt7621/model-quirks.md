@@ -22,10 +22,10 @@ sits right there, so the following allocation fails and the bootloader prints
 and nothing is overwritten, which is why a reported line size of 8 boots while
 16/32/64 do not.
 
-The model therefore reports `Dl = 2` for this board only; the true value is
-used everywhere else.  `MT7621_DL` overrides it for experiments.  This is a
-guest bug, not a cache-coherency gap: no `cache` instruction executes, the
-line size is only a number to the bootloader.
+The model reports `Dl = 2` for this board while it runs without a data cache;
+with `MT7621_DCACHE=1` it reports the hardware value and boots anyway (see the
+resolution at the end of this section).  `MT7621_DL` overrides it for
+experiments.
 
 ### Compared against real hardware, 2026-11-15
 
@@ -113,26 +113,52 @@ is).  `sysinfo`'s "Managed memory used" is not comparable between the two:
 it includes the DHCP/telnet buffers, and it moved from 860.87KB to 588.08KB on
 the board between two measurements of the same boot.
 
-and at the moment of the first DMA allocation the model's free block after the
+At the moment of the first DMA allocation the model's free block after the
 buffer is `0x8fddd198` with size `0xe68` (it ends exactly at the cursor).  The
-wrapper then clears `n = 0x43f` bytes from `round_up(p,32) = 0x8fddcd60`, i.e.
-through `0x8fddd19e` - three bytes of the next chunk's size field.  A split
-header `0x00000e69` becomes `0`: the allocator sees a zero-sized last block,
-falls into its "extend the pool" path, and the extension (at the cursor, page
-aligned, 0x1000) is not adjacent to that block, so it gives up and returns
-NULL.  Verified by breakpoint: `extend` -> `sbrk(0x1000)` at `0x8fdde000` ->
-`0xffffffff` -> `malloc` returns 0.  Writing `0xe69` back into
-`0x8fddd19c` at that point makes the next `malloc` return `0x8fddd1a0`, the
-board's exact second-buffer address.
+wrapper clears `n = 0x43f` bytes from `round_up(p,32) = 0x8fddcd60`, i.e.
+through `0x8fddd19e` - three bytes of the next chunk's size field, so the
+header `0x00000e69` becomes 0, the allocator sees a zero-sized last block, its
+pool extension is not adjacent to that block and it returns NULL.
 
-So the remaining question is why the board's own clear does not cost it that
-block.  Three bytes are always zeroed at `0x8fddd19c` when `n = 0x43f`, and a
-chunk size below 16 MiB cannot survive that, so on the board that word must
-not be a live chunk header at that moment - i.e. the board has already been
-through an earlier Ethernet init attempt (its cursor is `0x73000` further
-along than the model's) and re-enters with different heap state.  What is
-missing to confirm and reproduce this is the board's boot log at `Dl = 4`
-(the `Error:` lines and how many appear before it succeeds), not more dumps.
+### Resolved: the model had no data cache (2026-11-15)
+
+The board's chain is identical to the model's - same chunks, same alignment,
+same clear - so the difference was never the heap layout.  It is the cache.
+Breed clears through the **uncached** alias (`0xA0000000|p`) and the allocator
+reads the header through the **cached** one; on silicon the line stays in the
+L1D, so the allocator still sees the old size and the overrun costs nothing.
+QEMU had no cache, so the zero was immediately visible.
+
+The machine now models the 1004Kc L1 data cache (`MT7621_DCACHE=1`,
+`modules/dcache.c`, `patches/0005-mt7621-data-cache-model.patch`):
+
+- 32 KiB, 4-way, line size from `Config1.Dl`; PIPT, equivalent to the core's
+  VIPT for these parameters.
+- **Write-through**: the firmware writes relocated code through KSEG0 and runs
+  it without ever issuing a `cache` or `synci` instruction (measured: zero
+  cache instructions in Breed's whole boot), so stores must reach memory.
+  Reads are served from the resident line, which is what leaves a stale copy
+  behind after an uncached write - the behaviour the board shows.
+- Cacheable pages are forced through the TCG slow path and served from the
+  cache; uncached pages, device accesses and instruction fetch still use RAM.
+- `cache` instructions and `synci` are applied to it (hit writeback/invalidate,
+  index invalidate / store tag per set).
+
+Measured with `MT7621_DCACHE=1 -icount shift=auto`:
+
+| run | result |
+|---|---|
+| `Dl=2` | Breed, then Linux, same flash line |
+| `Dl=4` | Breed, then Linux - **the hardware value, no override** |
+
+`-icount shift=auto` is needed because the machine's timers are wall-clock
+based: the guest is about twice as slow with the cache on, and without icount
+its timer interrupts outpace it (it livelocks in the handler).  That is a
+timing-model issue, not a cache one.
+
+The cache is opt-in for now, so the default boot keeps the `Dl = 2` line
+above; once the timers follow guest progress the cache can become the default
+and the override can go.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 

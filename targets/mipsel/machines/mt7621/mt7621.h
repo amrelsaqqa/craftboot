@@ -65,6 +65,14 @@ typedef enum MT7621Board {
 #define DRAMC_WORDS             (0x1000 / 4)
 #define NFI_WORDS               (0x1000 / 4)
 
+typedef struct MT7621DLine {
+    uint64_t tag;
+    bool valid;
+    bool dirty;
+    uint64_t lru;
+    uint8_t data[64];
+} MT7621DLine;
+
 struct MT7621State {
     MachineState parent;
 
@@ -193,6 +201,14 @@ struct MT7621State {
     uint64_t flash_size;
     MemoryRegion flash_mr;
     bool spi_nor;
+    /* L1 D-cache model (MT7621_DCACHE=1): write-back, write-allocate */
+    struct {
+        bool enabled;
+        unsigned line_size, line_shift, nsets;
+        uint64_t clock;
+        MT7621DLine *lines;
+        AddressSpace as;
+    } dcache;
     /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
     uint8_t nand_id[8];
     bool nand_id_set;           /* property overrides the board's part */
@@ -271,3 +287,13 @@ void mt7621_systick_boot_handover(MT7621State *s);
 extern const MemoryRegionOps mt7621_reg_ops;
 
 #endif /* HW_MIPS_MT7621_H */
+
+/* modules/dcache.c */
+void mt7621_dcache_init(MT7621State *s);
+void mt7621_dcache_reset(MT7621State *s);
+void mt7621_dcache_flush_all(MT7621State *s, bool invalidate);
+void mt7621_dcache_invalidate_line(MT7621State *s, hwaddr pa);
+void mt7621_dcache_writeback_line(MT7621State *s, hwaddr pa);
+void mt7621_dcache_invalidate_set(MT7621State *s, unsigned set);
+void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
+                            unsigned op);
