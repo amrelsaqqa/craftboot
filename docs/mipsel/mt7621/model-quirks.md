@@ -91,10 +91,18 @@ difference to find - the earlier theory was wrong.
 What differs is the allocator's state.  Breed's allocator (TLSF, control block
 at `0x8fff0000`, `sbrk` bookkeeping at `0x8fffcd30`) ends up with:
 
-| | board | model |
-|---|---|---|
-| heap base / limit | `8fdbbf3c` / `8ffbbf3c` | same |
-| `sbrk` cursor after boot | `8fe51000` | `8fdde000` |
+| | board | model (Dl=2) | model (Dl=4, at the DMA alloc) |
+|---|---|---|---|
+| heap base / limit | `8fdbbf3c` / `8ffbbf3c` | same | same |
+| `sbrk` cursor | `8fe51000` | `8fe09000` | `8fdde000` |
+| allocator counter at `8fff0f8c` | `0x53` | `0x4c` | `0x48` |
+
+The board does about 0x48000 more transient allocation over boot than the model
+does at `Dl = 2`; that is a separate fidelity gap and not the `Dl = 4` cause
+(zeroing three bytes kills any chunk size below 16 MiB, whatever the cursor
+is).  `sysinfo`'s "Managed memory used" is not comparable between the two:
+it includes the DHCP/telnet buffers, and it moved from 860.87KB to 588.08KB on
+the board between two measurements of the same boot.
 
 and at the moment of the first DMA allocation the model's free block after the
 buffer is `0x8fddd198` with size `0xe68` (it ends exactly at the cursor).  The
