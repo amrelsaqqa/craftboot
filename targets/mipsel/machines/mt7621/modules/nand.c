@@ -168,9 +168,6 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
      * 512-byte sector, i.e. 64 bytes per page) and bits 5:4 scale the block
      * size from 64 KiB (so 1 = 128 KiB).
      */
-    static const uint8_t nand_id[8] = {
-        0xec, 0xf1, 0x00, 0x15, 0x40, 0x00, 0x00, 0x00
-    };
     uint8_t status = 0xe0;
 
     if (getenv("MT7621_NFILOG")) {
@@ -197,8 +194,29 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
 
     switch (cmd) {
     case 0x90:                          /* read id */
-        mt7621_nfi_fifo_put(s, nand_id, sizeof(nand_id));
+    {
+        static const uint8_t no_id[8] = { 0xff, 0xff, 0xff, 0xff,
+                                          0xff, 0xff, 0xff, 0xff };
+        unsigned cs = s->nfi_regs[NFI_CSEL >> 2] & 0x3;
+
+        /*
+         * The die is on CS0 only.  Breed probes CS0 and CS1 during scan; the
+         * model used to answer both, so the same NAND was reported twice,
+         * which cost an extra page buffer and shifted every later allocation.
+         */
+        if (cs != 0) {
+            if (getenv("MT7621_CSLOG")) {
+                fprintf(stderr, "nfi: id probe on cs=%u -> no die\n", cs);
+            }
+            mt7621_nfi_fifo_put(s, no_id, sizeof(no_id));
+        } else {
+            if (getenv("MT7621_CSLOG")) {
+                fprintf(stderr, "nfi: id probe on cs=%u\n", cs);
+            }
+            mt7621_nfi_fifo_put(s, s->nand_id, sizeof(s->nand_id));
+        }
         break;
+    }
     case 0x30:                          /* read: page data + spare */
     case 0xec:                          /* cache read (mtk-nandc variant) */
         /*
@@ -270,6 +288,11 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
 {
     MT7621State *s = opaque;
     uint32_t off = addr & 0xfff;
+    static int budget = 200;
+
+    if (getenv("MT7621_NFIREGS") && budget-- > 0) {
+        fprintf(stderr, "nfi rd %03x\n", (unsigned)off);
+    }
     uint32_t word = s->nfi_regs[off >> 2];
     uint64_t val;
 
@@ -328,11 +351,14 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
         break;
     }
     case NFI_PIO_DIRDY:
-        if (s->nfi_writing) {
-            val = 1;            /* always ready to accept write data */
-        } else {
-            val = (s->nfi_fifo_pos < s->nfi_fifo_len) ? 1 : 0;
-        }
+        /*
+         * The controller is never busy: data appears in the FIFO the moment a
+         * command asks for it.  Bit 0 means "PIO direction ready", i.e. the
+         * interface can take or hand over a byte -- not "a byte is pending",
+         * which is what the FIFO drain below reports.  Breed 1.2 polls it
+         * between operations and treats 0 as "PIO mode not ready".
+         */
+        val = 1;
         if (getenv("MT7621_NFILOG") && !val) {
             fprintf(stderr, "pio not ready: last cmd %02x col %x row %x addrlen %u\n",
                     s->nfi_last_cmd, s->nfi_col, s->nfi_row, s->nfi_addr_len);
@@ -434,6 +460,12 @@ static void mt7621_nfi_write(void *opaque, hwaddr addr, uint64_t val,
                              unsigned size)
 {
     MT7621State *s = opaque;
+    static int budget = 200;
+
+    if (getenv("MT7621_NFIREGS") && budget-- > 0) {
+        fprintf(stderr, "nfi wr %03x = %08x\n", (unsigned)(addr & 0xfff),
+                (unsigned)val);
+    }
     uint32_t off = addr & 0xfff;
     uint32_t shift = (off & 3) * 8;
     uint32_t mask;

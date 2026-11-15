@@ -14,7 +14,7 @@
 #
 # Nothing here needs QEMU or libvirt: it checks the translation, not the boot.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../../../.." || exit 1
 
 DUMP=$HOME/mikrotik-dump-latest7.17-32m.bin
 DTB=
@@ -62,7 +62,7 @@ PY
 fi
 [ -s "$DTB" ] || { echo "dts2xml-test: no device tree" >&2; exit 1; }
 
-TOOL=./tools/dts2xml.py
+TOOL=./tools/arm/ipq4019/dts2xml.py
 [ -x "$TOOL" ] || { echo "dts2xml-test: $TOOL is not executable" >&2; exit 1; }
 
 # ---- what the tree alone says --------------------------------------------

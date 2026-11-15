@@ -64,6 +64,25 @@ void mt7621_board_apply(MT7621State *s, const char *filename)
         s->board = mt7621_probe_board(filename);
     }
 
+    /*
+     * The die soldered on each board.  The B70 (lg-gapm7200) carries an ESMT
+     * 128 MiB part (vendor 0xc8); its own heap dump names it "ESMT NAND
+     * 128MiB 3.3V 8-bit".  The model used to answer with the Samsung ID
+     * (0xec) for every board, which made firmware report a part that is not
+     * there.  Boards can carry ESMT, Winbond, Macronix, ... so this is a
+     * per-board default, and -M mt7621,nand-id=... overrides it.
+     */
+    if (!s->nand_id_set) {
+        static const uint8_t esmt_128mib[8] = { 0xc8, 0xf1, 0x00, 0x15,
+                                                0x40, 0x00, 0x00, 0x00 };
+        static const uint8_t samsung_128mib[8] = { 0xec, 0xf1, 0x00, 0x15,
+                                                   0x40, 0x00, 0x00, 0x00 };
+        const uint8_t *id = s->board == MT7621_BOARD_LG_GAPM7200
+                            ? esmt_128mib : samsung_128mib;
+
+        memcpy(s->nand_id, id, sizeof(s->nand_id));
+    }
+
     if (s->board == MT7621_BOARD_RB750GR3) {
         s->chip_mode = 2;       /* SYSCFG0: boot from SPI 3-byte address */
     } else {

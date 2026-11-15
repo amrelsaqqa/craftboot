@@ -65,6 +65,19 @@ typedef enum MT7621Board {
 #define DRAMC_WORDS             (0x1000 / 4)
 #define NFI_WORDS               (0x1000 / 4)
 
+/*
+ * One cache set: the four ways' tags (line number + 1, 0 = invalid), their LRU
+ * stamps and a stale bit per way.  32 bytes, so a lookup touches one line and
+ * the four tags can be compared at once.  The bytes of a *stale* way live in
+ * the model's stale table, not here: a resident line equals memory (the part is
+ * write-through), so the model never needs to keep a clean line's data.
+ */
+typedef struct MT7621DSet {
+    uint32_t tag[4];
+    uint16_t lru[4];
+    uint8_t stale;              /* bit per way */
+} MT7621DSet;
+
 struct MT7621State {
     MachineState parent;
 
@@ -193,6 +206,25 @@ struct MT7621State {
     uint64_t flash_size;
     MemoryRegion flash_mr;
     bool spi_nor;
+    /*
+     * L1 data cache model (MT7621_DCACHE=1): a real 32 KiB 4-way write-through
+     * cache, sized from Config1, that serves every cacheable data access.
+     */
+    struct {
+        bool enabled;
+        uint64_t size;          /* DRAM size */
+        uint64_t alias_limit;   /* end of DRAM plus its wraparound aliases */
+        void *ram;              /* host pointer to DRAM */
+        MT7621DSet *sets;       /* nsets sets of four ways */
+        unsigned line_size;
+        unsigned line_shift;
+        unsigned nsets;
+        uint64_t clock;         /* LRU stamp source */
+        QEMUTimer *timer;       /* diagnostics only */
+    } dcache;
+    /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
+    uint8_t nand_id[8];
+    bool nand_id_set;           /* property overrides the board's part */
     bool elf_kernel;            /* -kernel is an ELF to load, not a dump */
     uint32_t elf_argc;
     uint32_t elf_argv;
@@ -268,3 +300,9 @@ void mt7621_systick_boot_handover(MT7621State *s);
 extern const MemoryRegionOps mt7621_reg_ops;
 
 #endif /* HW_MIPS_MT7621_H */
+
+/* modules/dcache.c */
+void mt7621_dcache_init(MT7621State *s, uint64_t ram_size);
+void mt7621_dcache_reset(MT7621State *s);
+void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
+                            unsigned op);

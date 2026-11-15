@@ -18,7 +18,7 @@
 #
 # Nothing here needs QEMU: it checks the converter, not a boot.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../../../.." || exit 1
 
 DIE=
 for a in "$@"; do
@@ -29,7 +29,7 @@ for a in "$@"; do
     esac
 done
 
-Q=./nanddie.py
+Q=./tools/arm/ipq4019/nanddie.py
 [ -x "$Q" ] || { echo "nanddie-test: $Q is missing or not executable" >&2; exit 1; }
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/nanddie.XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM

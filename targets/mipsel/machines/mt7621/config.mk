@@ -46,7 +46,8 @@ mt7621_MACHINE_SRCS := \
     modules/cm.c:hw/mips/mt7621/cm.c \
     modules/crypto.c:hw/mips/mt7621/crypto.c \
     modules/dump.c:hw/mips/mt7621/dump.c \
-    modules/loader.c:hw/mips/mt7621/loader.c
+    modules/loader.c:hw/mips/mt7621/loader.c \
+    modules/dcache.c:hw/mips/mt7621/dcache.c
 # hw/mips/mt7621/meson.build is generated from mt7621_MACHINE_SRCS by
 # prep/build/sync; these are the two things the generator needs.  The machine's
 # hook patch is static and only does subdir('mt7621').

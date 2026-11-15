@@ -1,0 +1,3 @@
+# Global patches — applied to every target, before its target series.
+# See README: only genuinely shared changes belong here.
+patches/generic/0001-qemu-report-the-craftboot-build-in-version.patch

@@ -256,7 +256,21 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * up; 0 means "no NAND" and makes board_init skip the NFI entirely.
      * Bits above it: DRAM type and xtal mode.
      */
-    s->sysctl_regs[SYS_SYSCFG0 / 4]      = 0x00000180 | s->chip_mode;
+    /*
+     * xtal mode lives in SYSCFG0[8:6]: Linux's clk-mt7621 maps 0-2 to
+     * 20 MHz, 3-5 to 40 MHz and 6-7 to 25 MHz.  Real MT7621 boards (the
+     * K2P log Breed prints, for instance) run a 40 MHz crystal, and Breed,
+     * U-Boot and Linux all derive their delays from it -- 25 MHz made every
+     * clock in the boot log wrong (DDR 2500 instead of 1200, Bus 218
+     * instead of 293).
+     */
+    {
+        const char *cfg0 = getenv("MT7621_SYSCFG0");
+
+        s->sysctl_regs[SYS_SYSCFG0 / 4] = cfg0
+            ? (uint32_t)strtoul(cfg0, NULL, 0)
+            : (0x00000100 | s->chip_mode);
+    }
     /*
      * CPLL clock config.  RouterBOOT programs 0x40800000 on the RB750Gr3,
      * which is how Linux ends up reporting the 875 MHz CPU clock (and the
@@ -264,8 +278,22 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      * makes it report 25 MHz instead, which then disagrees with the emulated
      * timers by a factor of 70.
      */
-    s->sysctl_regs[SYS_CLKCFG0 / 4]      = 0x40800000; /* 880 MHz PLL */
-    s->sysctl_regs[SYS_CUR_CLK_STS / 4]  = 0x00000101; /* /1 * 1 */
+    {
+        const char *cfg = getenv("MT7621_CLKCFG");
+        const char *cfg1 = getenv("MT7621_CLKCFG1");
+
+        s->sysctl_regs[SYS_CLKCFG0 / 4] = cfg ? (uint32_t)strtoul(cfg, NULL, 0)
+                                              : 0x40800000;
+        if (cfg1) {
+            s->sysctl_regs[0x30 / 4] = (uint32_t)strtoul(cfg1, NULL, 0);
+        }
+    }
+    {
+        const char *sts = getenv("MT7621_CLKSTS");
+
+        s->sysctl_regs[SYS_CUR_CLK_STS / 4] = sts ? (uint32_t)strtoul(sts, NULL, 0)
+                                                  : 0x00000101;
+    }
     /*
      * 0x3fc is polled for bit 10 before Breed's DDR3 init: it reports the
      * DDR/PLL calibration as finished. Our DDR is always ready.
@@ -285,8 +313,21 @@ static void mt7621_sysctl_defaults(MT7621State *s)
 static void mt7621_dramc_defaults(MT7621State *s)
 {
     memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
-    s->dramc_regs[0x604 / 4] = 0x00000000;
-    s->dramc_regs[0x618 / 4] = 0x00000190;
+    {
+        const char *v604 = getenv("MT7621_MEMC604");
+        const char *v618 = getenv("MT7621_MEMC618");
+
+        /*
+         * DDR rate decode: 0x604 bit 2 halves it and 0x618 carries the
+         * multiplier ((v >> 4) * 4 with a 40 MHz reference).  0x4 / 0xf0 is
+         * the pair that prints DDR 1200 on a 40 MHz crystal, the rate a real
+         * B70-class board reports.
+         */
+        s->dramc_regs[0x604 / 4] = v604 ? (uint32_t)strtoul(v604, NULL, 0)
+                                        : 0x00000004;
+        s->dramc_regs[0x618 / 4] = v618 ? (uint32_t)strtoul(v618, NULL, 0)
+                                        : 0x000000f0;
+    }
     /*
      * MEMC CPU PLL (0x648), decoded by Linux's clk-mt7621 as
      *   cpu = ((FBDIV + 1) * xtal) >> prediv_tbl[PREDIV], then / ffiv * ffrac
@@ -305,7 +346,24 @@ static void mt7621_dramc_defaults(MT7621State *s)
         const char *pll = getenv("MT7621_CPU_PLL");
 
         s->dramc_regs[0x648 / 4] = pll ? (uint32_t)strtoul(pll, NULL, 0)
-                                       : ((69 << 4) | (1 << 12)); /* 875MHz */
+                                       : ((21 << 4) | (0 << 12)); /* 880MHz */
+    }
+    {
+        const char *ddr = getenv("MT7621_DDR_PLL");
+
+        s->dramc_regs[0x64c / 4] = ddr ? (uint32_t)strtoul(ddr, NULL, 0)
+                                       : (29 << 4);
+    }
+    {
+        const char *v410 = getenv("MT7621_MEMC410");
+        const char *v80c = getenv("MT7621_MEMC80C");
+
+        if (v410) {
+            s->dramc_regs[0x410 / 4] = (uint32_t)strtoul(v410, NULL, 0);
+        }
+        if (v80c) {
+            s->dramc_regs[0x80c / 4] = (uint32_t)strtoul(v80c, NULL, 0);
+        }
     }
     s->dramc_regs[0x3fc / 4] = 0x00000400;
 }
@@ -362,16 +420,21 @@ static void mt7621_poweroff_poll(void *opaque)
          * the budget long before the interesting fault; only report the
          * codes that mean something went wrong. */
         bool interesting = (code == 4 || code == 5 || code == 10 ||
-                            code == 11 || code == 12 || code == 13);
+                            code == 11 || code == 12 || code == 13 ||
+                            code == 26);
         if (code && interesting && exc_budget-- > 0) {
             fprintf(stderr, "exc: code=%u pc=%08x epc=%08x badvaddr=%08x "
                     "status=%08x cause=%08x\n", code,
                     (uint32_t)env->active_tc.PC, (uint32_t)env->CP0_EPC,
                     (uint32_t)env->CP0_BadVAddr, env->CP0_Status, cause);
-            /* Reserved Instruction: show the word the guest choked on and
-             * the preceding few, which names the instruction and its delay
-             * slot context without needing a guest-side disassembler. */
-            if (code == 11) {
+            /*
+             * Reserved Instruction and DSP: show the word the guest choked on
+             * and the preceding few, which names the instruction and its delay
+             * slot context without needing a guest-side disassembler.  A DSP
+             * exception on instruction stream the kernel never emitted means
+             * control flow went into data, and these words say where.
+             */
+            if (code == 11 || code == 26) {
                 uint32_t epc = (uint32_t)env->CP0_EPC;
                 uint32_t insn[4];
                 int k;
@@ -607,6 +670,9 @@ static void mt7621_reset(void *opaque)
     if (mt7621_flag("MT7621_NO_CMGCR") && !getenv("MT7621_CFG3")) {
         env->CP0_Config3 &= ~((1u << 13) | (1u << 29));
     }
+    if (getenv("MT7621_CFG2")) {
+        env->CP0_Config2 = strtoul(getenv("MT7621_CFG2"), NULL, 0);
+    }
     if (getenv("MT7621_CFG3")) {
         env->CP0_Config3 = strtoul(getenv("MT7621_CFG3"), NULL, 0);
     }
@@ -620,14 +686,31 @@ static void mt7621_reset(void *opaque)
                            s->cfg1_cache_fields;
     }
     /*
-     * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
-     * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.
-     * Breed's rt2880-eth init fails at Dl=4 and works at Dl=2, so this is the
-     * handle used while the d-cache model itself is being understood.
+     * Breed (r1286, r1280) sizes its DMA buffers as
+     *
+     *     n = size - 1 + 2 * line;  p = malloc(n);
+     *     memset(round_up(p, line), 0, n);
+     *
+     * dlmalloc only guarantees 8-byte alignment, so with line = 32 the clear
+     * starts 0, 8, 16 or 24 bytes after p.  For the first 1 KiB buffer
+     * (n = 0x43f, 1088 usable bytes) only the 0 offset fits: 8 or more runs
+     * past the chunk and overwrites the next chunk's size field, so the
+     * following malloc returns NULL ("unable to allocate fifos").
+     *
+     * The board boots this firmware at Dl=4, and a real L1D is what makes it
+     * survive that clear, so with the cache model enabled the machine reports
+     * the hardware value and the guest sizes its cache maintenance for a
+     * 32 KiB / 32-byte-line cache, as the model does.  The Dl=2 override is
+     * only for the uncached baseline, where it keeps this firmware booting.
+     * MT7621_DL still overrides either way for experiments.
      */
-    if (s->board == MT7621_BOARD_LG_GAPM7200) {
+    if (s->board == MT7621_BOARD_LG_GAPM7200 && !getenv("MT7621_DCACHE")) {
         env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
     }
+    /*
+     * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
+     * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.
+     */
     {
         const char *dl = getenv("MT7621_DL");
 
@@ -636,6 +719,20 @@ static void mt7621_reset(void *opaque)
                                ((strtoul(dl, NULL, 0) & 7) << 10);
         }
     }
+    /*
+     * MT7621_CFGLOG=1 prints the line size the guest will actually see, so a
+     * test that means to run at a given Dl can assert it instead of assuming
+     * an environment variable took effect.  Breed derives the size as
+     * 1 << (Dl + 1): Dl=2 -> 8, Dl=4 -> 32.
+     */
+    if (getenv("MT7621_CFGLOG")) {
+        unsigned dl = ((uint32_t)env->CP0_Config1 >> 10) & 7;
+
+        fprintf(stderr, "cpu: Config1=%08x Dl=%u line=%u\n",
+                (uint32_t)env->CP0_Config1, dl, 1u << (dl + 1));
+    }
+
+    mt7621_dcache_reset(s);
 
     /* Everything the guest programmed is gone after a real reset. */
     mt7621_eth_dev_reset(s);
@@ -874,6 +971,16 @@ static void mt7621_machine_init(MachineState *machine)
     }
 
     /*
+     * L1 D-cache model over RAM and its aliases (MT7621_DCACHE=1).  The
+     * aliases only exist below the peripheral window; above it the address
+     * space belongs to devices and the boot flash, which are never cached in
+     * DRAM even when the guest reaches them through a KSEG0 mapping.
+     */
+    s->dcache.alias_limit = MIN((hwaddr)(s->ram_alias_count + 1) * ram_size,
+                                (hwaddr)MT7621_PERIPH_BASE);
+    mt7621_dcache_init(s, ram_size);
+
+    /*
      * The SoC interrupt controller is a MIPS GIC at 0x1fbc0000 (not the
      * RT305x-style INTC of older Ralink parts).  Directing a shared
      * interrupt to CPU line 0 gives Cause IP2, which is the line both
@@ -1028,8 +1135,41 @@ static void mt7621_set_board(Object *obj, const char *value,
 static void mt7621_machine_instance_init(Object *obj)
 {
     MT7621State *s = MT7621_MACHINE(obj);
+    static const uint8_t default_id[8] = { 0xec, 0xf1, 0x00, 0x15,
+                                           0x40, 0x00, 0x00, 0x00 };
 
+    memcpy(s->nand_id, default_id, sizeof(default_id));
     s->spi_uid = MT7621_SPI_UID_DEFAULT;
+}
+
+/*
+ * -M mt7621,nand-id=ecf1001540000000  -- the die's ID bytes, so a board can
+ * carry an ESMT/Winbond/Macronix part instead of the default Samsung.
+ */
+static void mt7621_set_nand_id(Object *obj, const char *value, Error **errp)
+{
+    MT7621State *s = MT7621_MACHINE(obj);
+    const char *p = value;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        char byte[3];
+        int n = 0;
+
+        while (*p && !g_ascii_isxdigit(*p)) {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        byte[n++] = *p++;
+        if (*p && g_ascii_isxdigit(*p)) {
+            byte[n++] = *p++;
+        }
+        byte[n] = 0;
+        s->nand_id[i] = (uint8_t)strtoul(byte, NULL, 16);
+    }
+    s->nand_id_set = true;
 }
 
 static void mt7621_set_spi_uid(Object *obj, Visitor *v, const char *name,
@@ -1049,6 +1189,7 @@ static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
 
     object_class_property_add_str(oc, "board", NULL, mt7621_set_board);
+    object_class_property_add_str(oc, "nand-id", NULL, mt7621_set_nand_id);
     object_class_property_set_description(oc, "board",
         "board preset: lg-gapm7200 (parallel NAND) or rb750gr3 (SPI NOR)");
 
