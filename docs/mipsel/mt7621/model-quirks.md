@@ -214,9 +214,20 @@ withdrawn, because it cannot be exact:
 Making residency exact therefore needs an inline *cache lookup* on every load
 and store - tag compares and a copy in generated code instead of one helper
 call - which is a real TCG cache model, and it would itself cost something.
+A second, non-TCG attempt went the same way: gate store tracking on pages that
+have actually been accessed through an uncached mapping (only such a page can
+receive a store that bypasses the cache).  Breed boots on it - no fifo error -
+but the kernel livelocks just after `sched_clock`, because a page becomes
+bypass-capable at `tlb_fill()` time and flushing the TLB from there storms
+during early init.  It is also an approximation: a page the guest only ever
+touches through cached mappings would get no staleness at all.
+
 So the honest position is: **about 1.48-1.75x is what an exact per-access cache
-costs in this TCG**, the ceiling of 1.0x is only reachable by approximating
-residency, and the model in the tree pays the exact price.
+costs in this TCG**.  The 1.0x ceiling requires either assuming residency
+(which invents stale values, the failure this model exists to prevent) or
+inlining a full cache lookup on both load and store paths.  The model in the
+tree pays the exact price, and both faster attempts are recorded here so they
+are not rediscovered.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 
