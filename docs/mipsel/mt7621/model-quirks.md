@@ -269,12 +269,25 @@ invites:
   with a sub-word store, so a 4/8-byte-only tracker has no residency for the
   one line the whole model exists to protect.
 
-Even with those fixed, it was withdrawn: the inline tracker used round-robin
-per set, and four intervening stores in the same set then evict the line the
-allocator had just written, so Breed fails *earlier* than without a model at
-all.  Matching the model needs LRU (or a PLRU tree) inline - moving the hit way
-to the front on every store, or a 3-bit tree per set - which is another few
-instructions and the next thing to try if this path is picked up again.
+Even with those fixed, it was withdrawn, and the second round narrowed the
+reason precisely:
+
+- it had to record **loads** as well as stores, or lines the CPU keeps reading
+  have no residency at all;
+- the set block stride must match the model exactly.  It went from a
+  five-word (four tags + counter) layout to a four-tag layout while the emitter
+  still multiplied by 20, so every tag landed in the wrong block and residency
+  was never found - visible as a set block full of `ffffffff` with three
+  million bounds checks having passed;
+- round-robin insertion was replaced by a **FIFO with move-to-front on a hit**,
+  which is the cheap LRU approximation.
+
+That still fails: at Breed's DMA clear the model finds the set holding the
+neighbouring lines (`0x7eeb8c, 0x7eec8c, 0x7eed8c`) but not the header line
+itself (`0x7eee8c`), which four insertions pushed out.  The C model keeps it
+because it ages on *every* access with true LRU.  So the next increment is
+2-bit age counters per way (true LRU inline) - more codegen and more TB bloat -
+or a PLRU tree per set (3 bits, cheaper, still not LRU).
 
 So the honest position is: **about 1.48-1.75x is what an exact per-access cache
 costs in this TCG**.  The 1.0x ceiling requires either assuming residency
