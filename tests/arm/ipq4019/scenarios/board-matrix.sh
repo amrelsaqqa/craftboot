@@ -26,7 +26,7 @@
 # appear before the deadline"; the deadlines exist so a hang fails instead of
 # blocking forever.
 set -u
-cd "$(dirname "$0")/../../.." || exit 1
+cd "$(dirname "$0")/../../../.." || exit 1
 
 QEMU=./build/arm/qemu-system-arm
 NOR=${NOR_DUMP:?set NOR_DUMP to a SPI-NOR dump}

@@ -20,7 +20,7 @@
 # device tree, the die is an empty file that the machine programs on first
 # boot, and the console goes to a file this script can read.
 set -u
-cd "$(dirname "$0")/../../.." || exit 1
+cd "$(dirname "$0")/../../../.." || exit 1
 
 DUMP=$HOME/mikrotik-dump-latest7.17-32m.bin
 DTB=
