@@ -30,7 +30,7 @@ line size is only a number to the bootloader.
 ### Compared against real hardware, 2026-11-15
 
 A B70 running Breed r1286 (the image in `full.bin`) was queried over its shell.
-Every modelled input matches:
+Every static input matches:
 
 | field | hardware | model |
 |---|---|---|
@@ -41,43 +41,51 @@ Every modelled input matches:
 | Managed memory | 2MB, `8fdbbf3c-8ffbbf3b` | same |
 | Cached DMA line size (`0x8fffc624`) | 32 | 32 |
 
-Only "Managed memory used" differs: 860.87KB on the device vs 410.89KB in the
-model.  A heap dump at the shell shows why that says nothing about boot time:
-by then the device's heap holds a DHCP exchange (`192.168.206.91 ->
-192.168.1.1`) and the telnet/console buffers, which overwrite the region the
-model still uses for its boot-time descriptor chain.  The device has no UART
-header, so a serial-console `sysinfo` (no network traffic) is not available.
+Two things the comparison settled:
 
-That leaves dynamic allocation *ordering* around the ring allocation as the
-only unmeasured variable; every static input the model can expose is identical.
+- The board's NAND is an **ESMT** part.  The device's own heap names it ("ESMT
+  NAND 128MiB 3.3V 8-bit") while the model answered with the Samsung ID
+  (`0xec`) for every board.  Vendor `0xc8` is now the `lg-gapm7200` default and
+  `-M mt7621,nand-id=...` covers other parts (see 1d).
+- The first 512 bytes of the heap (`0x8fdbbf3c`..`0x8fdbc13c`) are identical,
+  chunk sizes included - the same `mt7621-uart`, `reset`, `sys`, `red`
+  allocations and the same flash descriptor.
 
-### Measured, 2026-11-15
+The Ethernet path is where they part.  The DMA wrapper's clear starts at
+`round_up(p, line)` and runs `n = size - 1 + 2 * line` bytes; the allocator only
+guarantees 8-byte alignment, so at `line = 32` the start is 0, 8, 16 or 24
+bytes into a line.  For the first 1 KiB buffer (`n = 0x43f`, 1088 usable bytes)
+only 0 fits:
 
-A gdb probe of both Breed images on this machine (`full.bin`, r1286, and
-mc-g500, r1280) shows the same allocator arithmetic:
+- `0` - exact, nothing overruns.
+- `8` - `0x43f + 8 - 1088 = 7` bytes past the allocation: 3 bytes reach the
+  next chunk's `size`, and the following `malloc` returns NULL ("unable to
+  allocate fifos").  16 and 24 are worse.
 
-| Dl | line Breed caches | first `malloc(0x400)` | second identical call |
-|---|---|---|---|
-| 2 | 8 | `n = 0x40f` -> `0x8fddd6f8` | `0x8fdddb10` (ok) |
-| 4 | 32 | `n = 0x43f` -> `0x8fddd6f8` | `0` (NULL) |
+Measured here (`MT7621_DL=4`, Samsung and ESMT identity alike): the buffer is
+at `0x8fddcd58`, i.e. 8 bytes into a line, and the boot fails.  The board boots
+this same image at `Dl = 4`, so on the board that allocation must be 32-byte
+aligned - which means the pre-Ethernet allocation sequence still differs, not
+the arithmetic.
 
-`n = size - 1 + 2 * line` is what the wrapper requests; `malloc` is a
-dlmalloc-style allocator that rounds chunks to 8 bytes and never returns a
-pointer aligned to more than that. The clear is
-`memset(round_up(p, line), 0, n)`: at line = 8 the pointer is already aligned
-and the clear ends one byte short of the next chunk, at line = 32 it starts 8
-bytes into the allocation and ends inside the next chunk's header, so the
-second allocation fails. `tools/mipsel/mt7621/breed-dl-probe.sh` reproduces the
-table.
+What the model allocates before the Ethernet setup is now 15 chunks totalling
+`0x20dbc` requested (it was 19 chunks / `0x21744` before the CS0 fix removed
+the duplicate page buffer), and the heap's first 512 bytes match the board's
+dump chunk for chunk.  The remaining difference is somewhere after the flash
+descriptor at `0x8fdbc13c`, i.e. in the `0x200`/`0xf4`/`0x844` page-buffer
+group or the `0x20000` environment buffer.
 
-**Open question.** The same dump boots at Dl = 4 on the real board, so the
-hardware must hand Breed a DMA allocation that starts on a cache-line boundary
-(or an allocator whose chunk layout absorbs the overrun). What the model
-controls there is the heap base and nothing else; until that is measured on
-hardware (the pointer returned by the first 0x400 DMA allocation, and
-`Config1` as the device reports it), `board=lg-gapm7200` keeps reporting
-`Dl = 2` and `MT7621_DL` overrides it for experiments. U-Boot and RouterBOOT
-are unaffected: both boot this model at `Dl = 4`.
+Note for anyone re-testing: an earlier reading of "the ESMT ID fixes Dl=4" was
+wrong.  That run did not pass `MT7621_DL`, so the board override below (`Dl=2`)
+was still in force and the boot succeeded at `Dl = 2`.  The identity was a
+fidelity fix only.
+
+**Still open.**  A heap dump around the board's own DMA buffers would name the
+difference directly: its first 1 KiB buffer must be at an address that is a
+multiple of 32, so dumping `0x8fddc000` upwards on the device (a few hundred
+bytes is enough - the chunk headers carry the sizes) shows which allocation
+differs and by how much.  The board has no UART, but its shell has
+`mem dump <addr> <len>`.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 
@@ -120,23 +128,27 @@ registers the controller only for boards that have one (`rb750gr3`); on
 which is what the real board does.
 
 This does not by itself change the DMA-allocator outcome at Dl=4 (measured: the
-first 1 KiB buffer still lands at 0x8fddd6f8), so the ~0x9dc offset between the
-model's and the device's arena pointer comes from another allocation, not the
-SPI probe.
+first 1 KiB buffer did not move), so it is a fidelity fix, not the allocator
+one.
 
 ## 1d. The NAND answers on CS0 only
 
-Breed probes both chip selects during its flash scan.  The model returned the
-same Samsung ID on CS0 *and* CS1, so the bootloader "found" the same NAND
-twice (two identical `Flash:` lines) and allocated a second page buffer for
-it.  `mt7621_nfi_cmd()` now answers only when `NFI_CSEL` selects CS0, which is
-the board's wiring; the duplicate line and its ~0x9a0 of heap go away
-(measured: the first 1 KiB DMA buffer moves from `8fddd6f8` to `8fddcd58`).
+Breed probes both chip selects during its flash scan.  The model answered the
+ID command on CS0 *and* CS1, so the bootloader "found" the same NAND twice
+(two identical `Flash:` lines) and allocated a second page buffer for the
+phantom die.  `mt7621_nfi_cmd()` now answers only when `NFI_CSEL` selects CS0,
+which is the board's wiring: one `Flash:` line, and ~0x9a0 less heap before
+the Ethernet setup (measured: the first 1 KiB DMA buffer moves from
+`8fddd6f8` to `8fddcd58`).
 
-Dl=4 still fails after this: the buffer lands 24 bytes off a 32-byte boundary,
-so the allocator's overrun still hits the next chunk.  The remaining offset is
-small (tens of bytes) and needs a hardware-side trace to pin down; the device
-has no UART and its shell-time heap is overwritten by DHCP/telnet buffers.
+The identity is also the board's part now: an ESMT 128 MiB chip (vendor
+`0xc8`), as the device's own heap dump shows, instead of the Samsung `0xec`
+the model used to hard-code.  Boards differ, so this is a per-board default
+overridden by `-M mt7621,nand-id=...`.
+
+Dl=4 still fails after this: the buffer lands 24 bytes into a 32-byte line (8
+bytes to the next boundary), which is 4 bytes too far for Breed's overrun; see
+the measurements in section 1.
 
 `MT7621_CSLOG=1` prints every ID probe and the chip select it used.
 

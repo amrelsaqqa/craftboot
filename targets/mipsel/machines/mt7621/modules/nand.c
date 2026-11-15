@@ -168,9 +168,6 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
      * 512-byte sector, i.e. 64 bytes per page) and bits 5:4 scale the block
      * size from 64 KiB (so 1 = 128 KiB).
      */
-    static const uint8_t nand_id[8] = {
-        0xec, 0xf1, 0x00, 0x15, 0x40, 0x00, 0x00, 0x00
-    };
     uint8_t status = 0xe0;
 
     if (getenv("MT7621_NFILOG")) {
@@ -216,7 +213,7 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
             if (getenv("MT7621_CSLOG")) {
                 fprintf(stderr, "nfi: id probe on cs=%u\n", cs);
             }
-            mt7621_nfi_fifo_put(s, nand_id, sizeof(nand_id));
+            mt7621_nfi_fifo_put(s, s->nand_id, sizeof(s->nand_id));
         }
         break;
     }

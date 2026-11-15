@@ -193,6 +193,9 @@ struct MT7621State {
     uint64_t flash_size;
     MemoryRegion flash_mr;
     bool spi_nor;
+    /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
+    uint8_t nand_id[8];
+    bool nand_id_set;           /* property overrides the board's part */
     bool elf_kernel;            /* -kernel is an ELF to load, not a dump */
     uint32_t elf_argc;
     uint32_t elf_argv;

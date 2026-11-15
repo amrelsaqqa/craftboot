@@ -681,14 +681,31 @@ static void mt7621_reset(void *opaque)
                            s->cfg1_cache_fields;
     }
     /*
-     * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
-     * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.
-     * Breed's rt2880-eth init fails at Dl=4 and works at Dl=2, so this is the
-     * handle used while the d-cache model itself is being understood.
+     * Breed (r1286, r1280) sizes its DMA buffers as
+     *
+     *     n = size - 1 + 2 * line;  p = malloc(n);
+     *     memset(round_up(p, line), 0, n);
+     *
+     * dlmalloc only guarantees 8-byte alignment, so with line = 32 the clear
+     * starts 0, 8, 16 or 24 bytes after p.  For the first 1 KiB buffer
+     * (n = 0x43f, 1088 usable bytes) only the 0 offset fits: 8 or more runs
+     * past the chunk and overwrites the next chunk's size field, so the
+     * following malloc returns NULL ("unable to allocate fifos").
+     *
+     * The board boots this firmware at Dl=4, so its allocation of that buffer
+     * is 32-byte aligned; this model's lands at 0x8fddcd58 (8 bytes into the
+     * line).  Until the difference in the pre-Ethernet allocation sequence is
+     * measured against the board, lg-gapm7200 reports Dl=2.  MT7621_DL
+     * overrides it for experiments (MT7621_DL=4 reproduces the hardware value
+     * and the failure).
      */
     if (s->board == MT7621_BOARD_LG_GAPM7200) {
         env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
     }
+    /*
+     * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
+     * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.
+     */
     {
         const char *dl = getenv("MT7621_DL");
 
@@ -1089,8 +1106,41 @@ static void mt7621_set_board(Object *obj, const char *value,
 static void mt7621_machine_instance_init(Object *obj)
 {
     MT7621State *s = MT7621_MACHINE(obj);
+    static const uint8_t default_id[8] = { 0xec, 0xf1, 0x00, 0x15,
+                                           0x40, 0x00, 0x00, 0x00 };
 
+    memcpy(s->nand_id, default_id, sizeof(default_id));
     s->spi_uid = MT7621_SPI_UID_DEFAULT;
+}
+
+/*
+ * -M mt7621,nand-id=ecf1001540000000  -- the die's ID bytes, so a board can
+ * carry an ESMT/Winbond/Macronix part instead of the default Samsung.
+ */
+static void mt7621_set_nand_id(Object *obj, const char *value, Error **errp)
+{
+    MT7621State *s = MT7621_MACHINE(obj);
+    const char *p = value;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        char byte[3];
+        int n = 0;
+
+        while (*p && !g_ascii_isxdigit(*p)) {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        byte[n++] = *p++;
+        if (*p && g_ascii_isxdigit(*p)) {
+            byte[n++] = *p++;
+        }
+        byte[n] = 0;
+        s->nand_id[i] = (uint8_t)strtoul(byte, NULL, 16);
+    }
+    s->nand_id_set = true;
 }
 
 static void mt7621_set_spi_uid(Object *obj, Visitor *v, const char *name,
@@ -1110,6 +1160,7 @@ static void mt7621_machine_class_init(ObjectClass *oc, const void *data)
     MachineClass *mc = MACHINE_CLASS(oc);
 
     object_class_property_add_str(oc, "board", NULL, mt7621_set_board);
+    object_class_property_add_str(oc, "nand-id", NULL, mt7621_set_nand_id);
     object_class_property_set_description(oc, "board",
         "board preset: lg-gapm7200 (parallel NAND) or rb750gr3 (SPI NOR)");
 
