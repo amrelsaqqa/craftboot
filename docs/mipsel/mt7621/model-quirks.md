@@ -124,6 +124,22 @@ first 1 KiB buffer still lands at 0x8fddd6f8), so the ~0x9dc offset between the
 model's and the device's arena pointer comes from another allocation, not the
 SPI probe.
 
+## 1d. The NAND answers on CS0 only
+
+Breed probes both chip selects during its flash scan.  The model returned the
+same Samsung ID on CS0 *and* CS1, so the bootloader "found" the same NAND
+twice (two identical `Flash:` lines) and allocated a second page buffer for
+it.  `mt7621_nfi_cmd()` now answers only when `NFI_CSEL` selects CS0, which is
+the board's wiring; the duplicate line and its ~0x9a0 of heap go away
+(measured: the first 1 KiB DMA buffer moves from `8fddd6f8` to `8fddcd58`).
+
+Dl=4 still fails after this: the buffer lands 24 bytes off a 32-byte boundary,
+so the allocator's overrun still hits the next chunk.  The remaining offset is
+small (tens of bytes) and needs a hardware-side trace to pin down; the device
+has no UART and its shell-time heap is overwritten by DHCP/telnet buffers.
+
+`MT7621_CSLOG=1` prints every ID probe and the chip select it used.
+
 ## 2. DSA receive path: `fport` encoding and the delayed RX interrupt
 
 The frame engine fills RX descriptor word 3 with the receiving port, and the

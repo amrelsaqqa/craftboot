@@ -197,8 +197,29 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
 
     switch (cmd) {
     case 0x90:                          /* read id */
-        mt7621_nfi_fifo_put(s, nand_id, sizeof(nand_id));
+    {
+        static const uint8_t no_id[8] = { 0xff, 0xff, 0xff, 0xff,
+                                          0xff, 0xff, 0xff, 0xff };
+        unsigned cs = s->nfi_regs[NFI_CSEL >> 2] & 0x3;
+
+        /*
+         * The die is on CS0 only.  Breed probes CS0 and CS1 during scan; the
+         * model used to answer both, so the same NAND was reported twice,
+         * which cost an extra page buffer and shifted every later allocation.
+         */
+        if (cs != 0) {
+            if (getenv("MT7621_CSLOG")) {
+                fprintf(stderr, "nfi: id probe on cs=%u -> no die\n", cs);
+            }
+            mt7621_nfi_fifo_put(s, no_id, sizeof(no_id));
+        } else {
+            if (getenv("MT7621_CSLOG")) {
+                fprintf(stderr, "nfi: id probe on cs=%u\n", cs);
+            }
+            mt7621_nfi_fifo_put(s, nand_id, sizeof(nand_id));
+        }
         break;
+    }
     case 0x30:                          /* read: page data + spare */
     case 0xec:                          /* cache read (mtk-nandc variant) */
         /*
