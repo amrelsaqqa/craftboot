@@ -69,13 +69,18 @@ typedef enum MT7621Board {
  * One L1D line: tag, LRU stamp, the resident copy of the bytes, and whether
  * that copy is stale (an uncached store or device write made memory newer).
  */
-typedef struct MT7621DLine {
-    uint64_t tag;
-    bool valid;
-    bool stale;
-    uint64_t lru;
-    uint8_t data[64];           /* MT7621_DCACHE_MAXLINE */
-} MT7621DLine;
+/*
+ * One cache set: the four ways' tags (line number + 1, 0 = invalid), their LRU
+ * stamps and a stale bit per way.  32 bytes, so a lookup touches one line and
+ * the four tags can be compared at once.  The bytes of a *stale* way live in
+ * the model's stale table, not here: a resident line equals memory (the part is
+ * write-through), so the model never needs to keep a clean line's data.
+ */
+typedef struct MT7621DSet {
+    uint32_t tag[4];
+    uint16_t lru[4];
+    uint8_t stale;              /* bit per way */
+} MT7621DSet;
 
 struct MT7621State {
     MachineState parent;
@@ -214,7 +219,7 @@ struct MT7621State {
         uint64_t size;          /* DRAM size */
         uint64_t alias_limit;   /* end of DRAM plus its wraparound aliases */
         void *ram;              /* host pointer to DRAM */
-        MT7621DLine *lines;     /* nsets * MT7621_DCACHE_WAYS entries */
+        MT7621DSet *sets;       /* nsets sets of four ways */
         unsigned line_size;
         unsigned line_shift;
         unsigned nsets;

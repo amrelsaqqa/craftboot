@@ -18,42 +18,38 @@
  * continues; without a cache the zero is immediately visible, the allocator
  * sees a zero-sized block and gives up ("unable to allocate fifos").
  *
- * The model
- * ---------
- * A real 32 KiB 4-way L1D: tags, per-set LRU, line size from Config1.Dl, and a
- * resident copy of every line it holds.  It is write-through, so a resident
- * line equals memory *until something writes memory behind the cache's back* -
- * an uncached store or a device DMA.  That is the only situation in which a
- * cached read can differ from a read of memory, and it is therefore the only
- * thing the machine has to pay for:
+ * What hardware needs to answer is *residency*: when an uncached store hits a
+ * line, was that line in the cache?  The part is write-through, so a resident
+ * line equals memory unless something wrote memory behind the cache's back, and
+ * then the pre-store bytes are the only thing worth keeping.  That shapes the
+ * whole model:
  *
- *   - stores are seen on every cacheable page, because a store is what makes a
- *     line resident (write-allocate; measured: without it this firmware fails
- *     at "unable to allocate fifos").  A store updates the line and QEMU still
- *     performs it, so memory stays current;
- *   - an uncached store is seen too.  If it lands on a line the model holds,
- *     the line's pre-store bytes are kept and the line is marked stale; if the
- *     model holds nothing for that line, nothing is kept - the hardware would
- *     have read memory as well;
- *   - a load is only routed to the model for pages that hold a stale line.
- *     Everywhere else the line content equals memory, so QEMU's own load path
- *     is exactly what the hardware would return and stays at full speed;
- *   - `cache` instructions and `synci` drop lines (writeback is a no-op in a
- *     write-through cache), and index operations invalidate the set;
- *   - `ll`/`sc` bypass the model (QEMU's atomics write memory directly), so
- *     `sc` is followed by a line invalidate in gen_st_cond.
+ *   - residency is a tag array: 32 KiB, four ways, line size from Config1.Dl,
+ *     LRU per set.  A line is *never* copied in from memory - a clean line is
+ *     bit-identical to memory, so storing it would be work for nothing;
+ *   - the only bytes kept are the ones an uncached store made stale: when such
+ *     a store lands on a resident line, its pre-store bytes go into a small
+ *     stale table and the page is marked so its loads come here;
+ *   - stores are routed through the model on every cacheable page, because a
+ *     store is what makes a line resident (write-allocate; measured - without
+ *     it this firmware stops at "unable to allocate fifos");
+ *   - loads are routed through it only for pages holding a stale line, and are
+ *     served from that table.  Everywhere else a resident line equals memory,
+ *     so QEMU's own load path is exactly what the hardware returns.
  *
- * Residency is tracked for lines the CPU *stored*, which is the case the
- * firmware depends on and the only case a stale copy can matter for here: a
- * line that was resident only because it was read is treated as absent, so the
- * model can under-report staleness (the guest then sees memory, which is
- * newer) but can never invent an old value for a line the cache did not hold.
+ * `cache` instructions and `synci` drop a line (writeback is a no-op in a
+ * write-through cache); index operations invalidate everything.  `ll`/`sc`
+ * bypass the model - QEMU's atomics write memory directly - so `sc` is followed
+ * by a line invalidate in gen_st_cond.
  *
- * No ageing, no staleness window, nothing tuned to a guest.
+ * Nothing ages and nothing is tuned to a guest: whether a read sees an old
+ * value is decided by residency and invalidation, the two things the hardware
+ * uses.
  */
 
 #include "qemu/osdep.h"
 #include "qemu/target-info.h"
+#include <emmintrin.h>
 #include "qemu/units.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-dcache.h"
@@ -74,27 +70,31 @@ static MT7621State *dcache_state;
 
 /* Counters, reported with MT7621_STALETRACE=1 (diagnostics only). */
 static bool dcache_trace;
-static uint64_t dcache_hits, dcache_misses, dcache_fills, dcache_invals;
-static uint64_t dcache_stores, dcache_stale_made, dcache_reads_stale;
+static uint64_t dcache_hits, dcache_fills, dcache_stores, dcache_stale_made;
+static uint64_t dcache_reads_stale, dcache_invals;
 
-/*
- * MT7621_DSTALE=1 reports reads served from a stale line whose bytes no longer
- * match memory: exactly the reads the guest would not make without a cache.
- */
+/* MT7621_DSTALE=1 reports reads served from a stale snapshot. */
 static bool dcache_stale_on;
 static int dcache_stale_budget = 200;
 
-/*
- * MT7621_DCNOOP=1: keep the routing but let the model do nothing, to measure
- * what the forced slow path costs on its own.
- */
+/* MT7621_DCNOOP=1 keeps the routing but lets the model do nothing. */
 static bool dcache_noop;
 
-/* Diagnostic: no store tracking, and residency assumed (see tlb_fill). */
-static bool dcache_no_store;
+/* Per physical page: how many of its lines have a stale snapshot. */
+static uint16_t *dcache_page_stale;
 
-/* Per physical page: how many of its lines are stale. */
-static uint16_t *dcache_stale_lines;
+/*
+ * Stale snapshots, direct-mapped by line number.  Only lines an uncached store
+ * found resident ever appear here, so a small table is enough; a collision
+ * keeps the newer snapshot, which can only reduce what is served from stale
+ * bytes - the safe direction.
+ */
+struct MT7621Stale {
+    uint32_t line;              /* line number + 1, 0 = empty */
+    uint8_t data[MT7621_DCACHE_MAXLINE];
+};
+static struct MT7621Stale *dcache_stale;
+static unsigned dcache_stale_n;
 
 static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
@@ -113,92 +113,94 @@ static inline bool dcache_wrap(MT7621State *s, hwaddr *pa)
     return true;
 }
 
-static inline unsigned dcache_page(hwaddr pa)
-{
-    return pa >> 12;
-}
-
 static inline unsigned dcache_line(hwaddr pa)
 {
     return (pa >> dcache_state->dcache.line_shift) &
            (dcache_state->dcache.nsets - 1);
 }
 
-static inline MT7621DLine *dcache_set(MT7621State *s, hwaddr pa)
+static inline MT7621DSet *dcache_set(MT7621State *s, hwaddr pa)
 {
-    return &s->dcache.lines[dcache_line(pa) * MT7621_DCACHE_WAYS];
+    return &s->dcache.sets[dcache_line(pa)];
 }
 
-/* The resident line for this physical address, or the set's first way. */
-static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
+static inline struct MT7621Stale *dcache_stale_of(uint32_t line)
 {
-    unsigned shift = s->dcache.line_shift;
-    MT7621DLine *line = dcache_set(s, pa);
-    uint64_t tag = pa >> shift;
+    return &dcache_stale[line & (dcache_stale_n - 1)];
+}
+
+/*
+ * Which way of this set holds the line, or -1.  Four tags, one compare each;
+ * on x86-64 they are compared as a single vector when SSE2 is available.
+ */
+static inline int dcache_way(MT7621DSet *set, uint32_t want)
+{
+#if defined(__SSE2__) && defined(__x86_64__)
+    __m128i tags = _mm_loadu_si128((const __m128i *)set->tag);
+    __m128i w = _mm_set1_epi32((int)want);
+    unsigned mask = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(tags, w)));
+
+    return mask ? ctz32(mask) : -1;
+#else
     int i;
 
     for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
-        if (line[i].valid && line[i].tag == tag) {
-            *hit = true;
-            return &line[i];
+        if (set->tag[i] == want) {
+            return i;
         }
     }
-    *hit = false;
-    return line;
+    return -1;
+#endif
 }
 
-/* Drop a line; if it was stale, its page may stop needing the slow path. */
-static void dcache_drop(MT7621State *s, MT7621DLine *line)
+/* Drop a way, and with it any stale snapshot and page accounting. */
+static void dcache_drop_way(MT7621State *s, MT7621DSet *set, int way)
 {
-    if (line->valid && line->stale) {
-        unsigned page = dcache_page(line->tag << s->dcache.line_shift);
+    uint32_t tag = set->tag[way];
 
-        if (dcache_stale_lines[page]) {
-            dcache_stale_lines[page]--;
+    if (tag && (set->stale & (1u << way))) {
+        uint32_t line = tag - 1;
+        struct MT7621Stale *st = dcache_stale_of(line);
+        unsigned page = (line << s->dcache.line_shift) >> 12;
+
+        if (st->line == tag) {
+            st->line = 0;
+        }
+        set->stale &= ~(1u << way);
+        if (dcache_page_stale[page]) {
+            dcache_page_stale[page]--;
         }
     }
-    line->valid = false;
-    line->stale = false;
-    line->lru = 0;
+    set->tag[way] = 0;
+    set->lru[way] = 0;
 }
 
-/* Refill a line from memory, replacing the least recently used way. */
-static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
+/* Make this line resident, replacing the least recently used way. */
+static int dcache_fill(MT7621State *s, hwaddr pa)
 {
-    MT7621DLine *line = dcache_set(s, pa);
-    MT7621DLine *victim = &line[0];
-    hwaddr base = pa & ~(hwaddr)(s->dcache.line_size - 1);
-    unsigned n = s->dcache.line_size;
-    int i;
+    MT7621DSet *set = dcache_set(s, pa);
+    uint32_t want = (pa >> s->dcache.line_shift) + 1;
+    int victim = 0, i;
 
     for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
-        if (!line[i].valid) {
-            victim = &line[i];
+        if (!set->tag[i]) {
+            victim = i;
             break;
         }
-        if (line[i].lru < victim->lru) {
-            victim = &line[i];
+        if (set->lru[i] < set->lru[victim]) {
+            victim = i;
         }
     }
-    dcache_drop(s, victim);
-    if (base + n > s->dcache.size) {
-        n = s->dcache.size - base;
-    }
-    memcpy(victim->data, dcache_ram(s, base), n);
-    if (n < s->dcache.line_size) {
-        memset(victim->data + n, 0, s->dcache.line_size - n);
-    }
-    victim->tag = pa >> s->dcache.line_shift;
-    victim->valid = true;
+    dcache_drop_way(s, set, victim);
+    set->tag[victim] = want;
     dcache_fills++;
     return victim;
 }
 
 /*
- * An uncached store: if it lands on a line the cache holds, keep the bytes as
- * they were.  That copy is what a later cached read must see.  If the cache
- * holds nothing for the line, this store is the first thing to touch it as far
- * as the CPU is concerned, so memory is the truth and nothing is kept.
+ * An uncached store.  Where it lands on a resident line, keep the bytes as they
+ * were: that copy is what a later cached read must see.  Where it lands on a
+ * line the cache does not hold, memory is the truth and nothing is kept.
  */
 static void dcache_uncached_store(CPUState *cs, MT7621State *s, hwaddr pa,
                                   unsigned size)
@@ -209,28 +211,22 @@ static void dcache_uncached_store(CPUState *cs, MT7621State *s, hwaddr pa,
         hwaddr p = pa + done;
         unsigned off = p & (s->dcache.line_size - 1);
         unsigned n = MIN(size - done, s->dcache.line_size - off);
-        bool hit;
-        MT7621DLine *line = dcache_lookup(s, p, &hit);
+        MT7621DSet *set = dcache_set(s, p);
+        uint32_t want = (p >> s->dcache.line_shift) + 1;
+        int way = dcache_way(set, want);
 
-        if (!hit && dcache_no_store) {
-            hit = true;         /* diagnostic: assume the line is resident */
-            line = dcache_fill(s, p);
-        }
-        if (hit && !line->stale) {
-            /*
-             * The line is resident and its copy still matches memory: take
-             * the bytes before the store overwrites them and mark it stale.
-             * Loads on this page must now come through the model, so the TLB
-             * entries for it have to go.
-             */
+        if (way >= 0 && !(set->stale & (1u << way))) {
+            uint32_t line = want - 1;
+            struct MT7621Stale *st = dcache_stale_of(line);
             hwaddr base = p & ~(hwaddr)(s->dcache.line_size - 1);
-            unsigned page = dcache_page(base);
+            unsigned page = base >> 12;
 
-            memcpy(line->data, dcache_ram(s, base), s->dcache.line_size);
-            line->stale = true;
+            memcpy(st->data, dcache_ram(s, base), s->dcache.line_size);
+            st->line = want;
+            set->stale |= 1u << way;
             dcache_stale_made++;
-            if (dcache_stale_lines[page]++ == 0) {
-                /* the page's loads must now come through the model */
+            if (dcache_page_stale[page]++ == 0) {
+                /* this page's loads must now come through the model */
                 tlb_flush(cs);
             }
         }
@@ -240,17 +236,18 @@ static void dcache_uncached_store(CPUState *cs, MT7621State *s, hwaddr pa,
 
 /*
  * Slow-path data access.  The caller has translated the access and only sends
- * what the model asked to see, so this is a tag compare and a copy.
+ * what the model asked to see: every store on a cacheable page, and loads on
+ * pages holding a stale snapshot.
  */
 static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
                                  unsigned size, bool is_write, bool cached,
                                  uint64_t *value)
 {
     MT7621State *s = dcache_state;
+    MT7621DSet *set;
+    uint32_t want;
+    int way;
     unsigned off;
-    bool hit;
-    MT7621DLine *line;
-    uint64_t v;
 
     if (!s || !s->dcache.enabled || dcache_noop || size == 0 || size > 8) {
         return false;
@@ -269,82 +266,83 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
     if (off + size > s->dcache.line_size) {
         return false;           /* would straddle a line: QEMU's business */
     }
-
-    line = dcache_lookup(s, pa, &hit);
-    if (!hit) {
+    set = dcache_set(s, pa);
+    want = (pa >> s->dcache.line_shift) + 1;
+    way = dcache_way(set, want);
+    if (way < 0) {
         if (!is_write) {
-            /*
-             * A load of a line that is not resident: memory is the truth, and
-             * QEMU's own path returns it.  Only stale lines need the model.
-             */
-            return false;
+            return false;       /* not resident, nothing stale: memory is right */
         }
-        line = dcache_fill(s, pa);      /* write-allocate */
-        dcache_misses++;
+        way = dcache_fill(s, pa);       /* write-allocate */
     } else {
         dcache_hits++;
     }
-    line->lru = ++s->dcache.clock;
+    set->lru[way] = ++s->dcache.clock;
 
     if (is_write) {
         /*
-         * A clean line's copy is never read: the model serves memory for it,
-         * and a stale snapshot re-reads memory at the moment it is taken.  So
-         * the bytes only have to be written into a line that is *already*
-         * stale, where the cache copy is what a later load must see.
+         * Write-through: the cached copy takes the store too, so a later read
+         * of these bytes sees the new value while the rest of the line keeps
+         * the old one.  QEMU still performs the store; doing it here would skip
+         * its dirty/TB bookkeeping, and invalidating a TB from a store helper
+         * makes QEMU re-execute the instruction.
          */
-        if (line->stale) {
-            v = value ? *value : 0;
-            if (target_big_endian()) {
-                unsigned k;
+        if (set->stale & (1u << way)) {
+            uint64_t v = value ? *value : 0;
+            struct MT7621Stale *st = dcache_stale_of(want - 1);
 
-                for (k = 0; k < size; k++) {
-                    line->data[off + k] = (uint8_t)(v >> (8 * k));
+            if (st->line == want) {
+                if (target_big_endian()) {
+                    unsigned k;
+
+                    for (k = 0; k < size; k++) {
+                        st->data[off + k] = (uint8_t)(v >> (8 * k));
+                    }
+                } else {
+                    memcpy(st->data + off, &v, size);
                 }
-            } else {
-                memcpy(line->data + off, &v, size);
             }
         }
-        /*
-         * Write-through: the line is updated and QEMU performs the store, so
-         * memory stays current.  Writing memory here instead would skip
-         * QEMU's dirty and translated-block bookkeeping, and invalidating a TB
-         * from inside a store helper makes QEMU re-execute the instruction.
-         */
         dcache_stores++;
         return false;
     }
 
-    if (!line->stale) {
+    if (!(set->stale & (1u << way))) {
         return false;           /* identical to memory: QEMU's path is right */
     }
-    if (dcache_stale_on) {
-        if (memcmp(line->data + off, dcache_ram(s, pa), size) != 0 &&
-            dcache_stale_budget > 0) {
+    {
+        struct MT7621Stale *st = dcache_stale_of(want - 1);
+        uint64_t v;
+
+        if (st->line != want) {
+            return false;
+        }
+        if (dcache_stale_on && dcache_stale_budget > 0 &&
+            memcmp(st->data + off, dcache_ram(s, pa), size) != 0) {
             dcache_stale_budget--;
             fprintf(stderr, "dstale: pa=%08x va=%08x pc=%08x "
                     "cache=%02x%02x%02x%02x mem=%02x%02x%02x%02x\n",
                     (unsigned)pa, (unsigned)addr,
                     (unsigned)cpu_env(cs)->active_tc.PC,
-                    line->data[off + 3], line->data[off + 2],
-                    line->data[off + 1], line->data[off],
+                    st->data[off + 3], st->data[off + 2],
+                    st->data[off + 1], st->data[off],
                     dcache_ram(s, pa + 3)[0], dcache_ram(s, pa + 2)[0],
                     dcache_ram(s, pa + 1)[0], dcache_ram(s, pa)[0]);
         }
-    }
-    if (target_big_endian()) {
-        unsigned k;
+        if (target_big_endian()) {
+            unsigned k;
 
-        v = 0;
-        for (k = 0; k < size; k++) {
-            v |= (uint64_t)line->data[off + k] << (8 * k);
+            v = 0;
+            for (k = 0; k < size; k++) {
+                v |= (uint64_t)st->data[off + k] << (8 * k);
+            }
+        } else {
+            memcpy(&v, st->data + off, size);
         }
-    } else {
-        memcpy(&v, line->data + off, size);
+        *value = v;
+        dcache_reads_stale++;
+        return true;
     }
-    *value = v;
-    dcache_reads_stale++;
-    return true;
 }
 
 /* Does this page hold a line a load must be served from the model? */
@@ -358,7 +356,7 @@ static bool mt7621_dcache_page_slow(CPUState *cs, hwaddr pa)
     if (!dcache_wrap(s, &pa)) {
         return false;
     }
-    return dcache_stale_lines[dcache_page(pa)] != 0;
+    return dcache_page_stale[pa >> 12] != 0;
 }
 
 /*
@@ -373,11 +371,6 @@ static hwaddr dcache_pa(CPUState *cs, vaddr addr)
     return cpu_get_phys_page_debug(cs, addr);
 }
 
-/*
- * Cache operations.  A write-through cache never has dirty data to write back,
- * so writeback is a no-op; invalidate means "drop the line, memory is
- * authoritative again".
- */
 void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
                             unsigned op)
 {
@@ -388,14 +381,28 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
         return;                 /* the icache shadow owns the I side */
     }
     if (op <= 3) {
-        unsigned i, n = s->dcache.nsets * MT7621_DCACHE_WAYS;
+        unsigned i, n = s->dcache.nsets;
 
         if (op == 1) {
             return;             /* index load tag: nothing reads tags back */
         }
+        /* whole-cache operation: nothing is resident or stale any more */
         for (i = 0; i < n; i++) {
-            dcache_drop(s, &s->dcache.lines[i]);
+            MT7621DSet *set = &s->dcache.sets[i];
+            int w;
+
+            for (w = 0; w < MT7621_DCACHE_WAYS; w++) {
+                set->tag[w] = 0;
+            }
+            set->stale = 0;
         }
+        if (dcache_stale_n) {
+            memset(dcache_stale, 0,
+                   dcache_stale_n * sizeof(*dcache_stale));
+            memset(dcache_page_stale, 0, (s->dcache.size >> 12) *
+                   sizeof(*dcache_page_stale));
+        }
+        dcache_invals++;
         return;
     }
     if (op == 6) {
@@ -409,27 +416,26 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
         return;
     }
     {
-        bool hit;
-        MT7621DLine *line = dcache_lookup(s, pa, &hit);
+        MT7621DSet *set = dcache_set(s, pa);
+        int way = dcache_way(set, (pa >> s->dcache.line_shift) + 1);
 
-        if (hit) {
-            dcache_drop(s, line);
+        if (way >= 0) {
+            dcache_drop_way(s, set, way);
             dcache_invals++;
         }
     }
 }
 
 /*
- * Geometry follows the Dl the machine presents (Breed derives the line size as
- * 1 << (Dl + 1): Dl=2 -> 8, Dl=4 -> 32, which is what the board reports), and a
- * reset leaves the cache empty.
+ * Geometry follows the Dl the machine presents and a reset leaves the cache
+ * empty.
  */
 void mt7621_dcache_reset(MT7621State *s)
 {
     CPUState *cs = qemu_get_cpu(0);
-    unsigned dl, line, i, n;
+    unsigned dl, line, sets, i;
 
-    if (!s->dcache.enabled || !s->dcache.lines || !cs) {
+    if (!s->dcache.enabled || !cs) {
         return;
     }
     dl = (cpu_env(cs)->CP0_Config1 >> 10) & 7;
@@ -439,23 +445,27 @@ void mt7621_dcache_reset(MT7621State *s)
     }
     s->dcache.line_size = line;
     s->dcache.line_shift = ctz32(line);
-    s->dcache.nsets = MT7621_DCACHE_BYTES / (line * MT7621_DCACHE_WAYS);
-    n = s->dcache.nsets * MT7621_DCACHE_WAYS;
-    for (i = 0; i < n; i++) {
-        s->dcache.lines[i].valid = false;
-        s->dcache.lines[i].stale = false;
+    sets = MT7621_DCACHE_BYTES / (line * MT7621_DCACHE_WAYS);
+    s->dcache.nsets = sets;
+
+    for (i = 0; i < sets; i++) {
+        memset(s->dcache.sets[i].tag, 0, sizeof(s->dcache.sets[i].tag));
+        s->dcache.sets[i].stale = 0;
     }
-    memset(dcache_stale_lines, 0, s->dcache.size / 4096 *
-           sizeof(*dcache_stale_lines));
+    if (dcache_stale_n) {
+        memset(dcache_stale, 0, dcache_stale_n * sizeof(*dcache_stale));
+        memset(dcache_page_stale, 0, (s->dcache.size >> 12) *
+               sizeof(*dcache_page_stale));
+    }
 }
 
 static void dcache_report(void)
 {
-    fprintf(stderr, "dcache: hits=%" PRIu64 " misses=%" PRIu64 " fills=%"
-            PRIu64 " stores=%" PRIu64 " stale_made=%" PRIu64
-            " stale_reads=%" PRIu64 " invalidates=%" PRIu64 "\n",
-            dcache_hits, dcache_misses, dcache_fills, dcache_stores,
-            dcache_stale_made, dcache_reads_stale, dcache_invals);
+    fprintf(stderr, "dcache: hits=%" PRIu64 " fills=%" PRIu64 " stores=%"
+            PRIu64 " stale_made=%" PRIu64 " stale_reads=%" PRIu64
+            " invalidates=%" PRIu64 "\n", dcache_hits, dcache_fills,
+            dcache_stores, dcache_stale_made, dcache_reads_stale,
+            dcache_invals);
 }
 
 static void dcache_tick(void *opaque)
@@ -469,6 +479,8 @@ static void dcache_tick(void *opaque)
 
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
 {
+    unsigned sets;
+
     if (!getenv("MT7621_DCACHE")) {
         return;
     }
@@ -476,22 +488,25 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     dcache_trace = getenv("MT7621_STALETRACE") != NULL;
     dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
     dcache_noop = getenv("MT7621_DCNOOP") != NULL;
-    dcache_no_store = getenv("MT7621_DCACHENOSTORE") != NULL;
 
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     s->dcache.size = ram_size;
     if (!s->dcache.alias_limit) {
         s->dcache.alias_limit = ram_size;
     }
-    /* enough lines for the smallest line size the encoding allows (4 B) */
-    s->dcache.lines = g_new0(MT7621DLine, MT7621_DCACHE_BYTES / 4);
-    dcache_stale_lines = g_new0(uint16_t, ram_size / 4096);
-    s->dcache.enabled = true;
-    /* Defaults until the CPU's Config1 is available; reset refines them. */
+
+    /* enough sets for the smallest line size the encoding allows (4 B) */
+    sets = MT7621_DCACHE_BYTES / (4 * MT7621_DCACHE_WAYS);
+    s->dcache.sets = g_new0(MT7621DSet, sets);
+    s->dcache.nsets = sets;
     s->dcache.line_size = 32;
     s->dcache.line_shift = 5;
-    s->dcache.nsets = MT7621_DCACHE_BYTES / (32 * MT7621_DCACHE_WAYS);
 
+    dcache_page_stale = g_new0(uint16_t, ram_size >> 12);
+    dcache_stale_n = sets;
+    dcache_stale = g_new0(struct MT7621Stale, dcache_stale_n);
+
+    s->dcache.enabled = true;
     cpu_dcache_access_handler = mt7621_dcache_access;
     cpu_dcache_page_slow = mt7621_dcache_page_slow;
     mips_dcache_op = mt7621_dcache_cache_op;
