@@ -714,6 +714,18 @@ static void mt7621_reset(void *opaque)
                                ((strtoul(dl, NULL, 0) & 7) << 10);
         }
     }
+    /*
+     * MT7621_CFGLOG=1 prints the line size the guest will actually see, so a
+     * test that means to run at a given Dl can assert it instead of assuming
+     * an environment variable took effect.  Breed derives the size as
+     * 1 << (Dl + 1): Dl=2 -> 8, Dl=4 -> 32.
+     */
+    if (getenv("MT7621_CFGLOG")) {
+        unsigned dl = ((uint32_t)env->CP0_Config1 >> 10) & 7;
+
+        fprintf(stderr, "cpu: Config1=%08x Dl=%u line=%u\n",
+                (uint32_t)env->CP0_Config1, dl, 1u << (dl + 1));
+    }
 
     /* Everything the guest programmed is gone after a real reset. */
     mt7621_eth_dev_reset(s);

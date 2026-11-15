@@ -80,6 +80,15 @@ wrong.  That run did not pass `MT7621_DL`, so the board override below (`Dl=2`)
 was still in force and the boot succeeded at `Dl = 2`.  The identity was a
 fidelity fix only.
 
+`MT7621_CFGLOG=1` prints the value the guest will actually see, at reset:
+
+    cpu: Config1=fea3498f Dl=2 line=8        (default on lg-gapm7200)
+    cpu: Config1=fea3518f Dl=4 line=32       (MT7621_DL=4)
+
+Assert on that line in scripts instead of trusting that the environment
+variable was passed through - the false positive above came from a loop that
+printed the intended Dl without setting it.
+
 ### What the board's own heap says (2026-11-15, after the dumps)
 
 The board's chain at `Dl = 4` is identical to the model's: first DMA chunk
