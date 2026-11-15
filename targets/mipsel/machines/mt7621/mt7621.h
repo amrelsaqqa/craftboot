@@ -66,10 +66,6 @@ typedef enum MT7621Board {
 #define NFI_WORDS               (0x1000 / 4)
 
 /*
- * One L1D line: tag, LRU stamp, the resident copy of the bytes, and whether
- * that copy is stale (an uncached store or device write made memory newer).
- */
-/*
  * One cache set: the four ways' tags (line number + 1, 0 = invalid), their LRU
  * stamps and a stale bit per way.  32 bytes, so a lookup touches one line and
  * the four tags can be compared at once.  The bytes of a *stale* way live in
