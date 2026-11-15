@@ -73,6 +73,8 @@ typedef struct MT7621DLine {
     uint8_t data[64];
 } MT7621DLine;
 
+typedef struct MT7621ShadowPage MT7621ShadowPage;
+
 struct MT7621State {
     MachineState parent;
 
@@ -206,7 +208,7 @@ struct MT7621State {
         bool enabled;
         uint64_t size;
         void *ram;              /* host pointer to DRAM */
-        uint8_t **shadow;       /* per page: pre-uncached-write contents */
+        uint8_t **shadow;       /* per page: stale lines (MT7621ShadowPage) */
     } dcache;
     /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
     uint8_t nand_id[8];

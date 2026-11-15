@@ -50,8 +50,26 @@
 #include "system/memory.h"
 #include "mt7621.h"
 
+#include "system/physmem.h"
+
 #define MT7621_PAGE 4096
 #define MT7621_DCACHE_LINE 32
+#define MT7621_LINES_PER_PAGE (MT7621_PAGE / MT7621_DCACHE_LINE)
+
+/*
+ * How long a line stays stale.  A 32 KiB 4-way L1D turns over constantly, so a
+ * stale line survives only until the cache needs its way again - a handful of
+ * lines in practice.  Keeping a small window is what makes this faithful: the
+ * firmware's DMA clear only needs the header line to stay stale across the few
+ * instructions until the next malloc, while anything older reverts to memory.
+ */
+#define MT7621_STALE_WINDOW 64
+
+/* Per page: the stale copy of each line an uncached write touched. */
+struct MT7621ShadowPage {
+    uint8_t data[MT7621_PAGE];
+    uint8_t line[MT7621_LINES_PER_PAGE];
+};
 
 /* implemented in target/mips; declared here so the machine can ask */
 bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
@@ -60,9 +78,61 @@ bool mips_mapping_is_cacheable(CPUMIPSState *env, target_ulong address,
 static MT7621State *dcache_state;
 static unsigned dcache_pages;
 
+typedef struct MT7621StaleFifo {
+    uint32_t key[MT7621_STALE_WINDOW];  /* physical line address >> 5 */
+    unsigned head;
+    unsigned count;
+    unsigned limit;                     /* MT7621_STALE_WINDOW override */
+} MT7621StaleFifo;
+
+static inline unsigned dcache_line(hwaddr pa)
+{
+    return (pa % MT7621_PAGE) / MT7621_DCACHE_LINE;
+}
+
+static MT7621StaleFifo stale_fifo;
+
+/* Evict the oldest stale line: it is out of the cache, memory is the truth. */
+static void dcache_stale_push(MT7621State *s, hwaddr pa)
+{
+    uint32_t key = (uint32_t)(pa >> 5);
+
+    if (!stale_fifo.limit) {
+        return;                 /* staleness disabled: pure write-through */
+    }
+    stale_fifo.key[stale_fifo.head] = key;
+    stale_fifo.head = (stale_fifo.head + 1) % MT7621_STALE_WINDOW;
+    if (stale_fifo.count < stale_fifo.limit) {
+        stale_fifo.count++;
+        return;
+    }
+    {
+        uint32_t old = stale_fifo.key[stale_fifo.head];
+        hwaddr p = (hwaddr)old << 5;
+        struct MT7621ShadowPage *sp =
+            (struct MT7621ShadowPage *)s->dcache.shadow[p / MT7621_PAGE];
+
+        if (sp) {
+            sp->line[dcache_line(p)] = 0;
+        }
+    }
+}
+
 static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
     return (uint8_t *)s->dcache.ram + pa;
+}
+
+
+/*
+ * Has the CPU written this page?  QEMU marks a RAM page dirty on the first CPU
+ * store after it was clean, which is exactly the hint needed here: a line can
+ * only be in the cache if the CPU touched the page, and only such lines may
+ * become stale when a store bypasses the cache.
+ */
+static inline bool dcache_page_cpu_written(hwaddr pa)
+{
+    return physical_memory_get_dirty_flag(pa, DIRTY_MEMORY_MIGRATION);
 }
 
 static bool dcache_pa(CPUState *cs, vaddr addr, hwaddr *pa)
@@ -79,29 +149,57 @@ bool mt7621_dcache_page_slow(CPUState *cs, hwaddr pa)
 {
     MT7621State *s = dcache_state;
 
-    return s && s->dcache.enabled && pa < s->dcache.size &&
-           s->dcache.shadow[pa / MT7621_PAGE] != NULL;
-}
-
-/* Save a page's current contents and put it on the slow path. */
-static bool dcache_shadow_page(CPUState *cs, hwaddr pa)
-{
-    MT7621State *s = dcache_state;
-    unsigned page = pa / MT7621_PAGE;
-    uint8_t *shadow;
-
-    if (page >= dcache_pages) {
+    if (getenv("MT7621_DCACHE_NOOP")) {
         return false;
     }
-    if (s->dcache.shadow[page]) {
-        return true;            /* already shadowed */
+    return s && s->dcache.enabled && pa < s->dcache.size &&
+           (uint8_t *)s->dcache.shadow[pa / MT7621_PAGE] != NULL;
+}
+
+/*
+ * An uncached store: for every line it touches on a page the CPU has written,
+ * keep what the cache holds (the line as it was) and mark it stale.  Lines the
+ * CPU never touched are left alone - memory is the cache's content for them.
+ */
+static void dcache_uncached_store(CPUState *cs, hwaddr pa, unsigned size,
+                                  uint64_t value)
+{
+    MT7621State *s = dcache_state;
+    unsigned i;
+
+    for (i = 0; i < size; i++) {
+        hwaddr p = pa + i;
+        unsigned page = p / MT7621_PAGE;
+        unsigned line = dcache_line(p);
+        struct MT7621ShadowPage *sp;
+
+        if (page >= dcache_pages) {
+            continue;
+        }
+        sp = (struct MT7621ShadowPage *)s->dcache.shadow[page];
+        if (!sp && (getenv("MT7621_DCACHE_ALWAYS_SHADOW") ||
+                    dcache_page_cpu_written(page * MT7621_PAGE))) {
+            sp = g_new0(struct MT7621ShadowPage, 1);
+            s->dcache.shadow[page] = (uint8_t *)sp;
+            /* reads of this page must now come through the model */
+            tlb_flush(cs);
+        }
+        if (sp && !sp->line[line]) {
+            memcpy(sp->data + line * MT7621_DCACHE_LINE,
+                   dcache_ram(s, page * MT7621_PAGE + line * MT7621_DCACHE_LINE),
+                   MT7621_DCACHE_LINE);
+            sp->line[line] = 1;
+            if (getenv("MT7621_DCACHEDBG")) {
+                static int budget = 400;
+                if (budget-- > 0) {
+                    fprintf(stderr, "dcache: stale line pa=%08x\n",
+                            (unsigned)p);
+                }
+            }
+            dcache_stale_push(s, p);
+        }
+        dcache_ram(s, p)[0] = (uint8_t)(value >> (i * 8));
     }
-    shadow = g_malloc(MT7621_PAGE);
-    memcpy(shadow, dcache_ram(s, page * MT7621_PAGE), MT7621_PAGE);
-    s->dcache.shadow[page] = shadow;
-    /* cached mappings of this page must now come through the model */
-    tlb_flush(cs);
-    return true;
 }
 
 /*
@@ -115,13 +213,28 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
     MT7621State *s = dcache_state;
     CPUMIPSState *env;
     hwaddr pa;
-    uint8_t *shadow, buf[8];
+    struct MT7621ShadowPage *sp;
     uint64_t v = value ? *value : 0;
+    uint64_t r = 0;
     unsigned i;
     bool cached;
 
-    if (!s || !s->dcache.enabled) {
+    if (!s || !s->dcache.enabled || getenv("MT7621_DCACHE_NOOP")) {
         return false;
+    }
+    if (getenv("MT7621_DCACHEHEAP") && (addr >= 0xafdd0000 && addr < 0xafde0000) || (addr >= 0x8fdd0000 && addr < 0x8fde0000)) {
+        static int budget = 40;
+        if (budget-- > 0) {
+            fprintf(stderr, "dcache heap: %c addr=%08x size=%u\n",
+                    is_write ? 'w' : 'r', (unsigned)addr, size);
+        }
+    }
+    if (getenv("MT7621_DCACHECALL")) {
+        static int budget = 12;
+        if (budget-- > 0) {
+            fprintf(stderr, "dcache call: %c addr=%08x size=%u\n",
+                    is_write ? 'w' : 'r', (unsigned)addr, size);
+        }
     }
     env = cpu_env(cs);
     if (!dcache_pa(cs, addr, &pa) || pa + size > s->dcache.size) {
@@ -135,34 +248,47 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         if (!is_write) {
             return false;       /* uncached read: nothing to model */
         }
-        if (!dcache_shadow_page(cs, pa)) {
-            return false;
-        }
-        /* the store bypasses the cache: memory only */
-        for (i = 0; i < size; i++) {
-            dcache_ram(s, pa + i)[0] = (uint8_t)(v >> (i * 8));
-        }
-        return true;
+        dcache_uncached_store(cs, pa, size, v);
+        /*
+         * The store itself is left to QEMU: writing memory behind its back
+         * would skip the dirty tracking that invalidates translated blocks,
+         * and the guest executes code it has just written.
+         */
+        return false;
     }
 
-    shadow = s->dcache.shadow[pa / MT7621_PAGE];
-    if (!shadow) {
+    sp = (struct MT7621ShadowPage *)s->dcache.shadow[pa / MT7621_PAGE];
+    if (!sp) {
         return false;           /* not shadowed: fast path is right */
     }
-    shadow += pa % MT7621_PAGE;
     if (is_write) {
         for (i = 0; i < size; i++) {
-            shadow[i] = (uint8_t)(v >> (i * 8));
-            dcache_ram(s, pa + i)[0] = shadow[i];   /* write-through */
+            hwaddr p = pa + i;
+            unsigned line = dcache_line(p);
+
+            if (sp->line[line]) {
+                sp->data[p % MT7621_PAGE] = (uint8_t)(v >> (i * 8));
+            }
         }
-    } else {
-        memcpy(buf, shadow, size);
-        v = 0;
-        for (i = 0; i < size; i++) {
-            v |= (uint64_t)buf[i] << (i * 8);
-        }
-        *value = v;
+        return false;           /* memory is written by the normal path */
     }
+    for (i = 0; i < size; i++) {
+        hwaddr p = pa + i;
+
+        if (sp->line[dcache_line(p)]) {
+            if (getenv("MT7621_DCACHEDBG")) {
+                static int budget = 400;
+                if (budget-- > 0) {
+                    fprintf(stderr, "dcache: stale read pa=%08x\n",
+                            (unsigned)p);
+                }
+            }
+            r |= (uint64_t)sp->data[p % MT7621_PAGE] << (i * 8);
+        } else {
+            r |= (uint64_t)dcache_ram(s, p)[0] << (i * 8);
+        }
+    }
+    *value = r;
     return true;
 }
 
@@ -199,11 +325,11 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
     }
     if ((op == 4 || op == 5) && dcache_pa(cs, addr, &pa) &&
         pa < s->dcache.size) {
-        uint8_t *shadow = s->dcache.shadow[pa / MT7621_PAGE];
+        struct MT7621ShadowPage *sp =
+            (struct MT7621ShadowPage *)s->dcache.shadow[pa / MT7621_PAGE];
 
-        if (shadow) {
-            memcpy(shadow + (pa % MT7621_PAGE),
-                   dcache_ram(s, pa), MT7621_DCACHE_LINE);
+        if (sp) {
+            sp->line[dcache_line(pa)] = 0;
         }
     }
 }
@@ -214,9 +340,16 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
         return;
     }
     dcache_state = s;
+    stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
+                       ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
+                       : MT7621_STALE_WINDOW;
+    if (stale_fifo.limit > MT7621_STALE_WINDOW) {
+        stale_fifo.limit = MT7621_STALE_WINDOW;
+    }
     dcache_pages = ram_size / MT7621_PAGE;
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
-    s->dcache.shadow = g_new0(uint8_t *, dcache_pages);
+    s->dcache.shadow = (uint8_t **)g_new0(struct MT7621ShadowPage *,
+                                          dcache_pages);
     s->dcache.size = ram_size;
     s->dcache.enabled = true;
 
