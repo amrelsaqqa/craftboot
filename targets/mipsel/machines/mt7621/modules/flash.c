@@ -537,6 +537,17 @@ static const MemoryRegionOps mt7621_spi_ops = {
 
 void mt7621_spi_init(MT7621State *s)
 {
+    /*
+     * lg-gapm7200 has no SPI NOR: the B70's flash is the parallel NAND on the
+     * NFI, and the board's docs/log show no SPI device ("Flash: Samsung NAND
+     * ... on mt7621-nfi.0" twice, nothing on mt7621-spi).  Exposing the
+     * controller there makes the firmware probe a die that is not populated,
+     * which costs it a flash-read buffer (~2.5 KiB of heap) that the real
+     * board never allocates.
+     */
+    if (s->board == MT7621_BOARD_LG_GAPM7200) {
+        return;
+    }
     memory_region_init_io(&s->spi, NULL, &mt7621_spi_ops, s, "mt7621.spi", 0x100);
     memory_region_add_subregion(&s->sysctl, MT7621_SPI_OFF, &s->spi);
 }

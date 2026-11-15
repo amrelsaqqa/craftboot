@@ -110,6 +110,20 @@ All of these are reachable at run time for further measurements:
 `MT7621_MEMC604`, `MT7621_MEMC618`, `MT7621_DDR_PLL`, `MT7621_CLKCFG` and
 `MT7621_CLKSTS`.
 
+## 1c. No SPI NOR on lg-gapm7200
+
+The B70's only flash is the parallel NAND on the NFI.  The machine used to
+register the SPI controller for every board, so firmware probing it found a
+W25Q128 die that is not soldered on this board.  `mt7621_spi_init()` now
+registers the controller only for boards that have one (`rb750gr3`); on
+`lg-gapm7200` reads in that window hit the sysctl region and report nothing,
+which is what the real board does.
+
+This does not by itself change the DMA-allocator outcome at Dl=4 (measured: the
+first 1 KiB buffer still lands at 0x8fddd6f8), so the ~0x9dc offset between the
+model's and the device's arena pointer comes from another allocation, not the
+SPI probe.
+
 ## 2. DSA receive path: `fport` encoding and the delayed RX interrupt
 
 The frame engine fills RX descriptor word 3 with the receiving port, and the
