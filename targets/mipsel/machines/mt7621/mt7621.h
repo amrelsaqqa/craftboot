@@ -208,6 +208,7 @@ struct MT7621State {
         uint64_t clock;
         MT7621DLine *lines;
         AddressSpace as;
+        uint8_t *ram;           /* host pointer to DRAM */
     } dcache;
     /* NAND die identity the NFI answers with (-M mt7621,nand-id=...) */
     uint8_t nand_id[8];

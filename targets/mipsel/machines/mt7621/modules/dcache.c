@@ -58,7 +58,7 @@ static MT7621State *dcache_state;
 static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
 {
     unsigned shift = s->dcache.line_shift;
-    unsigned set = (pa >> shift) % s->dcache.nsets;
+    unsigned set = (pa >> shift) & (s->dcache.nsets - 1);
     MT7621DLine *line = &s->dcache.lines[set * MT7621_DCACHE_WAYS];
     uint64_t tag = pa >> shift;
     int i;
@@ -76,9 +76,8 @@ static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
 static void dcache_writeback(MT7621State *s, MT7621DLine *line)
 {
     if (line->valid && line->dirty) {
-        address_space_write(&s->dcache.as, line->tag << s->dcache.line_shift,
-                            MEMTXATTRS_UNSPECIFIED, line->data,
-                            s->dcache.line_size);
+        memcpy(s->dcache.ram + (line->tag << s->dcache.line_shift),
+               line->data, s->dcache.line_size);
         line->dirty = false;
     }
 }
@@ -86,7 +85,7 @@ static void dcache_writeback(MT7621State *s, MT7621DLine *line)
 static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
 {
     unsigned shift = s->dcache.line_shift;
-    unsigned set = (pa >> shift) % s->dcache.nsets;
+    unsigned set = (pa >> shift) & (s->dcache.nsets - 1);
     MT7621DLine *line = &s->dcache.lines[set * MT7621_DCACHE_WAYS];
     MT7621DLine *victim = &line[0];
     int i;
@@ -106,9 +105,8 @@ static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
     victim->tag = pa >> shift;
     victim->valid = true;
     victim->dirty = false;
-    address_space_read(&s->dcache.as, (pa >> shift) << shift,
-                       MEMTXATTRS_UNSPECIFIED, victim->data,
-                       s->dcache.line_size);
+    memcpy(victim->data, s->dcache.ram + ((pa >> shift) << shift),
+           s->dcache.line_size);
     return victim;
 }
 
@@ -184,18 +182,15 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         unsigned n = MIN(left, s->dcache.line_size - line_off);
         bool hit;
         MT7621DLine *line = dcache_lookup(s, p, &hit);
-        unsigned k;
 
         if (!hit) {
             line = dcache_fill(s, p);
         }
         line->lru = ++s->dcache.clock;
-        for (k = 0; k < n; k++) {
-            if (is_write) {
-                line->data[line_off + k] = (uint8_t)(w >> ((done + k) * 8));
-            } else {
-                r |= (uint64_t)line->data[line_off + k] << ((done + k) * 8);
-            }
+        if (is_write) {
+            memcpy(line->data + line_off, (uint8_t *)&w + done, n);
+        } else {
+            memcpy((uint8_t *)&r + done, line->data + line_off, n);
         }
         p += n;
         left -= n;
@@ -208,8 +203,7 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
      * from the line, which is why the uncached DMA clear leaves it stale.
      */
     if (is_write) {
-        address_space_write(&s->dcache.as, pa, MEMTXATTRS_UNSPECIFIED,
-                            &w, done);
+        memcpy(s->dcache.ram + pa, &w, done);
     } else {
         *value = r;
     }
@@ -345,7 +339,7 @@ void mt7621_dcache_init(MT7621State *s)
     s->dcache.nsets = MT7621_DCACHE_BYTES / (32 * MT7621_DCACHE_WAYS);
 
     /* DRAM as its own address space: fills and writebacks bypass the CPU. */
-    address_space_init(&s->dcache.as, &s->ram, "mt7621-dcache-ram");
+    s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     cpu_dcache_access_handler = mt7621_dcache_access;
     mips_dcache_op = mt7621_dcache_cache_op;
     fprintf(stderr, "mt7621: L1 data cache model enabled\n");
