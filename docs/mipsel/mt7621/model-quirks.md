@@ -185,6 +185,25 @@ Cost and routing, measured on one pinned core:
 |---|---|---|---|
 | `ubi0: attached` | 11 s | 13-16 s | ~1.2-1.4x |
 | `procd: - init -` | 22-26 s | 32-33 s | ~1.3x |
+| `br-lan: link becomes ready` | 44 s | 78 s | 1.75x |
+
+The whole remaining gap is the per-store slow-path entry.  Measured with
+`MT7621_DCACHENOSTORE=1` (diagnostic: no store tracking at all, residency
+assumed), the same boot takes 45 s - i.e. **the model would be free if store
+accounting cost nothing**.  That option is not shippable because assuming
+residency is exactly what lets a stale value be invented, but it fixes the
+target for the next step: keep the store in the fast path and record the
+stored line's tag there.
+
+That step is host code generation, not machine code: `tgen_qemu_st()` in
+`tcg/i386/tcg-target.c.inc` emits the fast store itself, so the recording
+would be ~10 hand-written x86 instructions (LEA the host address, subtract the
+RAM base, bounds-check, shift to a line number, mask into the log, store the
+tag) using `TCG_REG_L0`/`L1` and the dead guest-address register as scratch,
+after the store.  The hazard is that it runs on the fast path of every guest
+store, so a mistake corrupts guest memory broadly and silently - unlike every
+change so far, which could only get the cache wrong.  It needs its own test
+pass (all four boot cases plus a memory-torture run) rather than a smoke test.
 
 That is with **loads left on QEMU's fast path everywhere except pages that hold
 a stale line**.  The routing is what makes it affordable, and it is exact:

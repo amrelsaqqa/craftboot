@@ -90,6 +90,9 @@ static int dcache_stale_budget = 200;
  */
 static bool dcache_noop;
 
+/* Diagnostic: no store tracking, and residency assumed (see tlb_fill). */
+static bool dcache_no_store;
+
 /* Per physical page: how many of its lines are stale. */
 static uint16_t *dcache_stale_lines;
 
@@ -209,6 +212,10 @@ static void dcache_uncached_store(CPUState *cs, MT7621State *s, hwaddr pa,
         bool hit;
         MT7621DLine *line = dcache_lookup(s, p, &hit);
 
+        if (!hit && dcache_no_store) {
+            hit = true;         /* diagnostic: assume the line is resident */
+            line = dcache_fill(s, p);
+        }
         if (hit && !line->stale) {
             /*
              * The line is resident and its copy still matches memory: take
@@ -461,6 +468,7 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     dcache_trace = getenv("MT7621_STALETRACE") != NULL;
     dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
     dcache_noop = getenv("MT7621_DCNOOP") != NULL;
+    dcache_no_store = getenv("MT7621_DCACHENOSTORE") != NULL;
 
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     s->dcache.size = ram_size;
