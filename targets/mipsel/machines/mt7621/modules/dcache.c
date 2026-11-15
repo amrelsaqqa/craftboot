@@ -76,6 +76,13 @@ static uint64_t dcache_stores;
  */
 static bool dcache_stale_on;
 static int dcache_stale_budget = 200;
+/*
+ * MT7621_STALE_KSEG1_ONLY=1: serve a stale line only while the CPU executes
+ * from KSEG1, i.e. only for the bootloader that runs there.  Diagnostic - if a
+ * kernel that is correct about invalidation behaves differently under it, the
+ * difference is staleness the model invented, not the guest's.
+ */
+static bool dcache_stale_kseg1_only;
 
 static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
@@ -202,6 +209,11 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         bool hit;
         MT7621DLine *line = dcache_lookup(s, pa + done, &hit);
         unsigned k;
+
+        if (hit && dcache_stale_kseg1_only &&
+            cpu_env(cs)->active_tc.PC < 0xa0000000u) {
+            hit = false;        /* diagnostic: pretend the line is not there */
+        }
 
         if (!hit) {
             /*
@@ -395,6 +407,7 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     dcache_state = s;
     dcache_trace = getenv("MT7621_STALETRACE") != NULL;
     dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
+    dcache_stale_kseg1_only = getenv("MT7621_STALE_KSEG1_ONLY") != NULL;
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     s->dcache.size = ram_size;
     if (!s->dcache.alias_limit) {

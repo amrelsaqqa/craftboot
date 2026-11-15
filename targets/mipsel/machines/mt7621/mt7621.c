@@ -420,16 +420,21 @@ static void mt7621_poweroff_poll(void *opaque)
          * the budget long before the interesting fault; only report the
          * codes that mean something went wrong. */
         bool interesting = (code == 4 || code == 5 || code == 10 ||
-                            code == 11 || code == 12 || code == 13);
+                            code == 11 || code == 12 || code == 13 ||
+                            code == 26);
         if (code && interesting && exc_budget-- > 0) {
             fprintf(stderr, "exc: code=%u pc=%08x epc=%08x badvaddr=%08x "
                     "status=%08x cause=%08x\n", code,
                     (uint32_t)env->active_tc.PC, (uint32_t)env->CP0_EPC,
                     (uint32_t)env->CP0_BadVAddr, env->CP0_Status, cause);
-            /* Reserved Instruction: show the word the guest choked on and
-             * the preceding few, which names the instruction and its delay
-             * slot context without needing a guest-side disassembler. */
-            if (code == 11) {
+            /*
+             * Reserved Instruction and DSP: show the word the guest choked on
+             * and the preceding few, which names the instruction and its delay
+             * slot context without needing a guest-side disassembler.  A DSP
+             * exception on instruction stream the kernel never emitted means
+             * control flow went into data, and these words say where.
+             */
+            if (code == 11 || code == 26) {
                 uint32_t epc = (uint32_t)env->CP0_EPC;
                 uint32_t insn[4];
                 int k;
