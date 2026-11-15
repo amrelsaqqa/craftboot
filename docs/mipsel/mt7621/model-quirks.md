@@ -184,8 +184,23 @@ Cost and routing, measured on one pinned core:
 | milestone | no cache | cache model | ratio |
 |---|---|---|---|
 | `ubi0: attached` | 11 s | 13-16 s | ~1.2-1.4x |
-| `procd: - init -` | 22-26 s | 32-33 s | ~1.3x |
-| `br-lan: link becomes ready` | 44 s | 78 s | 1.75x |
+| `procd: - init -` | 22-26 s | 29-31 s | ~1.3x |
+| `br-lan: link becomes ready` | 36.8-39.9 s | 67.6-70.1 s | ~1.78x |
+
+The `br-lan` row is three runs each; the spread is +-2 s, so a difference under
+about 3% cannot be told apart from noise on this host.  (A single 64.3 s sample
+earlier was luck, not a gain.)
+
+Everything in that cost is the per-store slow-path entry, and the model side of
+it has been taken to its floor: one 32-byte set per cache set with four tags,
+four LRU stamps and a stale bit per way; the four tags compared at once with
+SSE2; no bytes copied on a fill (a write-through resident line equals memory, so
+only lines an uncached store made stale keep bytes, in a small direct-mapped
+side table); tags holding line+1 so zero means invalid; counters only maintained
+under `MT7621_STALETRACE`; the LRU stamp skipped when the way is already the
+most recent.  FIFO replacement (`MT7621_FIFO=1`) measured *worse* - 69.5 s
+against 67.6 - and stays a knob: true LRU is what keeps the allocator header
+resident across Breed's clear.
 
 The whole remaining gap is the per-store slow-path entry.  Measured with
 `MT7621_DCACHENOSTORE=1` (diagnostic: no store tracking at all, residency
