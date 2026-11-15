@@ -131,6 +131,17 @@ prep: fetch
 	done
 	@touch "$(SUBDIR)/.prepped"
 
+# ---- version stamp -------------------------------------------------------
+# The binaries report the CraftBoot version they were built as.  It comes from
+# the nearest release tag (so `make` after tagging v0.3.0 stamps v0.3.0), and
+# CRAFTBOOT_VERSION=... overrides it.  The header is only rewritten when the
+# value changes, so a rebuild of system/vl.c happens exactly then.
+CRAFTBOOT_VERSION ?= $(shell git -C "$(PWD)" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)
+VERSION_HEADER   = $(SRC)/include/craftboot-version.h
+
+version-header:
+	@scripts/version-header.sh "$(VERSION_HEADER)" "$(CRAFTBOOT_VERSION)"
+
 # ---- build: prep on demand, configure once, then ninja the binaries ------
 # Machine sources are re-copied on every build so editing <soc>.c is an
 # incremental rebuild: only that file recompiles.  `prep` is the only thing
@@ -141,6 +152,7 @@ build:
 	    $(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" prep
 	@set -e; $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))" || { echo "  sync $(m)/$(word 1,$(subst :, ,$(p)))"; mkdir -p "$(SRC)/$$(dirname $(word 2,$(subst :, ,$(p))))"; cp "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))"; };))
 	@set -e; $(foreach m,$(MACHINES),tools/machine-meson.sh "$(SRC)/$($(m)_MACHINE_SUBDIR)/meson.build" "$(m)" "$($(m)_MACHINE_SRCS)" "$($(m)_MACHINE_SS)" "$($(m)_MACHINE_SUBDIR)";)
+	@$(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" version-header
 	@if [ ! -f "$(OBJ)/build.ninja" ]; then \
 	    mkdir -p "$(OBJ)"; \
 	    echo "configure $(TARGET)"; \
@@ -161,6 +173,7 @@ sync:
 	    exit 1; }
 	@set -e; $(foreach m,$(MACHINES),$(foreach p,$($(m)_MACHINE_SRCS),cmp -s "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))" || { echo "  sync $(m)/$(word 1,$(subst :, ,$(p)))"; mkdir -p "$(SRC)/$$(dirname $(word 2,$(subst :, ,$(p))))"; cp "$(TDIR)/machines/$(m)/$(word 1,$(subst :, ,$(p)))" "$(SRC)/$(word 2,$(subst :, ,$(p)))"; };))
 	@set -e; $(foreach m,$(MACHINES),tools/machine-meson.sh "$(SRC)/$($(m)_MACHINE_SUBDIR)/meson.build" "$(m)" "$($(m)_MACHINE_SRCS)" "$($(m)_MACHINE_SS)" "$($(m)_MACHINE_SUBDIR)";)
+	@$(MAKE) --no-print-directory TARGET="$(TARGET)" MACHINES="$(MACHINES)" version-header
 	ninja -C "$(OBJ)" $(BINARIES)
 	@for b in $(BINARIES); do ln -sf "$(PWD)/$(OBJ)/$$b" "$(SUBDIR)/$$b"; done
 	@echo "synced $(SUBDIR): $(BINARIES)"
