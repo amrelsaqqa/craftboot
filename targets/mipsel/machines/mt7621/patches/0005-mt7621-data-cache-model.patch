@@ -1,7 +1,7 @@
 From effd08ded84c98a3779e62a21ec8fdce35b3a9a7 Mon Sep 17 00:00:00 2001
 From: dev <dev@local>
 Date: Sun, 15 Nov 2026 13:53:09 +0200
-Subject: [PATCH] mt7621: model the 1004Kc L1 data cache
+Subject: [PATCH 1/2] mt7621: model the 1004Kc L1 data cache
 
 The model had no data cache, so KSEG0 and KSEG1 both hit the same RAM.  On
 silicon they do not: a cached store lands in the L1D and reaches DRAM through
@@ -488,6 +488,74 @@ index 7a6804a..60ed2d2 100644
              }
  #endif
              ctx->base.is_jmp = DISAS_STOP;
+-- 
+2.56.1
+
+
+From 137b419f6c1ab7ad42df652800ddb1a47b0b5ba8 Mon Sep 17 00:00:00 2001
+From: dev <dev@local>
+Date: Sun, 15 Nov 2026 14:28:34 +0200
+Subject: [PATCH 2/2] mt7621: keep the data cache coherent with ll/sc
+
+A store-conditional is a tcg_gen_atomic_cmpxchg: it writes memory directly and
+never passes through the cache model, so the resident line stayed stale and
+Breed's ll/sc counter loop could never match (it spun forever).  Drop the line
+after the atomic so the next access refills from what the atomic wrote.
+---
+ target/mips/tcg/system/special_helper.c | 13 +++++++++++++
+ target/mips/tcg/system_helper.h.inc     |  1 +
+ target/mips/tcg/translate.c             |  2 ++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/target/mips/tcg/system/special_helper.c b/target/mips/tcg/system/special_helper.c
+index d135027..e3cb87c 100644
+--- a/target/mips/tcg/system/special_helper.c
++++ b/target/mips/tcg/system/special_helper.c
+@@ -169,6 +169,19 @@ void helper_mips_dcache_synci(CPUMIPSState *env, target_ulong addr)
+     }
+ }
+ 
++/*
++ * A store-conditional is done as an atomic compare-and-swap on memory, which
++ * does not go through the data cache.  Drop the line so subsequent accesses
++ * refill from the memory the atomic just wrote.
++ */
++void helper_mips_dcache_invalidate(CPUMIPSState *env, target_ulong addr)
++{
++    if (mips_dcache_op) {
++        mips_dcache_op(env_cpu(env), addr, 1 /* primary data */,
++                       4 /* hit invalidate */);
++    }
++}
++
+ void helper_cache(CPUMIPSState *env, target_ulong addr, uint32_t op)
+ {
+     if (getenv("MT7621_CACHLOG")) {
+diff --git a/target/mips/tcg/system_helper.h.inc b/target/mips/tcg/system_helper.h.inc
+index 8a9e43f..b80240e 100644
+--- a/target/mips/tcg/system_helper.h.inc
++++ b/target/mips/tcg/system_helper.h.inc
+@@ -177,6 +177,7 @@ DEF_HELPER_1(deret, void, env)
+ DEF_HELPER_3(cache, void, env, tl, i32)
+ DEF_HELPER_2(icache_shadow_flush, void, env, tl)
+ DEF_HELPER_2(mips_dcache_synci, void, env, tl)
++DEF_HELPER_2(mips_dcache_invalidate, void, env, tl)
+ 
+ #ifdef TARGET_MIPS64
+ /* Longson CSR */
+diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+index 60ed2d2..07d6b20 100644
+--- a/target/mips/tcg/translate.c
++++ b/target/mips/tcg/translate.c
+@@ -2268,6 +2268,8 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
+                               eva ? MIPS_HFLAG_UM : ctx->mem_idx, tcg_mo);
+     tcg_gen_setcond_tl(TCG_COND_EQ, t0, t0, cpu_llval);
+     gen_store_gpr(t0, rt);
++    /* the atomic wrote memory, not the cache: drop the line */
++    gen_helper_mips_dcache_invalidate(tcg_env, addr);
+ 
+     gen_set_label(done);
+ }
 -- 
 2.56.1
 
