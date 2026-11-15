@@ -47,6 +47,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/target-info.h"
 #include "qemu/units.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-dcache.h"
@@ -83,6 +84,12 @@ static int dcache_stale_budget = 200;
  * difference is staleness the model invented, not the guest's.
  */
 static bool dcache_stale_kseg1_only;
+/*
+ * MT7621_DCNOOP=1: keep every access on the slow path but let the model do
+ * nothing.  It measures what the forced slow path itself costs, separately
+ * from the cache bookkeeping.
+ */
+static bool dcache_noop;
 
 static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 {
@@ -93,7 +100,8 @@ static inline uint8_t *dcache_ram(MT7621State *s, hwaddr pa)
 static MT7621DLine *dcache_lookup(MT7621State *s, hwaddr pa, bool *hit)
 {
     unsigned shift = s->dcache.line_shift;
-    MT7621DLine *line = &s->dcache.lines[((pa >> shift) % s->dcache.nsets) *
+    MT7621DLine *line = &s->dcache.lines[((pa >> shift) &
+                                          (s->dcache.nsets - 1)) *
                                           MT7621_DCACHE_WAYS];
     uint64_t tag = pa >> shift;
     int i;
@@ -113,7 +121,8 @@ static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
 {
     unsigned shift = s->dcache.line_shift;
     unsigned size = s->dcache.line_size;
-    MT7621DLine *line = &s->dcache.lines[((pa >> shift) % s->dcache.nsets) *
+    MT7621DLine *line = &s->dcache.lines[((pa >> shift) &
+                                          (s->dcache.nsets - 1)) *
                                           MT7621_DCACHE_WAYS];
     MT7621DLine *victim = &line[0];
     hwaddr base = (pa >> shift) << shift;
@@ -144,7 +153,10 @@ static MT7621DLine *dcache_fill(MT7621State *s, hwaddr pa)
     return victim;
 }
 
-/* Translate a data address to a physical one, or -1. */
+/*
+ * Translate a cache-op address.  Only `cache`/`synci` come through here, so a
+ * lookup is fine; data accesses get their physical address from the slow path.
+ */
 static hwaddr dcache_pa(CPUState *cs, vaddr addr)
 {
     if (addr >= KSEG0_BASE && addr < KSEG2_BASE) {
@@ -154,35 +166,25 @@ static hwaddr dcache_pa(CPUState *cs, vaddr addr)
 }
 
 /*
- * Slow-path data access.  Only cacheable mappings reach this (uncached pages
- * and device memory keep QEMU's own path), and the access may cross a line, so
- * it is served a line at a time.
+ * Slow-path data access.  The caller has already translated the access and
+ * only calls for a cacheable page, so this is a tag compare plus a line copy:
+ * no address translation, no mapping lookups, nothing per-access that a real
+ * cache would not do.
+ *
+ * Aligned MIPS data accesses never cross a line (the largest is 8 bytes and
+ * lines are a multiple of that), so a single-line path covers them; anything
+ * that would straddle is left to QEMU, whose store is authoritative anyway.
  */
-static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
-                                 bool is_write, uint64_t *value)
+static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
+                                 unsigned size, bool is_write, uint64_t *value)
 {
     MT7621State *s = dcache_state;
-    hwaddr pa;
-    uint64_t w = value ? *value : 0;
-    uint64_t r = 0;
-    unsigned done = 0;
+    unsigned off;
+    bool hit;
+    MT7621DLine *line;
+    uint64_t v;
 
-    if (!s || !s->dcache.enabled || size == 0 || size > 8) {
-        return false;
-    }
-    /*
-     * This hook also runs on an ordinary TLB miss, not only for pages the
-     * target marked force-slow, so the mapping's cacheability has to be
-     * checked here: an uncached access (KSEG1, a device mapping, an uncached
-     * TLB page) must go to memory and never touch a line.
-     */
-    if (!mips_mapping_is_cacheable(cpu_env(cs), addr,
-                                   is_write ? MMU_DATA_STORE : MMU_DATA_LOAD,
-                                   0)) {
-        return false;
-    }
-    pa = dcache_pa(cs, addr);
-    if (pa == (hwaddr)-1) {
+    if (!s || !s->dcache.enabled || dcache_noop || size == 0 || size > 8) {
         return false;
     }
     /*
@@ -199,84 +201,72 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         }
         pa %= s->dcache.size;
     }
-    if (pa + size > s->dcache.size) {
-        return false;           /* straddles the top of DRAM: let QEMU store */
+    off = pa & (s->dcache.line_size - 1);
+    if (off + size > s->dcache.line_size) {
+        return false;
     }
 
-    while (done < size) {
-        unsigned off = (pa + done) & (s->dcache.line_size - 1);
-        unsigned n = MIN(size - done, s->dcache.line_size - off);
-        bool hit;
-        MT7621DLine *line = dcache_lookup(s, pa + done, &hit);
-        unsigned k;
+    line = dcache_lookup(s, pa, &hit);
+    if (!hit) {
+        /* a store that misses allocates (write-allocate; measured, see below) */
+        line = dcache_fill(s, pa);
+        dcache_misses++;
+    } else {
+        dcache_hits++;
+        if (dcache_stale_on && !is_write && dcache_stale_budget > 0) {
+            unsigned j;
 
-        if (hit && dcache_stale_kseg1_only &&
-            cpu_env(cs)->active_tc.PC < 0xa0000000u) {
-            hit = false;        /* diagnostic: pretend the line is not there */
-        }
-
-        if (!hit) {
-            /*
-             * A store that misses allocates too: measured, this firmware needs
-             * it - with no write allocate, Breed's allocator header reads the
-             * zero its DMA clear left in memory and the boot stops at "unable
-             * to allocate fifos" - which is what a write-through write-allocate
-             * L1D does.
-             */
-            line = dcache_fill(s, pa + done);
-            dcache_misses++;
-        } else {
-            dcache_hits++;
-            if (dcache_stale_on && !is_write) {
-                unsigned j;
-                bool differs = false;
-
-                for (j = 0; j < n; j++) {
-                    if (line->data[off + j] != dcache_ram(s, pa + done + j)[0]) {
-                        differs = true;
-                        break;
-                    }
-                }
-                if (differs && dcache_stale_budget-- > 0) {
+            for (j = 0; j < size; j++) {
+                if (line->data[off + j] != dcache_ram(s, pa + j)[0]) {
                     fprintf(stderr, "dstale: pa=%08x va=%08x pc=%08x "
-                            "segctl1=%08x cache=%02x%02x%02x%02x "
-                            "mem=%02x%02x%02x%02x\n",
-                            (unsigned)(pa + done), (unsigned)addr,
+                            "cache=%02x%02x%02x%02x mem=%02x%02x%02x%02x\n",
+                            (unsigned)pa, (unsigned)addr,
                             (unsigned)cpu_env(cs)->active_tc.PC,
-                            (uint32_t)cpu_env(cs)->CP0_SegCtl1,
                             line->data[off + 3], line->data[off + 2],
                             line->data[off + 1], line->data[off],
-                            dcache_ram(s, pa + done + 3)[0],
-                            dcache_ram(s, pa + done + 2)[0],
-                            dcache_ram(s, pa + done + 1)[0],
-                            dcache_ram(s, pa + done)[0]);
+                            dcache_ram(s, pa + 3)[0], dcache_ram(s, pa + 2)[0],
+                            dcache_ram(s, pa + 1)[0], dcache_ram(s, pa)[0]);
+                    dcache_stale_budget--;
+                    break;
                 }
             }
         }
-        line->lru = ++s->dcache.clock;
-        for (k = 0; k < n; k++) {
-            if (is_write) {
-                line->data[off + k] = (uint8_t)(w >> ((done + k) * 8));
-            } else {
-                r |= (uint64_t)line->data[off + k] << ((done + k) * 8);
-            }
-        }
-        done += n;
     }
+    line->lru = ++s->dcache.clock;
 
     if (is_write) {
+        v = value ? *value : 0;
+        if (target_big_endian()) {
+            unsigned k;
+
+            for (k = 0; k < size; k++) {
+                line->data[off + k] = (uint8_t)(v >> (8 * k));
+            }
+        } else {
+            memcpy(line->data + off, &v, size);
+        }
         /*
-         * Write-through: the line above is updated, and QEMU performs the
-         * store to memory exactly as it would without a cache model.  Doing
-         * that write here instead would skip QEMU's dirty tracking and its
-         * translated-block bookkeeping for code pages - and invalidating a TB
-         * from inside a store helper makes QEMU re-execute the instruction, so
-         * the store would happen twice.
+         * Write-through: the line is updated, and QEMU performs the store to
+         * memory exactly as it would without a cache model.  Writing it here
+         * instead would skip QEMU's dirty and translated-block bookkeeping,
+         * and invalidating a TB from inside a store helper makes QEMU
+         * re-execute the instruction, so the store would land twice.
          */
         dcache_stores++;
         return false;
     }
-    *value = r;
+
+    if (target_big_endian()) {
+        unsigned k;
+
+        v = 0;
+        for (k = 0; k < size; k++) {
+            v |= (uint64_t)line->data[off + k] << (8 * k);
+        }
+    } else {
+        memcpy(&v, line->data + off, size);
+    }
+    *value = v;
     return true;
 }
 
@@ -295,8 +285,9 @@ static void dcache_invalidate_line(MT7621State *s, hwaddr pa)
 /* Invalidate every way of the set this address indexes. */
 static void dcache_invalidate_set(MT7621State *s, hwaddr pa)
 {
-    MT7621DLine *line = &s->dcache.lines[((pa >> s->dcache.line_shift) %
-                                          s->dcache.nsets) * MT7621_DCACHE_WAYS];
+    MT7621DLine *line = &s->dcache.lines[((pa >> s->dcache.line_shift) &
+                                          (s->dcache.nsets - 1)) *
+                                         MT7621_DCACHE_WAYS];
     int i;
 
     for (i = 0; i < MT7621_DCACHE_WAYS; i++) {
@@ -348,9 +339,16 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
         return;
     }
     pa = dcache_pa(cs, addr);
-    if (pa != (hwaddr)-1) {
-        dcache_invalidate_line(s, pa);
+    if (pa == (hwaddr)-1) {
+        return;
     }
+    if (pa >= s->dcache.size) {
+        if (pa >= s->dcache.alias_limit) {
+            return;
+        }
+        pa %= s->dcache.size;
+    }
+    dcache_invalidate_line(s, pa);
 }
 
 /*
@@ -408,6 +406,7 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     dcache_trace = getenv("MT7621_STALETRACE") != NULL;
     dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
     dcache_stale_kseg1_only = getenv("MT7621_STALE_KSEG1_ONLY") != NULL;
+    dcache_noop = getenv("MT7621_DCNOOP") != NULL;
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     s->dcache.size = ram_size;
     if (!s->dcache.alias_limit) {
