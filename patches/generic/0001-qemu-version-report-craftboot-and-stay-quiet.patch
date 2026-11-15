@@ -1,16 +1,38 @@
-From aecf9a7ff10f79f5c56e9ea65645bf558f8cc0ba Mon Sep 17 00:00:00 2001
+From 7b620f21b143cde4d2d5c2e34e69b9eb84e4a1a9 Mon Sep 17 00:00:00 2001
 From: build <build@local>
 Date: Mon, 16 Nov 2026 00:14:56 +0200
-Subject: [PATCH] qemu: report the CraftBoot build in --version
+Subject: [PATCH] qemu: report the CraftBoot build in --version, and keep the
+ build quiet
 
 CraftBoot generates include/craftboot-version.h with the version the binaries
 were built as; print it above QEMU's own version line.  The include is
 conditional, so QEMU built without that header is unaffected and prints exactly
 what it always did.
----
- system/vl.c | 16 ++++++++++++++++
- 1 file changed, 16 insertions(+)
 
+qemu-version.sh also stops printing git's "No names found" fatal: a CraftBoot
+tree is a fresh repository with no tags, so that describe is expected to fail
+and QEMU already ignores the failure.
+---
+ scripts/qemu-version.sh |  5 ++++-
+ system/vl.c             | 16 ++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/qemu-version.sh b/scripts/qemu-version.sh
+index 3f6e7e6..59fb0cf 100755
+--- a/scripts/qemu-version.sh
++++ b/scripts/qemu-version.sh
+@@ -9,7 +9,10 @@ version="$3"
+ if [ -z "$pkgversion" ]; then
+     cd "$dir"
+     if [ -e .git ]; then
+-        pkgversion=$(git describe --match 'v*' --dirty) || :
++        # A CraftBoot tree is a fresh repository with no tags, so describe
++        # fails by design here; it is not an error and QEMU carries on without
++        # a package version.  Keep the build output quiet about it.
++        pkgversion=$(git describe --match 'v*' --dirty 2>/dev/null) || :
+     fi
+ fi
+ 
 diff --git a/system/vl.c b/system/vl.c
 index 5091fe5..5937cd0 100644
 --- a/system/vl.c

@@ -43,7 +43,10 @@ board bring-up.
   (`CRAFTBOOT_VERSION=...` overrides it), so nothing is hard-coded; the core
   change is a *global* patch (`patches/generic/`) and the include is
   conditional, so a QEMU built without the generated header prints what it
-  always did.
+  always did.  That patch also silences QEMU's own `qemu-version.sh`: a
+  CraftBoot tree is a fresh repository with no tags, so its `git describe`
+  fails by design and used to print a `fatal: No names found` line into every
+  build.
 
 ### Fixed
 
