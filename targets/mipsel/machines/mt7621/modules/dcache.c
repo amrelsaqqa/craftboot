@@ -51,6 +51,7 @@
 #include "mt7621.h"
 
 #include "system/physmem.h"
+#include "exec/translation-block.h"
 #include "exec/guest-cycles.h"
 
 #define MT7621_PAGE 4096
@@ -89,11 +90,18 @@ struct MT7621ShadowPage {
 };
 
 static uint64_t dcache_progress;
+/* pages whose cached mappings must be re-translated, flushed outside helpers */
+static hwaddr dcache_pending_flush[64];
+static unsigned dcache_pending_flush_n;
 static uint64_t dcache_stale_age = MT7621_STALE_MAX_AGE;
 
 static void mt7621_dcache_progress(CPUState *cs, unsigned insns)
 {
     dcache_progress += insns;
+    if (dcache_pending_flush_n) {
+        dcache_pending_flush_n = 0;
+        tlb_flush(cs);
+    }
 }
 
 /* Is this line still stale, or has the cache turned over since? */
@@ -295,6 +303,15 @@ bool mt7621_dcache_access(CPUState *cs, vaddr addr, unsigned size,
         }
         dcache_uncached_store(cs, pa, size, v);
         /*
+         * The store was written here, not by QEMU, so tell QEMU about it:
+         * mark the page dirty and drop any translated block covering it.  A
+         * guest that writes code or data through the uncached alias (or a
+         * device that shares the page) would otherwise execute a stale
+         * translation.
+         */
+        physical_memory_set_dirty_range(pa, size, DIRTY_CLIENTS_NOCODE);
+        tb_invalidate_phys_range(cs, pa, pa + size);
+        /*
          * Uncached stores target DMA buffers, never code, so performing them
          * here is safe: nothing needs a translated-block invalidation for
          * them.  Cached stores (below) do have to go back through QEMU, since
@@ -379,12 +396,16 @@ void mt7621_dcache_cache_op(CPUState *cs, vaddr addr, unsigned type,
     }
 }
 
-/* A reset invalidates the cache: nothing is stale any more. */
+
+/*
+ * A guest reset invalidates the cache: nothing survives it.  Called from the
+ * machine's reset, which is what a guest reboot ends up triggering.
+ */
 void mt7621_dcache_reset(MT7621State *s)
 {
     unsigned page;
 
-    if (!s->dcache.enabled) {
+    if (!s->dcache.enabled || !s->dcache.shadow) {
         return;
     }
     for (page = 0; page < dcache_pages; page++) {
@@ -395,6 +416,7 @@ void mt7621_dcache_reset(MT7621State *s)
     stale_fifo.limit = getenv("MT7621_STALE_WINDOW")
                        ? strtoul(getenv("MT7621_STALE_WINDOW"), NULL, 0)
                        : MT7621_STALE_WINDOW;
+    dcache_pending_flush_n = 0;
 }
 
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)

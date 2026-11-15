@@ -727,6 +727,8 @@ static void mt7621_reset(void *opaque)
                 (uint32_t)env->CP0_Config1, dl, 1u << (dl + 1));
     }
 
+    mt7621_dcache_reset(s);
+
     /* Everything the guest programmed is gone after a real reset. */
     mt7621_eth_dev_reset(s);
     memset(s->nfi_regs, 0, sizeof(s->nfi_regs));
