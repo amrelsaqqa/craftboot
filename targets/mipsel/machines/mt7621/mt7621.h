@@ -65,10 +65,14 @@ typedef enum MT7621Board {
 #define DRAMC_WORDS             (0x1000 / 4)
 #define NFI_WORDS               (0x1000 / 4)
 
-/* One L1D line: tag, LRU stamp and the resident copy of the bytes. */
+/*
+ * One L1D line: tag, LRU stamp, the resident copy of the bytes, and whether
+ * that copy is stale (an uncached store or device write made memory newer).
+ */
 typedef struct MT7621DLine {
     uint64_t tag;
     bool valid;
+    bool stale;
     uint64_t lru;
     uint8_t data[64];           /* MT7621_DCACHE_MAXLINE */
 } MT7621DLine;

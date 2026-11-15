@@ -179,33 +179,39 @@ Measured with `MT7621_DCACHE=1`, no `-icount`:
 | `Dl=2` | Breed, Linux, shell |
 | `Dl=4` | Breed, Linux, shell - **the hardware value, no override** |
 
-Cost, measured on one pinned core (three runs each, wall clock to
-`ubi0: attached`): 18/19/19 s without the model, 27/28/28 s with it, i.e.
-**about 1.48x**.  The reason is structural, not the bookkeeping: every
-cacheable access has to leave TCG's inline fast path (the TLB comparator
-carries `TLB_FORCE_SLOW`), so it pays `mmu_lookup` plus a helper call where a
-plain access would be a tag compare and a load.  The handler itself is already
-down to a set-index mask, four tag compares and an eight-byte copy, and it no
-longer translates anything (the slow path hands it the resolved physical
-address).
+Cost and routing, measured on one pinned core:
 
-Two ways to go faster, and only one of them keeps the model exact:
+| milestone | no cache | cache model | ratio |
+|---|---|---|---|
+| `ubi0: attached` | 11 s | 13-16 s | ~1.2-1.4x |
+| `procd: - init -` | 22-26 s | 32-33 s | ~1.3x |
 
-- inline the residency test in TCG's fast path (a generated per-page check
-  instead of leaving the fast path entirely).  That is the real fix and it is
-  a TCG change, not a machine one.
-- force the slow path only for pages that currently hold a stale line.  That
-  is cheap (near baseline) but it approximates residency: an uncached store
-  would be assumed to hit a resident line even when the hardware had already
-  evicted it.  It is the approximation this model exists to avoid, so it is
-  not what is in the tree.
+That is with **loads left on QEMU's fast path everywhere except pages that hold
+a stale line**.  The routing is what makes it affordable, and it is exact:
 
-An earlier approximation (a per-page "shadow" of lines touched by uncached
-stores, aged by an instruction count) is gone.  It was tuned until it happened
-to work and it served bytes from earlier lives of recycled pages - the kernel
-read `add@/module/` from memory while the shadow handed it the binary contents
-the page had held before.  Nothing in the model is tuned to a guest now:
-whether a read sees an old value is decided only by residency and invalidation.
+- a store is offered to the model on every cacheable page, because a store is
+  what makes a line resident (write-allocate);
+- an uncached store is offered too - it is the only thing that can make a
+  resident line stale, and the model keeps the pre-store bytes when it lands on
+  a line it holds;
+- a load is only routed to the model for a page whose stale-line count is
+  non-zero.  Everywhere else every resident line equals memory (the part is
+  write-through), so QEMU's own load path returns exactly what the hardware
+  would, at full speed.  When a page gains its first stale line the TLB is
+  flushed once so its loads start coming through the model.
+
+The request travels as a 2-bit field in `MemTxAttrs` (`dcache`: none / stores /
+loads+stores / uncached store), decided in `mips_cpu_tlb_fill()` where both the
+mapping's cacheability and the model's per-page state are known, and honoured in
+`tlb_set_compare()`.
+
+Residency is tracked for lines the CPU *stored*.  A line that was resident only
+because it was read is therefore treated as absent, so the model can
+under-report staleness - the guest then reads memory, which is newer - but it
+can never invent an old value for a line the cache did not hold.  That
+direction matters: the earlier approximation (mark every line an uncached store
+touches, aged by an instruction count) invented staleness and the kernel read
+`add@/module/` out of a page whose shadow still held binary data.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 
