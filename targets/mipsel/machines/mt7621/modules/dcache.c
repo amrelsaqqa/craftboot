@@ -80,6 +80,13 @@ static int dcache_stale_budget = 200;
 /* MT7621_DCNOOP=1 keeps the routing but lets the model do nothing. */
 static bool dcache_noop;
 
+/*
+ * MT7621_FIFO=1 replaces the LRU stamp update with insertion order, which costs
+ * one store per miss instead of one per access.  Experiment knob: LRU is what
+ * keeps the allocator header resident across Breed's clear.
+ */
+static bool dcache_fifo;
+
 /* Per physical page: how many of its lines have a stale snapshot. */
 static uint16_t *dcache_page_stale;
 
@@ -193,7 +200,9 @@ static int dcache_fill(MT7621State *s, hwaddr pa)
     }
     dcache_drop_way(s, set, victim);
     set->tag[victim] = want;
-    dcache_fills++;
+    if (dcache_trace) {
+        dcache_fills++;
+    }
     return victim;
 }
 
@@ -224,7 +233,9 @@ static void dcache_uncached_store(CPUState *cs, MT7621State *s, hwaddr pa,
             memcpy(st->data, dcache_ram(s, base), s->dcache.line_size);
             st->line = want;
             set->stale |= 1u << way;
-            dcache_stale_made++;
+            if (dcache_trace) {
+                dcache_stale_made++;
+            }
             if (dcache_page_stale[page]++ == 0) {
                 /* this page's loads must now come through the model */
                 tlb_flush(cs);
@@ -249,13 +260,19 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
     int way;
     unsigned off;
 
-    if (!s || !s->dcache.enabled || dcache_noop || size == 0 || size > 8) {
+    /*
+     * The core installs this handler only while the model is enabled and only
+     * calls it with the sizes a TCG memop can carry, so the guards that remain
+     * are the ones that can actually fire: the noop knob, an access wider than
+     * a register, and the DRAM alias window.
+     */
+    if (unlikely(dcache_noop || size > 8)) {
         return false;
     }
-    if (!dcache_wrap(s, &pa)) {
+    if (unlikely(!dcache_wrap(s, &pa))) {
         return false;
     }
-    if (!cached) {
+    if (unlikely(!cached)) {
         if (is_write) {
             dcache_uncached_store(cs, s, pa, size);
         }
@@ -263,21 +280,30 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
     }
 
     off = pa & (s->dcache.line_size - 1);
-    if (off + size > s->dcache.line_size) {
+    if (unlikely(off + size > s->dcache.line_size)) {
         return false;           /* would straddle a line: QEMU's business */
     }
-    set = dcache_set(s, pa);
     want = (pa >> s->dcache.line_shift) + 1;
+    /* want - 1 is the line number, and nsets is a power of two */
+    set = &s->dcache.sets[(want - 1) & (s->dcache.nsets - 1)];
     way = dcache_way(set, want);
     if (way < 0) {
         if (!is_write) {
             return false;       /* not resident, nothing stale: memory is right */
         }
         way = dcache_fill(s, pa);       /* write-allocate */
-    } else {
+    } else if (dcache_trace) {
         dcache_hits++;
     }
-    set->lru[way] = ++s->dcache.clock;
+    /*
+     * LRU, with one shortcut that matters: consecutive stores usually hit the
+     * line they just touched, and then the way is already the most recent, so
+     * the counter bump and the store are both unnecessary.
+     */
+    if (!dcache_fifo && (set->lru[way] != s->dcache.clock ||
+                         !s->dcache.clock)) {
+        set->lru[way] = ++s->dcache.clock;
+    }
 
     if (is_write) {
         /*
@@ -303,11 +329,13 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
                 }
             }
         }
-        dcache_stores++;
+        if (dcache_trace) {
+            dcache_stores++;
+        }
         return false;
     }
 
-    if (!(set->stale & (1u << way))) {
+    if (likely(!(set->stale & (1u << way)))) {
         return false;           /* identical to memory: QEMU's path is right */
     }
     {
@@ -340,7 +368,9 @@ static bool mt7621_dcache_access(CPUState *cs, vaddr addr, hwaddr pa,
             memcpy(&v, st->data + off, size);
         }
         *value = v;
-        dcache_reads_stale++;
+        if (dcache_trace) {
+            dcache_reads_stale++;
+        }
         return true;
     }
 }
@@ -488,6 +518,7 @@ void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
     dcache_trace = getenv("MT7621_STALETRACE") != NULL;
     dcache_stale_on = getenv("MT7621_DSTALE") != NULL;
     dcache_noop = getenv("MT7621_DCNOOP") != NULL;
+    dcache_fifo = getenv("MT7621_FIFO") != NULL;
 
     s->dcache.ram = memory_region_get_ram_ptr(&s->ram);
     s->dcache.size = ram_size;
