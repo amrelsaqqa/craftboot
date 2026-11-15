@@ -80,12 +80,42 @@ wrong.  That run did not pass `MT7621_DL`, so the board override below (`Dl=2`)
 was still in force and the boot succeeded at `Dl = 2`.  The identity was a
 fidelity fix only.
 
-**Still open.**  A heap dump around the board's own DMA buffers would name the
-difference directly: its first 1 KiB buffer must be at an address that is a
-multiple of 32, so dumping `0x8fddc000` upwards on the device (a few hundred
-bytes is enough - the chunk headers carry the sizes) shows which allocation
-differs and by how much.  The board has no UART, but its shell has
-`mem dump <addr> <len>`.
+### What the board's own heap says (2026-11-15, after the dumps)
+
+The board's chain at `Dl = 4` is identical to the model's: first DMA chunk
+`0x8fddcd50` size `0x449`, DMA pointer `afddcd60`, then `0x8fddd198` (second
+buffer), `0x8fddd5e0` (0x100 table), `0x8fddd6e8` (ring, size `0x18c69`).  So
+the layout and the overrun are the same on both sides; there is no 24-byte
+difference to find - the earlier theory was wrong.
+
+What differs is the allocator's state.  Breed's allocator (TLSF, control block
+at `0x8fff0000`, `sbrk` bookkeeping at `0x8fffcd30`) ends up with:
+
+| | board | model |
+|---|---|---|
+| heap base / limit | `8fdbbf3c` / `8ffbbf3c` | same |
+| `sbrk` cursor after boot | `8fe51000` | `8fdde000` |
+
+and at the moment of the first DMA allocation the model's free block after the
+buffer is `0x8fddd198` with size `0xe68` (it ends exactly at the cursor).  The
+wrapper then clears `n = 0x43f` bytes from `round_up(p,32) = 0x8fddcd60`, i.e.
+through `0x8fddd19e` - three bytes of the next chunk's size field.  A split
+header `0x00000e69` becomes `0`: the allocator sees a zero-sized last block,
+falls into its "extend the pool" path, and the extension (at the cursor, page
+aligned, 0x1000) is not adjacent to that block, so it gives up and returns
+NULL.  Verified by breakpoint: `extend` -> `sbrk(0x1000)` at `0x8fdde000` ->
+`0xffffffff` -> `malloc` returns 0.  Writing `0xe69` back into
+`0x8fddd19c` at that point makes the next `malloc` return `0x8fddd1a0`, the
+board's exact second-buffer address.
+
+So the remaining question is why the board's own clear does not cost it that
+block.  Three bytes are always zeroed at `0x8fddd19c` when `n = 0x43f`, and a
+chunk size below 16 MiB cannot survive that, so on the board that word must
+not be a live chunk header at that moment - i.e. the board has already been
+through an earlier Ethernet init attempt (its cursor is `0x73000` further
+along than the model's) and re-enters with different heap state.  What is
+missing to confirm and reproduce this is the board's boot log at `Dl = 4`
+(the `Error:` lines and how many appear before it succeeds), not more dumps.
 
 ## 1b. Clocks: crystal and DDR/bus decode
 
