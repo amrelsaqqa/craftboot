@@ -43,10 +43,12 @@ run_case() {
     local log=$OUT/boot-$name.log
     local -a fails=() passes=() sends=()
     local envs=()
+    local expect_fail=0
 
     case $name in
     base)   envs=();                               passes=("root@") ;;
-    dl4)    envs=("MT7621_DL=4");                  fails=("unable to allocate fifos") ;;
+    dl4)    envs=("MT7621_DL=4");                  fails=("unable to allocate fifos")
+            expect_fail=1 ;;
     cache)  envs=("MT7621_DCACHE=1");              passes=("root@") ;;
     cache2) envs=("MT7621_DCACHE=1" "MT7621_DL=2"); passes=("root@") ;;
     cache4) envs=("MT7621_DCACHE=1" "MT7621_DL=4"); passes=("root@") ;;
@@ -76,8 +78,16 @@ run_case() {
     "${args[@]}"
     local rc=$?
     case $rc in
-    0) echo "    ok" ;;
-    1) echo "    FAIL" ;;
+    0) if [ "$expect_fail" = 1 ]; then
+           echo "    FAIL (booted, but this case must not)"
+           return 1
+       fi
+       echo "    ok" ;;
+    1) if [ "$expect_fail" = 1 ]; then
+           echo "    ok (failed as intended)"
+           return 0
+       fi
+       echo "    FAIL" ;;
     2) echo "    no verdict within ${GUEST}s of guest time" ;;
     *) echo "    ERROR ($rc)" ;;
     esac
