@@ -354,6 +354,17 @@ static void mt7621_dramc_defaults(MT7621State *s)
         s->dramc_regs[0x64c / 4] = ddr ? (uint32_t)strtoul(ddr, NULL, 0)
                                        : (29 << 4);
     }
+    {
+        const char *v410 = getenv("MT7621_MEMC410");
+        const char *v80c = getenv("MT7621_MEMC80C");
+
+        if (v410) {
+            s->dramc_regs[0x410 / 4] = (uint32_t)strtoul(v410, NULL, 0);
+        }
+        if (v80c) {
+            s->dramc_regs[0x80c / 4] = (uint32_t)strtoul(v80c, NULL, 0);
+        }
+    }
     s->dramc_regs[0x3fc / 4] = 0x00000400;
 }
 
