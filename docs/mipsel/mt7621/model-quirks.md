@@ -191,7 +191,29 @@ The `br-lan` row is three runs each; the spread is +-2 s, so a difference under
 about 3% cannot be told apart from noise on this host.  (A single 64.3 s sample
 earlier was luck, not a gain.)
 
-Everything in that cost is the per-store slow-path entry, and the model side of
+Measurement caveat: the same build measures 67.6-70.1 s in one session and
+71.5-71.7 s in another, so this host drifts about 5% and anything smaller is
+noise.  Two "optimisations" (hoisting the geometry into statics, finding a free
+way with one SSE compare) were tried and reverted for exactly that reason: they
+measured as a regression in one session and as neutral in the next, and the
+simpler code won.
+
+What the model actually does to the guest, from `MT7621_STALETRACE=1` over a
+boot to `br-lan`:
+
+```
+hits 1.82e9   fills 3.1e7 (1.7% miss)   stores 1.85e9
+stale_made 1625   stale_reads 8584   invalidates 1.26e6
+```
+
+1.26M cache-op invalidations cost about 0.04 s, so they are not a lever.  Of the
+8584 reads served from a stale snapshot, only **three** differed from memory:
+two are Breed's DMA buffers (the allocator header the whole model exists for)
+and one is a kernel read of a DMA buffer before its invalidation - a case where
+the hardware returns the cached copy too.  That is the check that matters: the
+model is not inventing stale reads anywhere else.
+
+Everything in the cost is the per-store slow-path entry, and the model side of
 it has been taken to its floor: one 32-byte set per cache set with four tags,
 four LRU stamps and a stale bit per way; the four tags compared at once with
 SSE2; no bytes copied on a fill (a write-through resident line equals memory, so
