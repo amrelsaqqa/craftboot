@@ -31,6 +31,33 @@
 #define MT7621_NAND_PAGES_BLK   64
 
 /*
+ * The controller works on 512-byte sectors.  With AUTO_FMT_EN the data port
+ * streams data sectors only and the spare bytes come out through the FDM
+ * registers; without it the port streams the raw page, i.e. each sector is
+ * followed by its own spare bytes.  The address space is therefore
+ *
+ *   raw:  [512 data][16 spare] x4     (2112 bytes)
+ *   data: [512 data] x4              (2048 bytes, spare via FDML/FDMM)
+ *
+ * RouterBOOT's NAND driver (and U-Boot's mt7621_nand) read the bad-block mark
+ * with a one-byte access at column `ecc.size + badblockpos` (512), which the
+ * hardware resolves to the first spare byte of sector 0.  Treating every
+ * column as plain page data made every block whose byte 512 was not 0xff look
+ * bad, so the layout has to follow the controller, not the dump.
+ */
+#define MT7621_NFI_SECTOR_SIZE  512
+#define MT7621_NFI_SECTORS      (MT7621_NAND_PAGE_SIZE / MT7621_NFI_SECTOR_SIZE)
+#define MT7621_NFI_SPARE        (MT7621_NAND_OOB_SIZE / MT7621_NFI_SECTORS)
+
+static inline uint32_t mt7621_nfi_data_to_raw(uint32_t idx)
+{
+    uint32_t sector = idx / MT7621_NFI_SECTOR_SIZE;
+    uint32_t off = idx % MT7621_NFI_SECTOR_SIZE;
+
+    return sector * (MT7621_NFI_SECTOR_SIZE + MT7621_NFI_SPARE) + off;
+}
+
+/*
  * NAND flash interface.
  *
  * The controller is modelled at the level the firmware drives it: commands
@@ -103,13 +130,38 @@ static void mt7621_nfi_page_read(MT7621State *s)
         memcpy(buf, s->nand + off, n);     /* data + spare when present */
     }
 
-    s->nfi_served = 0;
-    mt7621_nfi_fifo_put(s, buf, sizeof(buf));
+    /*
+     * Build the raw page the controller exposes: every 512-byte sector is
+     * followed by its 16 spare bytes.  Data-only reads (AUTO_FMT_EN) map
+     * through mt7621_nfi_data_to_raw(), byte reads use this raw layout
+     * directly, which is how a column of 512 reaches the first spare byte.
+     */
+    {
+        unsigned sec;
+        uint8_t *dst = s->nfi_fifo;
 
-    /* Honour the column address: 2048..2111 selects the spare area. */
-    if (s->nfi_col < sizeof(buf)) {
-        s->nfi_fifo_pos = s->nfi_col;
+        for (sec = 0; sec < MT7621_NFI_SECTORS; sec++) {
+            memcpy(dst + sec * (MT7621_NFI_SECTOR_SIZE + MT7621_NFI_SPARE),
+                   buf + sec * MT7621_NFI_SECTOR_SIZE,
+                   MT7621_NFI_SECTOR_SIZE);
+            if (s->nand_stride == MT7621_NAND_PAGE_SIZE +
+                                   MT7621_NAND_OOB_SIZE) {
+                memcpy(dst + sec * (MT7621_NFI_SECTOR_SIZE +
+                                    MT7621_NFI_SPARE) +
+                       MT7621_NFI_SECTOR_SIZE,
+                       buf + MT7621_NAND_PAGE_SIZE +
+                       sec * MT7621_NFI_SPARE, MT7621_NFI_SPARE);
+            } else {
+                memset(dst + sec * (MT7621_NFI_SECTOR_SIZE +
+                                    MT7621_NFI_SPARE) +
+                       MT7621_NFI_SECTOR_SIZE, 0xff, MT7621_NFI_SPARE);
+            }
+        }
     }
+
+    s->nfi_served = 0;
+    s->nfi_fifo_len = MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE;
+    s->nfi_fifo_pos = 0;
 }
 
 /*
@@ -278,10 +330,44 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
     case 0xff:
         s->nfi_fifo_len = 0;
         s->nfi_fifo_pos = 0;
+        s->nfi_served = 0;
         break;
     default:
         break;
     }
+}
+
+static uint8_t mt7621_nfi_data_byte(MT7621State *s)
+{
+    uint32_t cnfg = s->nfi_regs[NFI_CNFG >> 2];
+    uint32_t logical = s->nfi_col + s->nfi_served;
+    uint32_t idx;
+
+    /*
+     * The legacy main-area dump exposes the spare area at columns 2048..2111;
+     * keep that view working for the booters that use it.
+     */
+    if (s->nfi_col >= MT7621_NAND_PAGE_SIZE) {
+        uint32_t oi = (s->nfi_col - MT7621_NAND_PAGE_SIZE) + s->nfi_served;
+        uint64_t page = (uint64_t)s->nfi_row * s->nand_stride;
+
+        if (s->nand &&
+            s->nand_stride == MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE &&
+            page + MT7621_NAND_PAGE_SIZE + oi < s->nand_size) {
+            return s->nand[page + MT7621_NAND_PAGE_SIZE + oi];
+        }
+        return 0xff;
+    }
+
+    if (cnfg & (1u << 6)) {             /* BYTE_RW: raw page layout */
+        idx = logical;
+    } else if (cnfg & (1u << 9)) {      /* AUTO_FMT_EN: data sectors only */
+        idx = mt7621_nfi_data_to_raw(logical);
+    } else {                            /* raw page layout */
+        idx = logical;
+    }
+
+    return idx < s->nfi_fifo_len ? s->nfi_fifo[idx] : 0xff;
 }
 
 static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
@@ -328,24 +414,14 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
          * it and move `size` bytes per access.
          */
         if (s->nfi_regs[NFI_CNFG >> 2] & (1u << 6)) {
-            uint8_t b = 0xff;
-
-            if (s->nfi_fifo_pos < s->nfi_fifo_len) {
-                b = s->nfi_fifo[s->nfi_fifo_pos++];
-                s->nfi_served++;
-            }
-            val = b;
+            val = mt7621_nfi_data_byte(s);
+            s->nfi_served++;
             break;
         }
 
         for (i = 0; i < size; i++) {
-            uint8_t b = 0xff;
-
-            if (s->nfi_fifo_pos < s->nfi_fifo_len) {
-                b = s->nfi_fifo[s->nfi_fifo_pos++];
-                s->nfi_served++;
-            }
-            v |= (uint32_t)b << (8 * i);
+            v |= (uint32_t)mt7621_nfi_data_byte(s) << (8 * i);
+            s->nfi_served++;
         }
         val = v;
         break;
@@ -499,6 +575,7 @@ static void mt7621_nfi_write(void *opaque, hwaddr addr, uint64_t val,
         if (val & 0x2) {        /* NFI_RST */
             s->nfi_fifo_len = 0;
             s->nfi_fifo_pos = 0;
+            s->nfi_served = 0;
             s->nfi_col = 0;
             s->nfi_row = 0;
         }

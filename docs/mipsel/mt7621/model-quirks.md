@@ -471,3 +471,29 @@ reset.
 The 5.15 NAND driver issues `0xEC` (cache read) during its bad-block scan and
 polls `NFI_PIO_DIRDY`.  It is handled like `0x30`; without it every miss burned
 the driver's PIO timeout and produced RCU stalls.
+
+## 5. NAND page address space: raw page vs AUTO_FMT
+
+The NFI works on 512-byte sectors, and the address the guest puts on the data
+port is resolved differently depending on the mode:
+
+| mode | data port layout | spare |
+|---|---|---|
+| raw (`AUTO_FMT_EN=0`) | `[512 data][16 spare]` x4 = 2112 bytes | interleaved after each sector |
+| `AUTO_FMT_EN=1` | four 512-byte data sectors = 2048 bytes | `NFI_FDML/FDMM` only |
+
+Both the MTK U-Boot driver and RouterBOOT read the bad-block mark with a
+one-byte access at column `ecc.size + badblockpos` (`512`), which the hardware
+resolves to **spare byte 0 of sector 0**.  The model used to treat every
+column below 2048 as plain page data, so any block whose byte 512 was not
+`0xff` (the first page of a real image, an environment block, ...) was
+reported bad and `nand read` returned `0xff`.
+
+`mt7621_nfi_page_read` now builds the raw interleaved page, and the data port
+maps the guest's logical offset per mode: byte reads (`BYTE_RW`) use the raw
+layout, `AUTO_FMT_EN` reads skip the spare bytes, and raw reads walk the
+interleaved layout.  Column `2048..2111` still addresses the main-area dump's
+spare area directly, which is the view the older booters use.
+
+This is why U-Boot's `nand bad` is empty and `nand read` returns the real
+image bytes; Breed → OpenWrt is unaffected.
