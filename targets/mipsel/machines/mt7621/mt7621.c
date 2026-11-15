@@ -692,14 +692,14 @@ static void mt7621_reset(void *opaque)
      * past the chunk and overwrites the next chunk's size field, so the
      * following malloc returns NULL ("unable to allocate fifos").
      *
-     * The board boots this firmware at Dl=4, so its allocation of that buffer
-     * is 32-byte aligned; this model's lands at 0x8fddcd58 (8 bytes into the
-     * line).  Until the difference in the pre-Ethernet allocation sequence is
-     * measured against the board, lg-gapm7200 reports Dl=2.  MT7621_DL
-     * overrides it for experiments (MT7621_DL=4 reproduces the hardware value
-     * and the failure).
+     * The board boots this firmware at Dl=4, and a real L1D is what makes it
+     * survive that clear, so with the cache model enabled the machine reports
+     * the hardware value and the guest sizes its cache maintenance for a
+     * 32 KiB / 32-byte-line cache, as the model does.  The Dl=2 override is
+     * only for the uncached baseline, where it keeps this firmware booting.
+     * MT7621_DL still overrides either way for experiments.
      */
-    if (s->board == MT7621_BOARD_LG_GAPM7200) {
+    if (s->board == MT7621_BOARD_LG_GAPM7200 && !getenv("MT7621_DCACHE")) {
         env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
     }
     /*
