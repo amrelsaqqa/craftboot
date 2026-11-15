@@ -250,8 +250,31 @@ per access.  Design, in stages:
    each store and count disagreements.  They must agree except immediately
    after an invalidation, which is a bug in the wrong direction.
 
-Estimated cost: ~10-15 instructions per access on the fast path, i.e. well
-under the 40 ns slow-path entry it replaces.
+The store half of this was implemented and measured: the tracker costs about
+6% of a boot (71 s instead of 67 s to `br-lan ready`), i.e. far less than the
+40 ns per-store slow path it was meant to replace.  Three codegen bugs it
+exposed are worth recording, because they are the class of mistake this work
+invites:
+
+- `OPC_SUB_GvEv` is the `sub r, r/m` form, so the destination is the *first*
+  register: `sub L0, L1` needs `(TCG_REG_L0, TCG_REG_L1)`, not the reverse.
+  The reversed form computed `ram_base - haddr`, so nothing was recorded and
+  every access fell through the bounds check;
+- a reserved host register must be added to `s->reserved_regs` *after*
+  `tcg_target_init()` rebuilds that set from scratch - reserving before the
+  rebuild silently leaves the register allocatable, and the tracker then
+  clobbers a live guest value (the symptom was Breed reporting "Bootloader data
+  is corrupted": every stored value came out wrong);
+- the tracker must record **every** store width: Breed writes its chunk header
+  with a sub-word store, so a 4/8-byte-only tracker has no residency for the
+  one line the whole model exists to protect.
+
+Even with those fixed, it was withdrawn: the inline tracker used round-robin
+per set, and four intervening stores in the same set then evict the line the
+allocator had just written, so Breed fails *earlier* than without a model at
+all.  Matching the model needs LRU (or a PLRU tree) inline - moving the hit way
+to the front on every store, or a 3-bit tree per set - which is another few
+instructions and the next thing to try if this path is picked up again.
 
 So the honest position is: **about 1.48-1.75x is what an exact per-access cache
 costs in this TCG**.  The 1.0x ceiling requires either assuming residency
