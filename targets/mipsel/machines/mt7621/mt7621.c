@@ -702,13 +702,21 @@ static void mt7621_reset(void *opaque)
      * The board boots this firmware at Dl=4, and a real L1D is what makes it
      * survive that clear, so with the cache model enabled the machine reports
      * the hardware value and the guest sizes its cache maintenance for a
-     * 32 KiB / 32-byte-line cache, as the model does.  The Dl=2 override is
-     * only for the uncached baseline, where it keeps this firmware booting.
-     * MT7621_DL still overrides either way for experiments.
+     * 32 KiB / 32-byte-line cache, as the model does.
+     *
+     * Dl is now always the hardware value: an 8-byte line is not something a
+     * Linux guest can live with.  r4k_blast_dcache_setup() only installs a
+     * blast routine for 16/32/64/128-byte lines, so at Dl=2
+     * r4k_blast_dcache/icache stay NULL and the first cache flush (typically
+     * an IRQ-time DMA sync) jumps to address 0 - the netinstall kernel on
+     * lg-gapm7200 died exactly that way (epc=0, BadVA=0, ExcCode 2, plus a
+     * "smp_call_function_many from IRQ" warning on the way down).  Breed's
+     * allocator needs the modelled cache at this line size, which is why the
+     * L1D model now defaults on for the whole machine (see
+     * mt7621_dcache_init); MT7621_DCACHE=0 restores the bare-TCG baseline.
+     * MT7621_DL=2 still forces the old 8-byte baseline for experiments, and
+     * MT7621_DCACHE=0 turns the model off.
      */
-    if (s->board == MT7621_BOARD_LG_GAPM7200 && !getenv("MT7621_DCACHE")) {
-        env->CP0_Config1 = (env->CP0_Config1 & ~(7u << 10)) | (2u << 10);
-    }
     /*
      * Debug knob only (the real part is Dl=4, i.e. 32-byte lines): override
      * Config1.Dl (bits 12:10) to A/B the d-cache line size without rebuilding.

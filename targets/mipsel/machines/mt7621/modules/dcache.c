@@ -510,8 +510,19 @@ static void dcache_tick(void *opaque)
 void mt7621_dcache_init(MT7621State *s, uint64_t ram_size)
 {
     unsigned sets;
+    bool on;
 
-    if (!getenv("MT7621_DCACHE")) {
+    /*
+     * The machine reports the hardware Dl=4 (32-byte lines) on every board so
+     * that guests install the cache maintenance their own tuning expects; a
+     * line size below 16 bytes leaves Linux's r4k_blast_* pointers NULL and the
+     * first flush jumps to 0.  Breed only survives that line size with the
+     * model in place, so model the L1D by default for the whole machine;
+     * MT7621_DCACHE=0 keeps the uncached baseline available (pair it with
+     * MT7621_DL=2, the only line size Breed boots on bare TCG).
+     */
+    on = !getenv("MT7621_DCACHE") || mt7621_flag("MT7621_DCACHE");
+    if (!on) {
         return;
     }
     dcache_state = s;

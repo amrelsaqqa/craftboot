@@ -172,12 +172,21 @@ the model serves it.  Two details matter and both were bugs first:
   alone made **KSEG1 look cached**, and Breed's DRAM probe (write through
   KSEG1, read back) then observed the cache and measured 448 MiB.
 
-Measured with `MT7621_DCACHE=1`, no `-icount`:
+**Both boards now run at the hardware `Dl=4` with the L1D model on by
+default** (`MT7621_DCACHE=0` opts out, `MT7621_DL=2` restores the old 8-byte
+baseline).  `Dl=2` was only ever a Breed-allocator workaround for the uncached
+baseline, and it is fatal for Linux guests: `r4k_blast_dcache_setup()` installs
+a blast routine only for 16/32/64/128-byte lines, so an 8-byte line leaves
+`r4k_blast_dcache`/`icache` NULL and the first flush - typically an IRQ-time
+DMA sync - jumps to address 0.  That is how the RouterOS netinstall kernel died
+on lg-gapm7200 (`epc=00000000`, `BadVA=00000000`, ExcCode 2, "Fatal exception
+in interrupt", followed by `kernel/smp.c:420` "smp_call_function_many from
+IRQ").  Measured before this change, no `-icount`:
 
 | run | result |
 |---|---|
-| `Dl=2` | Breed, Linux, shell |
-| `Dl=4` | Breed, Linux, shell - **the hardware value, no override** |
+| `Dl=2` | Breed, Linux, shell - but any cache flush from IRQ context jumps to 0 |
+| `Dl=4` | Breed, Linux, shell - **the hardware value, now the default** |
 
 Cost and routing, measured on one pinned core:
 
