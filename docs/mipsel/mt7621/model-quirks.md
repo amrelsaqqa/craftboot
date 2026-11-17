@@ -378,6 +378,23 @@ not known:
   A K2P-class dump (r1126) would settle whether the model needs a divider
   register we have not found.
 
+**Breed and U-Boot disagree by a factor of two on DDR, and both are right.**
+They read the same two registers but decode them differently:
+
+| reader | decode | with `0x618 = 0xf0`, `0x604 = 0x4` |
+|---|---|---|
+| Breed (measured, see below) | `ref * 4 * fb`, halved when `0x604` bits 2:1 are non-zero | 1200 |
+| U-Boot `arch/mips/mach-mt7621/clocks.c` | `fb * xtal`, doubled when `DIV2_SEL` (same bits) is zero | 600 |
+
+Measured on the model by sweeping `MT7621_MEMC604` / `MT7621_MEMC618` and
+reading Breed's `Clocks:` line: `0x604 = 0x4` or `0x2` -> `80 * fb`
+(`0xf0 -> 1200`, `0x1e0 -> 2400`, `0x78 -> 560`), `0x604 = 0x0` -> `160 * fb`
+(`0xf0 -> 2400`, `0x3c -> 480`).  So Breed prints the DDR **data rate**
+(1200 MT/s = 2 x 600 MHz) and U-Boot the **clock** - the real B70's Breed log
+does say `DDR: 1200MHz`.  The pair shipped here is therefore correct; do not
+"reconcile" the two readers by changing `0x618`.  (`MT7621_DDR_PLL`, i.e. the
+0x64c register, moves nothing in either decoder - verified.)
+
 `CUR_CLK_STS` itself is decoded: bits 1:0 multiply the CPU clock and bits 9:8
 divide it (`0x101 -> 880`, `0x102 -> 1760`, `0x201 -> 440`, `0x301 -> 293`).
 
@@ -446,8 +463,15 @@ Two independent things made guest time wrong (`sched_clock` at 25 MHz,
 timestamps jumping, minute-long NAND scans, RCU stalls):
 
 - **CPU clock.**  `clk-mt7621` computes the CPU rate from `MEMC[0x648]`
-  (`FBDIV` bits 10:4, `PREDIV` 13:12).  The model programs FBDIV 69 /
-  PREDIV 1 → 875 MHz, matching the counter.
+  (`FBDIV` bits 10:4, `PREDIV` 13:12).  The model programs FBDIV 21 /
+  PREDIV 0 with the board's 40 MHz crystal → 880 MHz, the value a real B70
+  prints (`Clocks: CPU: 880MHz, DDR: 1200MHz, Bus: 220MHz, Ref: 40MHz`).
+  `CLKCFG0` selects that PLL (`CPU_CLK_SEL = 1`) and `CUR_CLK_STS = 0x101`
+  keeps the ÷1 ×1 post-divider, so Breed, U-Boot and Linux all read 880.
+  The GIC counter is programmed to the same 880 MHz — it used to be left at
+  875 MHz, the rate the old 25 MHz-crystal model produced from FBDIV 69 /
+  PREDIV 1, which made every guest timebase run 0.57% slow relative to its
+  own `udelay()` scale.
 - **GIC counter width.**  The SoC's GIC has a 64-bit shared counter, and Linux
   registers sched_clock with 64 bits regardless of the advertised width.  The
   model advertises `COUNTERBITS = 8`, implements `COUNTERHI`, and treats the

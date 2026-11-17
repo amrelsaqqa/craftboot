@@ -338,9 +338,11 @@ static void mt7621_dramc_defaults(MT7621State *s)
      * minute and tripped the RCU stall detector) and the clock reported in
      * dmesg was nonsense.
      *
-     * FBDIV 69 / PREDIV 1 gives (69 + 1) * 25 MHz / 2 = 875 MHz, the clock
-     * the GIC counter is modelled at (mips_gictimer_set_freq) and the value
-     * RouterBOOT reports for the RB750Gr3.
+     * FBDIV 21 / PREDIV 0 with the board's 40 MHz crystal gives
+     * (21 + 1) * 40 MHz = 880 MHz, the CPU clock a real board reports
+     * ("Clocks: CPU: 880MHz ... Ref: 40MHz") and the rate the GIC counter is
+     * modelled at (mips_gictimer_set_freq).  The 69 / 1 pair above belonged
+     * to the old 25 MHz-crystal model, where it produced 875 MHz.
      */
     {
         const char *pll = getenv("MT7621_CPU_PLL");
@@ -907,12 +909,21 @@ static void mt7621_machine_init(MachineState *machine)
         mips_gictimer_set_freq(strtoul(getenv("MT7621_GIC_FREQ"), NULL, 0));
     } else {
         /*
-         * Run the GIC shared counter at the real device's CPU clock (875 MHz,
-         * the rate RouterBOOT reports and OpenWrt programs its clockevents
-         * against) for the whole machine, instead of the 25 MHz reference the
-         * old hardcoded constant used.
+         * The GIC shared counter is clocked from the CPU PLL: a real board
+         * reports "Clocks: CPU: 880MHz ... Ref: 40MHz" and Linux derives its
+         * clocksource/sched_clock rate from the same value, so the emulated
+         * counter must run at exactly the CPU rate the guest decodes from
+         * MEMC[0x648] (FBDIV 21 / PREDIV 0 on a 40 MHz crystal = 880 MHz).
+         *
+         * This used to be 875 MHz, the number the old 25 MHz-crystal model
+         * produced from FBDIV 69 / PREDIV 1.  Once the crystal and the PLL
+         * moved to the real board's 40 MHz / 880 MHz, the counter was left
+         * behind: every guest timebase below the timer (clockevents,
+         * timekeeping, sched_clock) then ran 0.57% slow while its udelay()
+         * and BogoMIPS calibration - which come from CP0 Count - stayed
+         * right.  Keep the two in step.
          */
-        mips_gictimer_set_freq(875 * 1000 * 1000);
+        mips_gictimer_set_freq(880 * 1000 * 1000);
     }
 
 
