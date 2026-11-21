@@ -32,6 +32,32 @@ image; the project never ships one.
 Nothing in the image is patched to make this work: the model boots the same
 bytes the device would.
 
+> ### Disclaimer — read this before you flash anything
+>
+> **Emulation is evidence, not proof.**  A flow that passes here can still fail
+> on the real board, and a flow that fails here can work on it.  The machines
+> are reconstructed from dumps, vendor kernels and bootloader binaries; they
+> cover what was needed to boot and drive the images at hand, and they are known
+> to differ from the silicon at the edges — bus timing and clock tree details,
+> DMA and cache behaviour, interrupt delivery, NAND spare/OOB handling,
+> unmodelled registers, PHY and switch quirks.  Anything that depends on exact
+> hardware behaviour (write timing, power sequencing, wear, analogue effects) is
+> not modelled at all.
+>
+> **Bootloaders are the highest-risk thing you can touch.**  They are the one
+> component that cannot be re-flashed from software once they are broken: a
+> wrong image, a wrong offset, a mismatched flash part or an interrupted write
+> leaves a device that only a programmer or a chip-off recovery can bring back.
+> Treat bootloader work with the highest attention — verify the image, the
+> target offset, the part and the write path against your hardware, keep a
+> known-good dump and a proven recovery route, and only ever experiment on
+> hardware you can afford to lose.
+>
+> **Flashing a bootloader, or any modified firmware, to a real device after
+> testing it here is done entirely at your own risk.**  The authors provide no
+> warranty and accept no liability for bricked, damaged or out-of-warranty
+> hardware.
+
 ---
 
 ## Demo
@@ -58,6 +84,10 @@ https://github.com/user-attachments/assets/cd33f09e-8f5f-465f-92eb-24c49e0d90f4
   device you own; nothing is redistributed here.
 - Not a full-system simulator of the hardware.  Peripherals beyond the boot and
   debug path are stubs or absent, and the gaps are documented per machine.
+- Not a guarantee that a given image will work on real hardware — or that an
+  image that works here will work there.  See the disclaimer above: emulation
+  widens the set of things you can try safely, it does not remove the risk of
+  flashing a real device.
 - Not a fork of QEMU.  The changes are a patch series against a pinned release.
 
 ---
