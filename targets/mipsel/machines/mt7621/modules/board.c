@@ -73,7 +73,15 @@ void mt7621_board_apply(MT7621State *s, const char *filename)
      * per-board default, and -M mt7621,nand-id=... overrides it.
      */
     if (!s->nand_id_set) {
-        static const uint8_t esmt_128mib[8] = { 0xc8, 0xf1, 0x00, 0x15,
+        /*
+         * The real GAPM7200 answers 0xc8 0xd1 ("ESMT NAND 128MiB 3,3V
+         * 8-bit" in the vendor kernel log).  The preset used to carry
+         * 0xc8 0xf1 -- an ESMT vendor byte with the wrong chip byte, so
+         * the guest identified a part that is not soldered on the board
+         * and any identity derived from the flash ID (RouterOS software-id
+         * among them) came out different from the hardware.
+         */
+        static const uint8_t esmt_128mib[8] = { 0xc8, 0xd1, 0x00, 0x15,
                                                 0x40, 0x00, 0x00, 0x00 };
         static const uint8_t samsung_128mib[8] = { 0xec, 0xf1, 0x00, 0x15,
                                                    0x40, 0x00, 0x00, 0x00 };

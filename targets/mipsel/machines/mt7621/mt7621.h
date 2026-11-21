@@ -125,6 +125,14 @@ struct MT7621State {
     QEMUTimer *wdt_timer;
     bool wdt_rst_cause;
     unsigned eth_port;          /* DSA user port exposed to the backend */
+    uint32_t eth_rx_first_base; /* first RX ring base seen: the bootloader's.
+                                 * The kernel installs its own ring, which is the
+                                 * only reliable "handover happened" signal. */
+    bool eth_switch;            /* guest programmed a PCR matrix: a switch-aware
+                                 * stack (RouterOS) owns the port now.  RouterBOOT
+                                 * never writes PCR, so this is the reliable
+                                 * "kernel is in charge" signal -- INT_MASK is
+                                 * useless because the booter sets it during TFTP. */
     uint32_t qtx_dtx;           /* forward DMA pointer (next to send) */
     uint32_t qtx_base;          /* start of the TX descriptor ring */
     bool qtx_en;                /* QDMA TX DMA enable */
@@ -159,7 +167,16 @@ struct MT7621State {
     /* page program buffer */
     uint8_t nfi_wbuf[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
     uint32_t nfi_wbuf_len;
+    uint32_t nfi_wcol;          /* column of the page-program that filled wbuf */
     bool nfi_writing;
+    /*
+     * Spare area shadow.  A "main area only" dump has stride 2048, so the
+     * spare bytes have nowhere to live and every read synthesised 0xff.  yaffs
+     * keeps its tags there, so writes were silently lost and the filesystem
+     * could never format.  One OOB block per page, initialised to 0xff.
+     */
+    uint8_t *nand_oob;
+    uint64_t nand_oob_pages;
     uint32_t cm_regs[MT7621_CM_SIZE / 4];
 
     /* systick state: count = base + elapsed, anchored at base_ns */

@@ -49,6 +49,95 @@
 #define MT7621_NFI_SECTORS      (MT7621_NAND_PAGE_SIZE / MT7621_NFI_SECTOR_SIZE)
 #define MT7621_NFI_SPARE        (MT7621_NAND_OOB_SIZE / MT7621_NFI_SECTORS)
 
+
+/*
+ * MT7621_NAND_BADBLOCKS=17,18,... marks blocks bad the way the factory does:
+ * a non-0xff byte in the first spare byte of the block's first pages.  The
+ * dump carries no OOB, so the model synthesises 0xff there and every block
+ * looks good -- unlike the real device, which reports nine bad blocks starting
+ * at 0x220000 (block 17).  This knob reproduces the hardware map so the
+ * yaffs/format failure can be studied without touching real NAND.
+ */
+static bool mt7621_nand_block_bad(MT7621State *s, uint64_t row)
+{
+    const char *list = getenv("MT7621_NAND_BADBLOCKS");
+    uint64_t blk;
+
+    if (!list) {
+        return false;
+    }
+    blk = row / MT7621_NAND_PAGES_BLK;
+    if (getenv("MT7621_NAND_BBLOG")) {
+        fprintf(stderr, "nand-bb: query row=%" PRIu64 " (block %" PRIu64 ")\n",
+                row, blk);
+    }
+    while (*list) {
+        char *end;
+        unsigned long v = strtoul(list, &end, 0);
+
+        if (end == list) {
+            break;
+        }
+        if ((uint64_t)v == blk) {
+            return true;
+        }
+        list = end;
+        while (*list == ',' || *list == ' ') {
+            list++;
+        }
+    }
+    return false;
+}
+
+/*
+ * One spare byte of a page, as the controller presents it: the die image's
+ * OOB when the dump carries one, the programmed shadow otherwise, and the
+ * factory bad-block mark (spare[0] of the block's first two pages) on top.
+ * Every view that exposes spare bytes - byte reads, FDM registers, page
+ * assembly - has to go through this, otherwise a mark written by
+ * MT7621_NAND_BADBLOCKS (or by the guest) stays invisible to whichever path
+ * the driver happens to use.
+ */
+static uint8_t mt7621_nand_oob_byte(MT7621State *s, uint64_t row, unsigned oi)
+{
+    uint8_t v = 0xff;
+
+    if (oi >= MT7621_NAND_OOB_SIZE) {
+        return 0xff;
+    }
+    if (s->nand &&
+        s->nand_stride == MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE) {
+        uint64_t off = row * s->nand_stride;
+
+        if (off + MT7621_NAND_PAGE_SIZE + oi < s->nand_size) {
+            v = s->nand[off + MT7621_NAND_PAGE_SIZE + oi];
+        }
+    } else if (s->nand_oob && row < s->nand_oob_pages) {
+        v = s->nand_oob[row * MT7621_NAND_OOB_SIZE + oi];
+    }
+    if (oi == 0 && (row % MT7621_NAND_PAGES_BLK) < 2 &&
+        mt7621_nand_block_bad(s, row)) {
+        v = 0x00;
+    }
+    return v;
+}
+
+/* Store spare bytes for a page; a data-only dump keeps them in a shadow. */
+static void mt7621_nand_oob_store(MT7621State *s, uint64_t row, uint32_t off,
+                                  const uint8_t *buf, uint32_t n)
+{
+    if (!s->nand_oob || row >= s->nand_oob_pages) {
+        return;
+    }
+    if (off >= MT7621_NAND_OOB_SIZE) {
+        return;
+    }
+    if (off + n > MT7621_NAND_OOB_SIZE) {
+        n = MT7621_NAND_OOB_SIZE - off;
+    }
+    memcpy(s->nand_oob + row * MT7621_NAND_OOB_SIZE + off, buf, n);
+}
+
 static inline uint32_t mt7621_nfi_data_to_raw(uint32_t idx)
 {
     uint32_t sector = idx / MT7621_NFI_SECTOR_SIZE;
@@ -152,11 +241,26 @@ static void mt7621_nfi_page_read(MT7621State *s)
                        buf + MT7621_NAND_PAGE_SIZE +
                        sec * MT7621_NFI_SPARE, MT7621_NFI_SPARE);
             } else {
-                memset(dst + sec * (MT7621_NFI_SECTOR_SIZE +
-                                    MT7621_NFI_SPARE) +
-                       MT7621_NFI_SECTOR_SIZE, 0xff, MT7621_NFI_SPARE);
+                uint8_t *sp = dst + sec * (MT7621_NFI_SECTOR_SIZE +
+                                           MT7621_NFI_SPARE) +
+                              MT7621_NFI_SECTOR_SIZE;
+
+                if (s->nand_oob &&
+                    (uint64_t)s->nfi_row < s->nand_oob_pages) {
+                    memcpy(sp, s->nand_oob +
+                           (uint64_t)s->nfi_row * MT7621_NAND_OOB_SIZE +
+                           sec * MT7621_NFI_SPARE, MT7621_NFI_SPARE);
+                } else {
+                    memset(sp, 0xff, MT7621_NFI_SPARE);
+                }
             }
         }
+    }
+
+    if ((s->nfi_row % MT7621_NAND_PAGES_BLK) < 2 &&
+        mt7621_nand_block_bad(s, s->nfi_row)) {
+        /* spare[0] of sector 0: the bad-block marker the BBT reads at col 512 */
+        s->nfi_fifo[MT7621_NFI_SECTOR_SIZE] = 0x00;
     }
 
     s->nfi_served = 0;
@@ -286,19 +390,52 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
         break;
     case 0x80:                          /* page program */
         s->nfi_wbuf_len = 0;
+        s->nfi_wcol = s->nfi_col;       /* where this program starts */
         s->nfi_writing = true;
         break;
     case 0x10:                          /* program confirm */
         if (s->nfi_writing && s->nand) {
-            uint64_t off = mt7621_nfi_addr_row(s) * s->nand_stride;
+            uint64_t row = mt7621_nfi_addr_row(s);
+            uint64_t off = row * s->nand_stride;
             uint32_t n = s->nfi_wbuf_len;
+            uint32_t wcol = s->nfi_wcol;
 
-            if (n > s->nand_stride) {
-                n = s->nand_stride;
-            }
-            if (off + n <= s->nand_size) {
-                memcpy(s->nand + off, s->nfi_wbuf, n);
-                mt7621_nand_persist(s, off, s->nfi_wbuf, n);
+            if (wcol >= MT7621_NAND_PAGE_SIZE) {
+                /* OOB-only program (tags written after the data page) */
+                mt7621_nand_oob_store(s, row,
+                                      wcol - MT7621_NAND_PAGE_SIZE,
+                                      s->nfi_wbuf, n);
+            } else if (n >= MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE) {
+                /*
+                 * Raw page stream: [512 data][16 spare] per sector.  Split it,
+                 * because a main-area-only dump has nowhere to put the spare
+                 * bytes and yaffs keeps its tags there.
+                 */
+                unsigned sec;
+
+                for (sec = 0; sec < MT7621_NFI_SECTORS; sec++) {
+                    const uint8_t *src = s->nfi_wbuf +
+                        sec * (MT7621_NFI_SECTOR_SIZE + MT7621_NFI_SPARE);
+                    uint64_t doff = off + sec * MT7621_NFI_SECTOR_SIZE;
+
+                    if (doff + MT7621_NFI_SECTOR_SIZE <= s->nand_size) {
+                        memcpy(s->nand + doff, src, MT7621_NFI_SECTOR_SIZE);
+                        mt7621_nand_persist(s, doff, src,
+                                            MT7621_NFI_SECTOR_SIZE);
+                    }
+                    mt7621_nand_oob_store(s, row,
+                                          sec * MT7621_NFI_SPARE,
+                                          src + MT7621_NFI_SECTOR_SIZE,
+                                          MT7621_NFI_SPARE);
+                }
+            } else {
+                if (n > s->nand_stride) {
+                    n = s->nand_stride;
+                }
+                if (off + n <= s->nand_size) {
+                    memcpy(s->nand + off, s->nfi_wbuf, n);
+                    mt7621_nand_persist(s, off, s->nfi_wbuf, n);
+                }
             }
         }
         s->nfi_writing = false;
@@ -319,6 +456,16 @@ static void mt7621_nfi_cmd(MT7621State *s, uint32_t cmd)
                 memset(s->nand + blk_start, 0xff, blk_size);
                 mt7621_nand_persist(s, blk_start, s->nand + blk_start,
                                     blk_size);
+            }
+            if (s->nand_oob) {
+                uint64_t blk = row / MT7621_NAND_PAGES_BLK;
+
+                if ((blk + 1) * MT7621_NAND_PAGES_BLK <= s->nand_oob_pages) {
+                    memset(s->nand_oob + blk * MT7621_NAND_PAGES_BLK *
+                           MT7621_NAND_OOB_SIZE, 0xff,
+                           (uint64_t)MT7621_NAND_PAGES_BLK *
+                           MT7621_NAND_OOB_SIZE);
+                }
             }
         }
         {
@@ -345,18 +492,16 @@ static uint8_t mt7621_nfi_data_byte(MT7621State *s)
 
     /*
      * The legacy main-area dump exposes the spare area at columns 2048..2111;
-     * keep that view working for the booters that use it.
+     * keep that view working for the booters that use it.  This is also the
+     * view nand_read_oob() takes, i.e. what UBI's bad-block probe and the
+     * on-flash BBT see, so it has to report the programmed spare bytes *and*
+     * the factory bad-block marks - reading straight from the dump here made
+     * MT7621_NAND_BADBLOCKS invisible to every Linux guest.
      */
     if (s->nfi_col >= MT7621_NAND_PAGE_SIZE) {
         uint32_t oi = (s->nfi_col - MT7621_NAND_PAGE_SIZE) + s->nfi_served;
-        uint64_t page = (uint64_t)s->nfi_row * s->nand_stride;
 
-        if (s->nand &&
-            s->nand_stride == MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE &&
-            page + MT7621_NAND_PAGE_SIZE + oi < s->nand_size) {
-            return s->nand[page + MT7621_NAND_PAGE_SIZE + oi];
-        }
-        return 0xff;
+        return mt7621_nand_oob_byte(s, s->nfi_row, oi);
     }
 
     if (cnfg & (1u << 6)) {             /* BYTE_RW: raw page layout */
@@ -367,7 +512,22 @@ static uint8_t mt7621_nfi_data_byte(MT7621State *s)
         idx = logical;
     }
 
-    return idx < s->nfi_fifo_len ? s->nfi_fifo[idx] : 0xff;
+    {
+        uint8_t v = idx < s->nfi_fifo_len ? s->nfi_fifo[idx] : 0xff;
+
+        if (getenv("MT7621_NAND_BBLOG") && s->nfi_col == 512) {
+            static int bbbyte_budget = 12;
+
+            if (bbbyte_budget-- > 0) {
+                fprintf(stderr, "nand-bb: byte col=%u served=%u cnfg=%08x "
+                        "idx=%u (fifo_len=%u) -> %02x\n",
+                        (unsigned)s->nfi_col, (unsigned)s->nfi_served,
+                        (unsigned)cnfg, (unsigned)idx,
+                        (unsigned)s->nfi_fifo_len, v);
+            }
+        }
+        return v;
+    }
 }
 
 static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
@@ -453,13 +613,25 @@ static uint64_t mt7621_nfi_read(void *opaque, hwaddr addr, unsigned size)
         val = 0x0000f000;
         break;
     case 0xa0 ... 0xbf:
+    {
         /*
          * NFI_FDML/FDMM: the spare bytes the controller extracted from the
-         * last page.  The dump has no OOB area, so report it as erased --
-         * which also means "not a bad block".
+         * last page.  These used to be hard-wired to 0xffffffff ("the dump
+         * has no OOB"), which meant a guest that reads the spare through the
+         * FDM registers - RouterOS's mt7621-nand driver does, in AUTO_FMT
+         * mode - could never see a bad-block mark or any programmed OOB.
+         * Serve the real spare bytes, four per register, wrapping over the
+         * 64-byte area.
          */
-        val = 0xffffffff;
+        unsigned w = (off - 0xa0) >> 2;
+        unsigned base = (w * 4) & (MT7621_NAND_OOB_SIZE - 1);
+
+        val = (uint32_t)mt7621_nand_oob_byte(s, s->nfi_row, base) |
+              ((uint32_t)mt7621_nand_oob_byte(s, s->nfi_row, base + 1) << 8) |
+              ((uint32_t)mt7621_nand_oob_byte(s, s->nfi_row, base + 2) << 16) |
+              ((uint32_t)mt7621_nand_oob_byte(s, s->nfi_row, base + 3) << 24);
         break;
+    }
     default:
         switch (size) {
         case 1:
@@ -677,18 +849,80 @@ void mt7621_nand_load(MT7621State *s, const char *filename)
     if (s->nand_size) {
         uint64_t pages = s->nand_size / (MT7621_NAND_PAGE_SIZE +
                                          MT7621_NAND_OOB_SIZE);
+        const char *lay = getenv("MT7621_NAND_LAYOUT");
+        const char *src = getenv("MT7621_NAND_SOURCE");
+        bool src_die = false, src_data = false, forced = false;
 
-        if (s->nand_size % (MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE)
-            == 0 && pages && !(pages & (pages - 1))) {
+        /*
+         * The guest always sees a die: a NAND part has a spare area, and the
+         * controller hands it out through NFI_FDML/FDMM (and the legacy
+         * 2048+ view) whether or not the image file carries it.
+         *
+         * What the knob selects is the *file format*, i.e. where the model
+         * reads pages from:
+         *
+         *   MT7621_NAND_SOURCE=die   file pages are 2112 bytes (2048 data +
+         *                            64 spare, interleaved) - a full-die /
+         *                            "mtdall" dump
+         *   MT7621_NAND_SOURCE=data  file pages are 2048 bytes, main area
+         *                            only; the spare is synthesised (erased,
+         *                            plus any MT7621_NAND_BADBLOCKS marks)
+         *   unset                    auto: die when the size divides into a
+         *                            power-of-two number of 2112-byte pages,
+         *                            data otherwise
+         *
+         * MT7621_NAND_LAYOUT=die|data is accepted as a legacy alias for the
+         * same thing.  Forcing "data" is what makes a truncated main-area
+         * image work: its page count is not a nice power of two, and the
+         * model must not reinterpret 2048-byte pages as interleaved ones.
+         */
+        if (!src || !*src) {
+            src = lay;
+        }
+        if (src && (!strcmp(src, "die") || !strcmp(src, "full") ||
+                    !strcmp(src, "oob"))) {
+            src_die = true;
+            forced = true;
+        } else if (src && (!strcmp(src, "data") || !strcmp(src, "flat") ||
+                           !strcmp(src, "main"))) {
+            src_data = true;
+            forced = true;
+        }
+
+        if (src_die) {
+            s->nand_stride = MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE;
+            if (s->nand_size % s->nand_stride) {
+                warn_report("mt7621: %s is not a whole number of %u-byte "
+                            "pages; ignoring the last %u bytes",
+                            filename, s->nand_stride,
+                            (unsigned)(s->nand_size % s->nand_stride));
+            }
+        } else if (src_data) {
+            s->nand_stride = MT7621_NAND_PAGE_SIZE;
+        } else if (s->nand_size % (MT7621_NAND_PAGE_SIZE +
+                                   MT7621_NAND_OOB_SIZE)
+                   == 0 && pages && !(pages & (pages - 1))) {
             s->nand_stride = MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE;
         } else {
             s->nand_stride = MT7621_NAND_PAGE_SIZE;
         }
         s->nand_pages = s->nand_size / s->nand_stride;
-        if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+        if (s->nand_stride == MT7621_NAND_PAGE_SIZE && s->nand_pages) {
+            s->nand_oob_pages = s->nand_pages;
+            s->nand_oob = g_malloc0(s->nand_pages * MT7621_NAND_OOB_SIZE);
+            memset(s->nand_oob, 0xff,
+                   (size_t)s->nand_pages * MT7621_NAND_OOB_SIZE);
+        }
+        if (s->nand_stride != MT7621_NAND_PAGE_SIZE) {
             printf("mt7621: NAND dump includes the spare area "
-                   "(%u-byte pages, %u pages)\n",
-                   s->nand_stride, s->nand_pages);
+                   "(%u-byte pages, %u pages%s)\n",
+                   s->nand_stride, s->nand_pages,
+                   forced ? ", forced by MT7621_NAND_SOURCE" : "");
+        } else {
+            printf("mt7621: NAND dump is main-area only, spare synthesised "
+                   "(%u-byte pages, %u pages%s)\n",
+                   s->nand_stride, s->nand_pages,
+                   forced ? ", forced by MT7621_NAND_SOURCE" : "");
         }
     }
 }

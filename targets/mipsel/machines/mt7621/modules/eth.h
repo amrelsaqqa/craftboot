@@ -74,6 +74,17 @@
  */
 #define PDMA_TX_DONE0           (1u << 0)
 /*
+ * Delayed TX completion: a driver that programs PDMA_TX_DLY_INT_CFG (0x0a0c)
+ * masks MTK_TX_DONE_DLY (bit 28) instead of the per-queue bits 0..3, and the
+ * hardware latches that single bit once the coalescing counter fires.  The
+ * model only ever raised the per-queue bits, so such a driver waited for a
+ * completion that could never arrive: every queue filled to
+ * max_tx_buffers_per_port, the stack reported "transmit queue 0 timed out"
+ * and RouterOS restarted the switch in a loop.  Raised only when the guest
+ * has actually masked it, so poll-only users (RouterBOOT) are unaffected.
+ */
+#define PDMA_TX_DLY_INT         (1u << 28)
+/*
  * RX_DONE_INT0 is bit 16 of PDMA_INT_STATUS, and the driver does enable it
  * (its mask is 0x0003000f: TX done for four queues in bits 0..3, RX done for
  * the two RX rings in bits 16..17).  The old model raised bit 30 instead,
