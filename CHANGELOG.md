@@ -1,5 +1,96 @@
 # Changelog
 
+## v0.4.0 — 2026-11-22
+
+The MT7621 machine now runs the *installed* system end to end: netinstall over
+the tapped PHY, the installed RouterOS booting from the NAND die image, and
+repeated reboots (including `/system reboot` through the watchdog) without
+panics or lost state.  The 1004Kc is modelled as what it is (two cores, two VPs
+each), the SoC resets completely instead of inheriting latched state from the
+boot it replaced, and the NAND path is modelled closely enough to serve a real
+yaffs filesystem - which is what made the last class of failures visible.
+
+### Added
+
+- **1004Kc multi-threading bring-up** (2 cores x 2 VPs, `{2,2} total 4`):
+  `VPECONTROL.TARGTC` is core-local, the MTTR/MFTR gate asks whether the TC
+  exists in the processor, `DVPE`/`EVPE` is per processor, `CPC_Cx_CONFIG.PVPE`
+  and `MVPConf0.PVPE` agree with the topology, `GCR_CL_ID`/`GCR_CL_COHERENCE`
+  are per core, and per-VP reset state is modelled.
+- **CP0 count/compare routed through the GIC** on CM parts: the compare is the
+  VP-local `GIC_LOCAL_INT_TIMER` (2), latched in `GIC_VP_PEND` and forwarded only
+  when the VP mask bit and `GIC_VPE_TIMER_MAP` allow it.  `GIC_VPE_CTL` reports
+  `TIMER_ROUTABLE`, so a guest that registers the r4k clockevent gets the GIC
+  path the model implements instead of CPU pin 7.
+- **NAND: per-sector spare area** (`512 data + 16 spare` per sector, FDM 8 +
+  ECC 8), the controller's raw and `AUTO_FMT` page address spaces, yaffs tag
+  synthesis for dumps without spare (`MT7621_NAND_YAFFS`), a write-through
+  backend (`MT7621_NAND_IMAGE`, `-drive if=none,id=nand`), and a medium snapshot
+  at the first real reset (`MT7621_NAND_SNAP`).
+- **NAND diagnostics**: `MT7621_TAGLOG`/`MT7621_TAGLOG_BOOT` (per-boot NFI read
+  trace, so two boots of the same medium can be diffed), `MT7621_FDMLOG` (the
+  tag bytes actually served to the guest, per row), `MT7621_NAND_WRLOG` with
+  timestamps, `MT7621_NFIWLOG`, `MT7621_NFILOG`.
+- **GIC diagnostics**: `MT7621_GICIRQLOG` reports per-source rates (`gicrate`),
+  held-high levels (`giclevel`) and a filtered VP-local transition trace with
+  the guest PC, mask/map and pending bits.
+- **Ethernet**: the second (QDMA) RX ring and the hand-off latch, the engine is
+  quiesced when the guest asks for a reset (so DMA cannot land in freed pages
+  during the slow model reset), the bootloader's ring is refused once the kernel
+  owns the engine, stale firmware interrupt status is discarded at the driver's
+  first unmask, and `MT7621_TXDBG`/`MT7621_RXDBG`/`MT7621_MDIOLOG`/`QDMALOG`
+  traces make the phases visible.
+- **xHCI/IPPC** (`modules/usb.c`) wired into the build.
+
+### Changed
+
+- **A reset resets every controller, explicitly** - SYSCTL, MEMC, WDT, CM/CPC,
+  NFI, SPI, ethernet (incl. the GIC line), xHCI/IPPC, EIP-93, systick, the L1D
+  model and the per-boot bring-up latches.  Only DRAM, the flash media and the
+  board's strapping properties survive, like the silicon.  `model-quirks.md`
+  §17 has the table and the ordering rules.
+- **Watchdog**: expiry now resets the SoC (the hardware contract RouterOS relies
+  on for `/system reboot`); `MT7621_NO_WDT_RESET=1` turns it back into a warning.
+  The armed bark is dropped on reset, so a reboot cannot inherit the previous
+  boot's countdown.
+- **Warm boot** skips the DDR-init stage and inherits the *trained* MEMC PLL, so
+  the booter reports 880 MHz instead of decoding 440 MHz.
+- **L1D model on by default at the hardware `Dl=4`** (32-byte lines); the GIC
+  counter is clocked at the CPU rate the guest decodes from the PLL.
+- CP0 compare writes tolerate the read-arm race (a fresh arm a few microseconds
+  behind `Count` expires immediately instead of 2^32 ticks later).
+
+### Fixed
+
+- `irq 7: nobody cared` storm on guests that never route the local timer.
+- RCU stalls / `epc=80017a80` hangs caused by unacknowledged VP-local interrupt
+  state (and, separately, host starvation - see §18.3).
+- `440 MHz` reported on warm boots.
+- Netinstall instability: RX DMA into freed pages, a rewound RX index on
+  `RX_EN 0->1`, a shadowed `GLO_CFG`, and stale TX/RX status firing `napi` on a
+  zeroed `napi_struct`.
+- The NAND warm-boot truncation (`chunks=415/416`, silent hang after
+  `jumping to kernel code`): the loader now reports it (`INCOMPLETE`, missing
+  chunk, `REFUSING: ELF tail missing`) and the *cause* was tracked to an
+  offline image-injection page carrying another page's ECC (§18.1).
+
+### Docs
+
+- `model-quirks.md` §14 (topology and the four registers), §15 (compare routing),
+  §16 (engine ownership and `GLO_CFG`), §17 (complete reset policy), §18 (the
+  truncated-kernel case, its root cause in our offline tooling, and the model's
+  ECC limitation).
+
+### Known limits
+
+- The NFI's ECC engine is a stub: `DECENUM` always reads clean, so the model
+  cannot reject a page whose spare/ECC is inconsistent.  Images written *inside*
+  the emulator therefore carry `0xff` ECC - fine for emulator tests, invalid on
+  flash.  A BCH encoder/decoder for `512+8`-byte sectors (strength 4, 8 parity
+  bytes) is the missing piece (§18.2).
+- A loaded host starves the vCPUs; an RCU stall report from such a run is not a
+  guest bug (§18.3).
+
 ## v0.3.0 — 2026-11-16
 
 The MT7621 machine can now run the board's real cache geometry (`Config1.Dl=4`,

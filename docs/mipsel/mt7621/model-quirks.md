@@ -530,3 +530,1047 @@ spare area directly, which is the view the older booters use.
 
 This is why U-Boot's `nand bad` is empty and `nand read` returns the real
 image bytes; Breed → OpenWrt is unaffected.
+
+## 6. Boot a real B70 die dump: the NFI protocol, the three layouts, and what is still open
+
+This is the state after taking a **real device backup** (`backup-flash-dump-lg7200.bin`,
+132 MiB) as the boot image, with our own NFI driver (`~/mt7621-mod/mt7621_nand.c`,
+the `mt7621_nfc` module we ported) as the reference for what the hardware must do.
+Before this, every attempt at "run the device's own image" died in the booter or
+in the filesystem; the list below is why.
+
+### 6.1 A die dump is per-sector raw, not 2048+64
+
+There are three dump layouts and they are not interchangeable:
+
+| layout | page stride | where the spare is | knob |
+|---|---|---|---|
+| main area only | 2048 | absent, synthesised `0xff` | `MT7621_NAND_SOURCE=data` |
+| "mtdall" die | 2112 | 64 bytes at the **end** of the page | `MT7621_NAND_SOURCE=die` |
+| controller-raw die | 2112 | 16 bytes **after each 512-byte sector** | `MT7621_NAND_SOURCE=raw` |
+
+A real `nanddump` of this part is the third one.  Reading it as the second puts
+everything after the first 512 bytes of each page 16 bytes early - the booter's
+stage-1 code then executes `0xffffffff` and the model faithfully reports the
+`RI` it takes.  Symptom: Breed boots, "jumping to kernel code", then nothing, or
+a `TLBL` loop in the booter's handler.
+
+Diagnosis that settled it: a known byte pattern from a working flat image at
+`0x240` appeared in the die dump at `0x250` - one 16-byte spare block later -
+and every page's first 512 bytes matched the flat image while the rest was
+`0xff`.
+
+The model now keeps `nand_spare` (`NONE`/`PAGE`/`SECTOR`) next to `nand_stride`,
+and every path that touches spare bytes goes through one accessor:
+`mt7621_nand_oob_byte()` / `mt7621_nand_oob_write()` (image OOB when present,
+programmed shadow otherwise, plus the factory bad-block mark and any
+`MT7621_NAND_YAFFS` tags).  Writes scatter per sector for the raw layout, because
+a data-only program that memcpy's 2048 bytes at the page start overwrites the
+neighbouring sectors' spare area.
+
+### 6.2 The BootROM runs stage 1 out of `0xb900_0000`
+
+A NAND uImage at flash 0 is a `uImage` whose name field is overlaid by MikroTik's
+`nand_header_t`; `ih_bootloader_offset` (+52) is non-zero and points at the
+bootloader inside the image data.  The model used to skip straight to it
+("BootROM boot step 2").  On hardware the ROM first copies the image data that
+precedes that offset into the BootROM's stage-1 window and runs it there; the
+stage-1 image is linked at **`0xb9000000`** (its first instruction is
+`j 0xb9000140`, and `0xb9000148` reads `CP0 EBase` and writes `0x7621abcd` to
+`0xbe10ad00` as its first hardware poke).  This is the default path (`MT7621_NO_ROM_STAGE1=1` restores the old shortcut):
+stage 1 is loaded at `0xb9000000` and entered, the bootloader is pre-placed at
+`ih_load` for the hand-over, and the loader's bounds check accepts the KSEG1
+window (512 MiB, upper half aliases DRAM) instead of only `ram_size`.
+
+Without this the device's own booter runs into `0xffffffff` at `+0x200` and
+loops in its TLB-refill path - the register dump shows `CP0 Status EXL=1`,
+`Cause = BD | ExcCode 2`, `EPC = 0xa020…`, `PC` in the exception vector.
+
+### 6.3 What the NFI driver requires (and the model did not do)
+
+Read from `mt7621-mod/mt7621_nand.c`; all four were model bugs, not driver quirks:
+
+1. **Command first, addresses after.**  `nand_read_page_op()` sends `0x30` and
+   only then the five address bytes.  The model used to fetch the page inside the
+   `0x30` handler, i.e. from the *previous* row.  The fetch is now deferred
+   (`nfi_read_pending`) and happens on the first `DATAR` access - and the word
+   path has to trigger it too, or AUTO_FMT reads return `0xff` from an empty FIFO
+   and the driver spins at `PIO_DIRDY` (that was the intermittent "hang in
+   Scanning device for bad blocks").
+2. **Every address byte goes through `COLADDR`, then `ADDRNOB=1`.**
+   `mt7621_nfc_send_address_byte()` writes `COLADDR=byte; ROWADDR=0; ADDRNOB=1`
+   for each cycle, so the column/row split cannot come from `ADDRNOB`; it comes
+   from the current NAND command.  The byte must also be latched as the *pending*
+   byte or the commit appends a stale value: that made every row assemble to 0,
+   so **every erase hit block 0** (`erase row=0 block=0` ×40) and yaffs retired
+   the whole partition.
+3. **Erase addresses are row-only.**  `0x60` is followed by three row bytes and
+   no column; the model assumed two column bytes first.  Handled by
+   `nfi_addr_row_only`, set on `0x60` and cleared by `0x00/0x30/0x80/0x90/0xff`.
+   The address phase now starts at the first address byte after a command
+   (`nfi_addr_fresh`), which covers both orders - the booters send addresses
+   before the command, the Linux core after it.
+4. **FDM is 8 bytes per sector at an 8-byte register stride.**
+   `NFI_FDML(n) = 0xa0 + n*8`, `NFI_FDMM(n) = 0xa4 + n*8`, `NFI_FDM_SIZE = 8`;
+   sector *n*'s spare is `[n*16 .. n*16+7]` (the other 8 bytes are ECC parity).
+   The model mapped four bytes per register over the whole 64 bytes and, worse,
+   only *read* FDM.  Program writes the OOB through FDM (the data port carries
+   data only in `AUTO_FMT`), so tags written by yaffs landed nowhere while the
+   data page did - the write/read round-trip yaffs checks.
+5. Program path detail: the driver skips all-`0xff` pages entirely
+   (`check_empty_page`), so a missing program command is expected, not a fault;
+   and it forces spare byte 0 to `0xff` on every programmed page so the
+   bad-block marker stays pristine (its free area starts at byte 1).
+
+### 6.4 Verification ladder on the die dump
+
+Each step is a real milestone, measured on `MT7621_ROM_STAGE1=1 MT7621_NAND_LAYOUT=raw`:
+
+| step | evidence |
+|---|---|
+| Breed runs from the die dump | `Board: HiWiFi HC5962 (B70)`, `Clocks: CPU: 880MHz, DDR: 1200MHz, Bus: 220MHz, Ref: 40MHz` |
+| loader assembles the kernel object from real OOB | `[NB] obj=00010100 seq=001011ff data=00000869 chunks=0x415` |
+| kernel boots | `MIPS: machine is mediatek,mtk7621-soc`, `Memory: 254224K/262144K` |
+| NFI driver binds | `mt7621_nfc: ESMT NAND 128MiB`, `ECC strength adjusted to 4 bits` |
+| MTD layout | 3 partitions: `RouterBoard NAND 1 Boot`, `RouterBoard NAND 1 Main`, `RouterBoot` |
+| yaffs mounts **mtdblock1** | `Attempting MTD mount of 31.1,"mtdblock1"`, `89 blocks to be sorted...`, `is_checkpointed 0` |
+| userspace starts | `[NB] init: up`, GPIO/UART/PHY registration, later `crypto: ring status: 0` |
+
+### 6.5 Fixed: the yaffs "block needs retiring" storm
+
+Symptom (hundreds of lines per run, then `init` dying):
+
+```
+yaffs: **>> Block 133 retired
+yaffs: Block 133 is in state 9 after gc, should be erased
+```
+
+yaffs erased a GC block, programmed chunks into it, read them back and found
+neither erased data nor valid tags, so it retired the block - and then the next
+one, until the filesystem had no blocks left.
+
+Root cause: **the FDM write path was unreachable code.** The capture for
+`NFI_FDML/FDMM` writes (spare bytes, where yaffs tags live) had been inserted
+between `case NFI_DATAW:` and `case NFI_CMD:`, i.e. after a `return`, so no
+program ever captured spare bytes:
+
+```
+nand-wr: program row=9976 col=0 len=2048 fdm=0 data0=01000000   <- tags dropped
+```
+
+The data page was programmed, the tags were not, so every read-back of a written
+page looked corrupt.  As a proper `case 0xa0 ... 0xbf:` the same program shows:
+
+```
+nand-wr: program row=9976 col=0 len=2048 fdm=1 data0=01000000
+```
+
+and the storm stops:
+
+| | before | after |
+|---|---|---|
+| `fdm=` on programs | 0 | 1 |
+| yaffs retire messages | 971-1416 per run | **0** |
+| where it ends | `init` panic | RouterOS userspace (`rb_ioctl`, `RB_GET_TYPE`, `probe_er_radio_data`) |
+
+The lesson is general: the model's spare write path is the only thing that makes
+a filesystem's metadata round-trip, so "the data page was written" is not
+evidence that a write worked.  `MT7621_NAND_WRLOG=1` prints `fdm=` and the first
+spare bytes per program for exactly this check.
+
+### 6.5b Still open
+
+- **Intermittent no-output boots** with an identical command line (sometimes
+  nothing after reset, sometimes a stall after `jumping to kernel code`).  Not
+  reproducible under `-icount` (the machine is ~5x too slow there), so it needs a
+  poll trace: `MT7621_NFISPIN=1` names a register that is read thousands of times
+  with the same value.
+- **Bad-block scan takes ~16 s** (one read round trip per page through the
+  model).
+- **Warm reboot** does not yet behave like the device (`machine_hang` vs the real
+  reset path) - unverified.
+
+### 6.6 Knob reference (all off by default unless noted)
+
+| knob | meaning |
+|---|---|
+| `MT7621_NAND_SOURCE=data\|die\|raw` (alias `MT7621_NAND_LAYOUT`) | dump layout (6.1) |
+| `MT7621_NAND_BADBLOCKS=a,b,…` | overlay the factory bad-block map |
+| `MT7621_NAND_BBLOG=1` | log bad-block queries and the byte path |
+| `MT7621_NAND_WRLOG=1` | log program starts and erase row/block |
+| `MT7621_NFIWLOG=1` | log every NFI register write (register protocol) |
+| `MT7621_NO_ROM_STAGE1=1` | disable the BootROM stage-1 path, i.e. the old jump-straight-to-the-bootloader shortcut (6.2; stage 1 is the default and the only path a real image boots through) |
+| `MT7621_BOOTLOG=1` | first 32 PCs after reset, with the entry point |
+| `MT7621_TLBLOG=1` | TLB-miss exceptions with `BadVAddr`, `EPC`, faulting word |
+| `MT7621_NAND_YAFFS=obj,seq,page:chunk:count,…` | synthesise yaffs tags for main-area dumps |
+| `MT7621_DCACHE` / `MT7621_DL` | L1D model (default on) and line size override |
+
+Core changes that came with this: **IBE on instruction fetch from a device or
+unassigned region** (`target/mips`, ExcCode 6) instead of QEMU aborting with
+`cpu_io_recompile: could not find TB for pc=(nil)`; the machine now reports the
+hardware `Dl=4` with the L1D model on by default; and the GIC counter runs at the
+CPU rate (880 MHz) the guest decodes.
+
+## 7. MDIO: the MT7530's five PHYs, the busy bit, and the frame's ST field
+
+The die image now boots into RouterOS's userspace (section 6), and the next
+things it complains about are Ethernet.  Both items here came out of tracing the
+MDIO controller (`MT7621_PHY_IAC` at frame-engine offset `0x10004`) on the real
+device image, not out of guessing.
+
+Register layout, from `drivers/net/ethernet/mediatek/mtk_eth_soc.[ch]` (the
+driver RouterOS's `raeth` descends from, and the one our model was written
+against):
+
+| bit | meaning |
+|---|---|
+| 31 | `ACCESS`: the transaction.  Write it, the controller runs the frame and clears it. |
+| 25..29 | register (5 bits) |
+| 20..24 | PHY address (5 bits) |
+| 19 / 18 | `READ` / `WRITE` |
+| 16 | `ST`: the MDIO frame's start-of-frame field (`01` for clause 22, `00` for clause 45) |
+| 15..0 | data (write) / read result |
+
+### 7.1 Only five PHYs and the switch answer
+
+`MT7621_MDIOLOG=1` records every IAC transaction with its decoded PHY and
+register.  A full boot of the die image touches exactly these addresses:
+
+```
+phy 0 .. 4      (132 / 45 / 45 / 45 / 45 transactions - the MT7530's five
+                 internal PHYs, port 0 = WAN, 1..4 = the LAN ports)
+phy 31 (0x1f)   (2917 transactions - the switch's indirect register file)
+```
+
+Nothing else.  A real MDIO address with no device reads back `0xffff`, and the
+model had been answering *every* address 0..31 with a plausible BMCR/BMSR/PHY-ID
+set - a "PHY" at every address a driver scans for.  `mt7621_eth_phy_read()` now
+returns `0xffff` for `phy > 4`, which is what the bus does.
+
+This is also why RouterOS prints `raeth: mdio timeout` when it does hit an
+address that does not answer: it is the driver's word for "read returned
+`0xffff`", not a bus hang.  How many of those appear is *not* deterministic
+across runs (4 in three runs, 0 in another with an identical command line), so
+the count alone says little; the transaction trace is what identifies them.
+
+### 7.2 `ACCESS` is the busy bit; `ST` is not a second "go"
+
+The model used to start a transaction only when a write had **both** `ACCESS`
+and `ST` set.  That is right for clause-22 frames (Linux's driver always sets
+both), and wrong for the frames the booter sends.  RouterBOOT's etherboot, right
+before it prints `Press Ctrl+E to enter etherboot mode`, writes:
+
+```
+IAC <- 0xbe000026     ACCESS | reg 0x1f | data 0x26, ST = 0
+IAC <- 0xbe040000     ACCESS | reg 0x1f | data 0x0,  ST = 0
+```
+
+and then polls `ACCESS`.  Under the old model nothing ever ran, `ACCESS` stayed
+set, and the booter spun a bounded ~1200 times per frame before giving up:
+
+```
+mdio: read iac=be000026 ACCESS-STILL-SET      (1199 times)
+mdio: read iac=be040000 ACCESS-STILL-SET
+```
+
+On hardware the access always finishes - `ACCESS` is the busy bit, and `ST` is
+just the copy of the frame's start-of-frame field - so `ACCESS` clears and the
+poll ends on the first read.  The model now runs any write that sets `ACCESS`:
+
+- `ST` set (clause 22): decoded as before - switch page/data registers at PHY
+  31, PHY register reads/writes at 0..4.
+- `ST` clear (clause 45 or any other frame): the frame completes and `ACCESS`
+  clears; nothing on this bus speaks clause 45, so a read returns `0xffff`,
+  exactly like an unpopulated address.
+
+That removes ~2400 poll iterations per boot on the die image, and with it a
+source of host-speed-dependent behaviour.  It is also the same bit the driver
+polls before *starting* a transaction, so an `ACCESS` left set by a rejected
+write stalls the *next* transfer, which is one plausible source of the
+intermittent `raeth: mdio timeout` bursts.
+
+### 7.3 What the PHY model still says about link
+
+`up = phy && phy == s->eth_port`: only the switch port wired to the host backend
+reports a cable, and PHY address 0 (the WAN PHY) can never report one even when
+`MT7621_ETH_PORT=0` asks for it.  The first half is the honest consequence of
+modelling a single net backend; the second half is a wart, because address 0 is
+a real PHY on this board.  It is left alone for now because RouterBOOT's
+etherboot and the netinstall flow probe specific ports to decide whether a cable
+is present, so changing it changes which port a booter will use.
+
+### 7.4 Next gap: the SSUSB block
+
+With MDIO quiet, the boot continues into the kernel's own devices and stops at:
+
+```
+xhci-mtk 1e1c0000.xhci: clocks are not stable (0x0)
+xhci-mtk: probe of 1e1c0000.xhci failed with error -145
+```
+
+`xhci-mtk` powers up the ports and then polls `ip_pw_sts1` for
+`STS1_SYSPLL_STABLE | STS1_REF_RST | STS1_SYS125_RST | STS1_XHCI_RST`.  The IPPC
+block is not modelled at all, so the read returns 0 and the probe fails after a
+20 ms timeout.  Per the MT7621 device tree the SSUSB MAC is at `0x1e1c0000` and
+its IPPC registers at `0x1e1d0700` (256 bytes: control `0x00..0x0c`, status
+`0x10`/`0x14`, `ip_xhci_cap` at `0x24`, four U3 port registers from `0x30`, five
+U2 port registers from `0x50`, `u2_phy_pll` at `0x7c`).  A faithful model needs
+both halves - the status bits alone move the failure to `xhci_init`, which then
+needs a plausible capability register file and a reset/run sequence - so this is
+a module of its own, not a one-line stub.
+
+## 8. The board's own device tree, and why the SSUSB block cannot be found from it
+
+Everything above was derived from drivers and from what the guest prints.  The
+die image lets us do better: RouterOS's kernel carries its **own flattened
+device tree**, so the model can be checked against the tree the firmware
+actually boots with instead of against a kernel source tree.
+
+### 8.1 Extracting it from the running guest
+
+The blob is in RAM, so the monitor can hand it over (path quoted or the monitor
+tries to parse it as an expression):
+
+```
+(qemu) pmemsave 0 0x10000000 "/tmp/ni/ram256.bin"
+```
+
+Only one FDT magic is present in 256 MiB of RAM - at physical `0x4cc640`,
+9291 bytes, i.e. inside the kernel image the loader placed at `0x80000000`
+(physical `0`).  `dtc -I dtb -O dts` then prints the tree.
+
+What it says about the blocks this model implements:
+
+| node | reg | note |
+|---|---|---|
+| `palmbus@1e000000` | `ranges = <0 0x1e000000 0xfffff>` | children are offsets: `spi@b00`, `nand@3000`, ... |
+| `crypto@1e004000` | `0x1e004000 0x1000` | the model maps `0x800` of it |
+| `xhci@1e1c0000` | `0x1e1c0000 0x1000`, `0x1e1d0700 0x100` | `reg-names = "mac", "ippc"`; `status = "disabled"` |
+| `interrupt-controller@1fbc0000` | `0x1fbc0000 0x80` | GIC base agrees; the DT size is smaller than the block |
+| `ethernet@1e100000` | `0x1e100000 0x10000` | frame engine |
+| `pcie@1e140000` | ranges to `0x60000000` | |
+
+So for the GIC, crypto, frame engine, NAND and SPI the model's addresses match
+the firmware's own tree, which is a much stronger statement than matching a
+mainline DTS.
+
+### 8.2 The USB puzzle: `disabled`, yet probed, and not at the DT address
+
+Two observations that do not fit together:
+
+1. The tree marks `xhci@1e1c0000` as **`status = "disabled"`**, so a
+   device-tree-driven probe should never happen - yet RouterOS's kernel probes
+   `xhci-mtk 1e1c0000.xhci` on every boot.
+2. A switch-side model of both blocks (`modules/usb.c`, MAC at `0x1e1c0000`,
+   IPPC at `0x1e1d0700`, with `MT7621_USBLOG=1` to name every access) records
+   **no access at all** to either address, while `MT7621_PERIPHSPY=1` sees no
+   unassigned access anywhere in `0x1e100000..0x1e200000` either.
+
+The probe does run and does read a status register, because it reports a value
+that changes from run to run:
+
+```
+xhci-mtk 1e1c0000.xhci: clocks are not stable (0x1600003d)
+xhci-mtk 1e1c0000.xhci: clocks are not stable (0x24170002)
+xhci-mtk 1e1c0000.xhci: clocks are not stable (0x1dc04)
+```
+
+Values that differ every boot are what uninitialised DRAM or an unrelated
+register file full of DMA pointers looks like - not a modelled status register.
+So RouterOS's kernel registers this platform device **itself** (the DT node is
+disabled), with resource addresses that are not the ones in the tree, and the
+`1e1c0000` in the device name is only the first resource's start.
+
+That makes the SSUSB module a model of a block the firmware believes is
+somewhere else: the register file in `modules/usb.c` is written from the
+datasheet/spec side (xHCI capability + operational registers, IPPC status bits,
+Supported Protocol extended capabilities) and is correct *if* the guest ever
+addresses it, but it cannot fix the probe until the address the firmware
+actually uses is known.  The instrument for that is the pair of knobs above
+(`MT7621_USBLOG` for the model's own blocks, `MT7621_PERIPHSPY` for everything
+unassigned in the peripheral window) plus QEMU's trace points, which name the
+region and offset of every other access:
+
+```
+qemu ... -trace enable=memory_region_ops_read \
+              -trace enable=memory_region_ops_write \
+              -trace file=/dev/stdout | <filter bursts>
+```
+
+because the failing check is a *poll*, i.e. a long burst of identical reads of
+one register, which is easy to spot and easy to attribute to a region.
+
+### 8.3 Where the die image stands after the MDIO fix
+
+Four back-to-back runs of the die dump (`MT7621_NAND_LAYOUT=raw`, no other
+knobs), counted from the serial log:
+
+| run | mdio timeouts | yaffs retirements | panic | last line |
+|---|---|---|---|---|
+| 1 | 0 | 0 | 0 | `probe_er_radio_data` @ 78.8 s |
+| 2 | 0 | 0 | 0 | `xhci-mtk: probe ... failed` @ 77.8 s |
+| 3 | 0 | 0 | 0 | `probe_er_radio_data` @ 77.3 s |
+| 4 (with monitor) | 0 | 0 | **1** | `sstore` oops @ 53.0 s, then a reset |
+
+The first three are the state to work from: Breed -> loader (real OOB) ->
+kernel -> NFI -> 3 MTD partitions -> yaffs (clean) -> userspace -> switch ->
+`rb_ioctl`/`probe_er_radio_data`, with no storage or MDIO complaint anywhere.
+
+The fourth run is the open item: one boot in four dies in RouterOS's `sstore`
+("settings store", PID 79) with a **NULL ops pointer**, and the panic then
+resets the machine into the booter (whose `flash_ioctl`/`spi_program_sector`
+messages appear afterwards without kernel timestamps, and the CPU is left
+executing in the `0xbfc0_0000` boot window).
+
+The fault is a three-level ops indirection, which is why it is worth naming:
+
+```
+$4 (a0) = 8e1d0840          ; some driver object
+0x80266e64  lw  a1, 0x90(a0)   ; a1 = 8f8dc964
+0x80266e68  lw  v0, 0x14(a1)   ; v0 = NULL
+0x80266e6c  lw  t9, 0x20(v0)   ; -> fault at 0x20
+0x80266e78  jr  t9
+```
+
+and the caller (`ra = 0x8010be2c`) uses the same `+0x14` ops pointer with
+`+0x24` for its own op, i.e. the guest called a driver-core wrapper whose
+private object exists but whose ops table was never installed.  That is the
+signature of a *probe that has not finished* while `sstore` already talks to
+the device, not of a bad register value - `sstore` runs from `/init` while
+RouterOS is still loading its out-of-tree modules (`mt7621_nfc` is one of
+them), and this model's NAND scan is slow enough (multiple seconds) that the
+interleaving differs from the board.
+
+So this is a window in which the guest's own bring-up order matters, not a
+wrong register value.
+
+Is it concurrency?  Measured, same image and binary:
+
+| accelerator | runs | panics |
+|---|---|---|
+| default (multi-threaded TCG, 4 vCPUs) | 4 | 1 |
+| `-accel tcg,thread=single` | 4 | 0 |
+
+Serialising the vCPUs made it disappear in four runs, so the panic is a
+concurrency effect rather than a deterministic data error.  It is not yet
+attributed: a data race inside a shared guest object and a race the *model*
+introduces (two vCPUs driving one controller, or one vCPU polling a register
+while another owns the transaction) look the same from the serial log.
+
+What the timing shows is that the crash window is RouterOS's settings store
+writing to flash, not a random driver:
+
+```
+[52.456] new-flash: starting...
+[52.458] flash: ptr = (ptrval), base = 1fc00000
+[52.478] board name = RouterBOARD 750G r3
+[53.338] mt7621-nand 1e003000.nand: wr page 9976 ecc data oob=1 steps=4 ...
+[53.4..] ... wr page 9977 .. 9983
+```
+
+the panicking run dies at 52.98 s, i.e. as `new-flash`/`sstore` start using the
+MTD device, and the first thing they do is program the last pages of block 155.
+That puts the NFI program/read round trip - the newest and most stateful part
+of the model - at the centre of the investigation, not the Ethernet or USB
+code.
+
+Next steps, in order: repeat the MTTCG run enough times to get a rate, then
+make the NFI model's transaction state per-context-safe / explicitly locked and
+re-measure; if it survives MTTCG, speed the page-read path up (the bad-block
+scan and the yaffs sort dominate the boot) so the guest's bring-up order stops
+differing from the board's.
+
+## 9a. The die dump's firmware slot predates the board patch
+
+Section 9 ended with the booter looping on a fault.  That fault is real, and it
+is in the *image*, not in the model:
+
+- the function is the etherboot timeout loop (`0x81108c58`), whose prologue
+  sets `$fp = 0x81110000`;
+- the loop's constant load must therefore be `lw v1,-0x70ec($fp)` - which is
+  exactly what the other booter build we have (`/tmp/opencode/booter_ram.bin`,
+  dumped from a previous session) decodes at the same offset;
+- the die dump's booter decodes `lb v1,-0x70ec($t6)` instead, and `$t6` is a
+  caller-saved register that the preceding `jalr`s legitimately clobber, so it
+  is zero: `BadVAddr = 0xffff8f14`, TLB load fault, and the vector at
+  `0x80000180` is `bovc sp,sp,...; jr ra`, which returns to the faulting
+  instruction.  Infinite loop, no message.
+
+Proof that this is the image and not the machine: overlay the *known-good*
+patched package (`~/tmp/rb-fw-routerboot-full.bin`, sha256 `c74e544f...`,
+917504 B for flash `0x140000`-`0x220000`) on the die dump and boot the same
+emulator binary with the same command line.  Etherboot then runs:
+
+```
+Ethernet link absent...
+trying bootp protocol... ... OK
+Got IP address: 192.168.33.3
+resolved mac address 76:19:B0:2B:86:06
+******...            <- TFTP blocks from the host netinstall
+```
+
+So the die dump's `0x140000` slot contains an older 3040-byte loader whose
+booter image is the pre-patch one; the real board has the package.  The model
+needs nothing for this.
+
+Two model fixes were still needed to get that far, both hardware facts:
+
+1. **Autoneg deadline from power-on, not from the first poll** - the PHY used
+   to report link-down on the very first BMSR read and only start its 300 ms
+   settle then, and RouterBOOT treats that first read as "retry".
+2. **The RouterBoot area is mirrored to `0x80e00000`** at load (from the
+   board's own `mtd2`, `0x1e0000`, 256 KiB).  Its 0x28-byte header is the
+   board descriptor table the booter parses (`+0x14` = config TLV offset,
+   `+0x18..+0x24` = geometry windows) and the TLVs follow ("Hard" at
+   `+0xf000`).  ROUTERBOOT-NOTES sec.3/sec.15/sec.16 require this; the model
+   logs the readback so a wrong offset is visible immediately.
+
+Also confirmed from the booter's own code: its MDIO helper at `0x81110854`
+builds the IAC word as `reg<<25 | addr<<18 | ...` with `2<<18` = READ, and the
+etherboot path calls it with **PHY 1**, so the default cable must stay on a LAN
+PHY (`MT7621_ETH_PORT=1`), not the WAN.
+
+## 9. Etherboot (Ctrl+E) on the die image: link now works, the booter then faults
+
+The netinstall path is RouterBOOT's own: Ctrl+E -> eth init -> BOOTP -> TFTP.
+With a host tap attached the booter printed its banner, waited for the key, and
+then hung with no further output.  Three separate things were measured.
+
+### 9.1 The wait was a PHY that could never have a cable
+
+A driver trace of the IAC transactions (`MT7621_MDIOLOG=1`) ends with:
+
+```
+mdio: w#616 0209ffff phy=00 reg=01 rd  access=0 start=1
+mdio: w#617 8209ffff phy=00 reg=01 rd  access=1 start=1   <- BMSR of PHY 0
+```
+
+RouterBOOT polls link at **PHY address 0**, the WAN.  The model reported link
+only where `phy && phy == MT7621_ETH_PORT`, so address 0 could never have a
+cable no matter how the backend was configured.  Fixed: the cable follows
+`MT7621_ETH_PORT` for every address, and the `lg-gapm7200` preset now defaults
+that to **0**, because the WAN socket is the port a netinstall cable goes into
+and the port the booter looks at.  After the fix the booter's own register $s0
+holds the BMSR value `0x7965` (link up, autoneg complete), so it does see the
+cable.
+
+### 9.2 But it still sends no frame: it takes a TLB fault first
+
+With link up, the booter enters a timer loop and never transmits (`0` frames
+with `MT7621_ETHLOG=1`).  QEMU's own exception trace (`-d int`) names the fault:
+
+```
+mips_cpu_do_interrupt enter: PC 81108d20 EPC 81108d20 TLB load exception
+    S 10000002 C 40000008 A ffff8f14 D 00000000
+```
+
+i.e. `BadVAddr = 0xffff8f14`, from the instruction at `0x81108d20`:
+
+```
+0x81108d10: lui  a0,0x8110
+0x81108d14: lw   v1,0x10(sp)     ; start of the delay window
+0x81108d18: lw   a0,0x19ac(a0)
+0x81108d1c: subu v0,v0,v1       ; elapsed
+0x81108d20: lb   v1,-28908(t6)  ; t6 = 0 -> 0xffff8f14
+0x81108d24: mul  v1,v1,a0
+0x81108d28: sltu v0,v1,v0
+0x81108d2c: beqz v0,0x81108d58   ; timeout exit
+...
+0x81108d50: jalr s5             ; reporting call
+```
+
+The exception vector is not initialised in this image (`0x80000180` holds
+`bovc sp,sp,...; jr ra`), so the fault returns straight to the faulting
+instruction and the machine loops for ever - no message, no reset, exactly the
+"apparent infinite loop".
+
+Two facts narrow the cause:
+
+* `-smp`-independent: this is not the MTTCG race of 8.3, it is deterministic
+  (same PC, same BadVAddr in every run).
+* The **same instruction differs between the two booters we have**: the die
+  image decompresses `lb v1,-0x70ec(t6)` there, while the earlier relocated
+  build (`/tmp/opencode/rb-full-reloc-trace-df.bin`, dumped from RAM in an older
+  session) has `lw v1,-0x70ec(fp)` in the identical location - a word load from
+  the booter's own data, which cannot fault.  The two booters are otherwise
+  different builds (2.6 KiB of differing bytes in 256 KiB, including the entry
+  stub and a 50 MHz constant), so this is either a different build that expects
+  a static base register in `$t6`, or a damaged/patch-variant word in the die
+  image.
+
+Since the die image is the source of truth, the next step is to diff its
+decompressed booter against a stock RouterBOOT 7.17 for MT7621 rather than to
+teach the model anything: a `lb` through a zero base cannot work on silicon
+either.  Until then, etherboot from this image is expected to loop.
+
+New knob from this work: `MT7621_TLBLOG_MIN=<pc>` restricts the TLB-miss log to
+faults at or above an address (`0x81000000` keeps only the booter's), because
+the default sampler is consumed by user-space noise long before a booter fault.
+
+## 10. Matching the model to the board's own register dump (etherboot)
+
+The board's first working etherboot produced a register dump from the booter
+itself (the patched build prints `M…` / `G…` lines right before BOOTP).  Diffing
+that against the model at the same point is the most direct fidelity test there
+is, and it found four differences - all fixed, all board-scoped:
+
+| register | board (working) | model before | model now |
+|---|---|---|---|
+| `0x1e000010` SYS_SYSCFG0 | `000232c1` | `00000101` | `000232c1` (strap: CHIP_MODE + DDR + 40 MHz xtal in 8:6) |
+| `0x1e000058` | `0a210a01` | `00000000` | `0a210a01` |
+| `0x1e100a08` PDMA_RST_IDX | `00000000` | `00010000` | self-clearing pulse |
+| `0x1e110004` IAC | `0000796d` (data only) | `02097941` (request bits kept) | `0000 <data>` |
+| PHY BMSR | `796d` with cable | `7965` / `7941` (bit 3 missing) | `796d` / `7949` |
+
+`MT7621_SYSCFG0` / `MT7621_SYSCTL58` override the straps for A/B.  Normal boot
+is unaffected: the die dump still reaches userspace, and with the cable on the
+WAN PHY the kernel reports `eth0: phy link up (1000/full)`.
+
+The lg board's default backend port is now **0 (WAN)**: the netinstall cable
+goes there on the real board, and that is the PHY RouterBOOT's etherboot reads
+(its dump shows the link-up BMSR on that read).
+
+Still different after the fixes (worth chasing next, same method): the booter
+programs `PDMA_GLO_CFG = 0x455` (i.e. `MTK_MULTI_EN`, bit 10) on the board and
+`0x45` here, reads `0x1e110000` as `45000504` there and zero here, and the
+switch matrices read back `000000ff` / `000000ff` on the board versus
+`0000003f` / `00000040` in the model - i.e. the booter builds a slightly
+different descriptor set, which is the next thing to align.
+
+### 10.1 Why "Ctrl+E hangs" is not a model bug
+
+A gdbstub breakpoint on the booter's branch (`0x81108cc0`) shows the guard is
+**unconditional**: `$s0` is zeroed two instructions earlier (`move s0,zero` in
+the `jalr` delay slot), so `and s0,s0,s1` is always 0 and `bne s0,s1` is always
+taken.  There is no link- or register-dependent escape from that path, so the
+instruction that faults (`lb v1,-0x70ec($t6)`, see sec.9) executes on every
+etherboot entry.
+
+In the flashed image that instruction is `lw v1,-0x70ec($fp)`; our reloc loader
+rewrites it because its "literal address word" rule matches words whose top 18
+bits are `0x8FC00` (see sec.9a).  A board running the same decoded image would
+fault identically, so the board must be running a decoded image that differs -
+the fix is in the loader's relocation rule, not in the machine model.
+
+## 11. Warm reset: re-enter the bootloader, not the DDR-init stage
+
+Symptom: `system_reset` (HMP; note `reset` is not a command, the monitor
+answers `unknown command: 'reset'`) restarts the CPU at `0xb9000000`, the
+BootROM stage-1 runs, and then the guest never prints again.  The PC trace
+shows the stage returning into `0x8900xxxx`, calling back to `b9000238` and
+ending in a loop at `0x00000d10`; Breed's banner never returns and the guest
+that answers afterwards is the *previous* instance still in RAM.
+
+Cause: on a warm reset the stage-1 code sees the state the previous boot left
+in its SRAM window and takes a different hand-over path than on a cold boot
+(cold: `b9002148 -> 89001834`; warm: `b9002148 -> 890019d8 -> b9000238 ->
+0xd10`).  The model has no DDR to train, so re-running the stage only replays
+that stale hand-over.
+
+Fix: `mt7621_reset()` counts resets and sets `s->warm_boot` for every reset
+after the first; `loader.c` then takes the existing "step 2" path for uImage
+images (`bl_off` present): load the bootloader from the image at its load
+address and enter its entry point, exactly the state a cold boot hands over.
+`MT7621_STAGE1_WARM=1` forces the old behaviour for A/B.
+
+Verified with `breed-gapm7200-en.bin` (two monitor resets in a row: full
+banner each time, shell answers `help` after the last one) and with the
+byte-for-byte die image (Breed banner + `RouterBOOT booter 7.17` twice), plus
+Breed's own `reset` command.
+
+## 12. Probe-time RX interrupts: `ifconfig` right after `insmod raether.ko`
+
+Symptom (manual module path, traffic on the wire):
+
+```
+insmod raether.ko; ifconfig eth0 192.168.1.100 up
+CPU 0 Unable to handle kernel paging request ..., epc == 0, ra == 80286e44
+Kernel panic - not syncing: Fatal exception in interrupt
+```
+
+`ra` is `napi_poll()`'s `n->poll(n, weight)` and the NAPI has `poll == NULL`:
+the probe programs the rings and enables RX DMA with `INT_MASK` clear, frames
+arrive, `RX_DONE` is latched, and the first unmask (in `ndo_open`, before
+`netif_napi_add`) raises the line.  Waiting 25 s before `ifconfig` avoids it.
+
+Reproduced deterministically with a 300 ms broadcast on the model's peer
+(no netinstall needed).  Fix: `RX_DONE` is latched only while the driver has
+`RX_DONE` enabled — the real board does not see those frames because the
+switch does not forward to the CPU port until the port is up, and this model
+has no switch to enforce that.  `TX_DONE` must keep latching regardless of
+the mask: that is what fixes the separate `in_transmit:101` queue stall.
+`MT7621_MASKED_STATUS=1` restores mask-gated latching for both.
+
+Verified: immediate `ifconfig` with traffic -> `eth0: phy link up`, no panic;
+`sleep 25` then `ifconfig` -> link up.
+
+Still open in this area: `eth0..eth4: Caught tx_queue_len zero misconfig` and
+`soft lockup ... [ww2]` come from per-port state the switch driver builds from
+MT7530 registers that the model leaves at 0 (`mt7621_switch_defaults()` only
+presets `CREV`/`HWTRAP`).
+
+## 13. QDMA TX completion: publish to DRX (0x1b14), not only DTX (0x1b04)
+
+Symptom (mainline `mtk_soc_eth`, OpenWrt 6.6):
+
+```
+mtk_soc_eth 1e100000.ethernet eth0: NETDEV WATCHDOG: CPU: 0: transmit queue 3 timed out 5620 ms
+```
+
+repeating every ~5 s, while frames do leave the port.  The driver reclaims
+from the QDMA **DRX** pointer and requires the descriptor's owner bit:
+
+```
+	dma = mtk_r32(eth, reg_map->qdma.drx_ptr);      /* MTK_QTX_DRX_PTR 0x1b14 */
+	while ((cpu != dma) && budget) {
+		desc = ...desc->txd2...;
+		if ((desc->txd3 & TX_DMA_OWNER_CPU) == 0) break;
+	}
+```
+
+The model published DMA progress only to DTX (`0x1b04`, which is the DMA's
+own index), so `drx_ptr` never moved and no buffer was reclaimed.  Publish to
+both (DTX/DRX for context 0, `0x1b24`/`0x1b34` for the second context the
+driver programs for GMAC2).  Verified: 7 timeouts in 65 s before, 0 after,
+userspace reached; the die image still boots.
+
+The second QDMA TX context (`0x1b20` CTX / `0x1b24` DTX, GMAC2) is now
+modelled explicitly instead of being stored as an inert register.
+
+## 14. The 1004Kc is 2 cores x 2 VPs - and four registers have to say so
+
+Symptom: `VPE topology {2,2} total 4` was eventually printed, but the kernel
+still brought up one CPU (`smp: Brought up 1 node, 1 CPU`), or - with the
+topology fixed but the VPC mapping wrong - two (the boot core's VP0/VP1) while
+both VPs of core 1 stayed offline.
+
+The 1004Kc core implements **two VPEs with one TC each**, and Linux (`CONFIG_MIPS_MT_SMP=y`,
+`CONFIG_MIPS_CPS=y`) builds both its CPU topology and its secondary bring-up
+from that.  Four independent register values matter:
+
+1. **`CPC_Cx_CONFIG` at `0xc010`** (the CM >= 3.5 path, not the earlier
+   `GCR_Cx_CONFIG` at `GCR_CL_OTHER + 0`): `mips_cps_numvps()` returns
+   `PVPE + 1`, and this kernel reads only the CPC alias.  Returning 0 there
+   made a 2x2 part look like four single-VP cores (`{1,1,1,1}`).
+   `GCR_CONFIG.PCORES` must be "cores minus one" (1), not "VPs minus one".
+
+2. **`MVPConf0.PVPE`** (bits 14:10) is "VPEs per core minus one" and must be 1.
+   QEMU's `mvp_init()` leaves 0 (`TODO: actually do 2 VPEs`), which
+   * cps-vec's `mips_cps_get_bootcfg()` uses to mask `EBase.CPUNum` into a
+     VP id (mask 0 -> every VP computes VP0), and
+   * `mips_cps_core_init()` uses to decide whether to loop over the core's
+     VPEs at all ("If there's only 1, we're done"), so the second VP was
+     never bound (`mttc0 TCBIND`) or halted (`mttc0 TCHALT`), and
+     `mips_cps_boot_vpes()` then skipped it ("Skip the VPE if its TC is not
+     halted").
+
+3. **`GCR_CL_ID` (GCR+0x2028) is the *core* id**, not the VPE/cpu index:
+   `mips_cps_get_bootcfg()` indexes `mips_cps_core_bootcfg[core]` with it.
+   Returning the VPE index made the second VP of a core (and both VPs of
+   core 1) read past the end of that array.
+
+4. **`GCR_CL_COHERENCE` (GCR+0x2008) is per core.**  With one shared cell,
+   core 1 read the `0xff` the boot core had already written and skipped
+   `mips_cps_core_init()` entirely.  The model now keeps one byte per core
+   (`cm_coherent[]`), so a freshly released core starts non-coherent, runs
+   the cache/coherence setup and initialises its VPEs.
+
+Reset state and MT addressing complete the picture:
+
+* VPE0 of each core is the master VPE (`VPEConf0.MVP`); the other VPs come
+  out of reset halted and inactive (`TCHalt=1`, `TCStatus.A=0`, `VPA=0`).
+  QEMU's own MT reset block is skipped because it runs before
+  `mt7621_cpu_hw_config()` sets `Config3.MT`, so the model sets that state
+  itself, on every CPU reset.
+
+* `VPECONTROL.TARGTC` (bits 7:0) is a **TC number inside the processor
+  (core)**, which is what cps-vec's `mttc0` sequences rely on.  QEMU's
+  `mips_cpu_map_tc()` treated it as a global thread index
+  (`vpe_idx = tc / nr_threads`), which only coincides on a single-core MT
+  part: from cpu 2 it addressed cpu 0/1 instead of the other VP of core 1.
+  The machine now sets `CPUState.nr_threads` to the VPs per core, and
+  `mips_cpu_map_tc()` maps a core-local TC to `core * nr_threads + tc`
+  (each VPE has one TC here, so the local TC index is 0).
+
+* The translation-time gate in `gen_mftr()`/`gen_mttr()` rejected the whole
+  sequence: it NOPs when `TARGTC > MVPConf0.PTC`, and on a 1004K `PTC` is 0
+  (one TC per VPE) while `TARGTC` is 1 for the second VP of the core.  The
+  gate now asks whether the TC exists in the processor (`TARGTC < VPs per
+  core`) and whether the target is another VPE of this core, resolving the
+  target VCPU the same way as the runtime mapping.  (The helpers still
+  resolve `TARGTC` from the live register, so a translation that saw a stale
+  value cannot misdirect the access.)
+
+* `dvpe`/`evpe` are per processor: they must only affect the other VPEs of
+  the executing core.  QEMU's helpers iterated over every CPU, so releasing
+  core 1's VPs stopped the running boot core.
+
+Result: `CPU0..CPU3 revision is: 0001992f (MIPS 1004Kc)`,
+`VPE topology {2,2} total 4`, `smp: Brought up 1 node, 4 CPUs` - the
+board's own topology.  Verified over repeated boots (no soft lockups, no
+oops) and across a warm reset; `MT7621_VPS=1` restores the old flat
+`{1,1,1,1}` view and `MT7621_NO_MT=1` the "two cores, one VP each" one.
+
+## 15. CP0 compare: it is GIC local interrupt 2, not CPU interrupt pin 7
+
+Symptom: with all four CPUs up, OpenWrt 6.6 printed `irq 7: nobody cared` on
+the secondary CPUs (`handlers:` empty) and then disabled IRQ 7.  On the real
+LG-7200 with the same image there is **no irq 7 activity at all**:
+`/proc/interrupts` lists only GIC lines (`8: ... MIPS GIC Local 1 timer`, the
+IPIs, and the peripherals), no `7:` entry, no "spurious interrupt", no
+"nobody cared".  Both run the same `sync-r4k.c` path, so the compare is armed
+on both (`Synchronize counters for CPU 1..3: done.`).
+
+The difference is where the interrupt goes.  On a core covered by a
+Coherence Manager the CP0 count/compare interrupt is the GIC's **VP-local
+interrupt `GIC_LOCAL_INT_TIMER` (local 2)**, not the core's IP7 pin:
+
+* `arch/mips/include/asm/mips-gic.h`: `GIC_LOCAL_INT_COMPARE` (1) is the
+  GIC's own count/compare, `GIC_LOCAL_INT_TIMER` (2) is documented as the
+  "CP0 count/compare interrupt".
+* `gic_get_c0_compare_int()` maps the CP0 timer that way when the local
+  interrupt is routable; a guest enables it by setting the VP mask bit and
+  writing `GIC_VPE_TIMER_MAP` (`gic_all_vpes_irq_cpu_online()` writes
+  `BIT(GIC_LOCAL_INT_TIMER)` to `GIC_VPE_SMASK` and the map register).
+* On this image nothing ever enables local 2: `r4k_clockevent_init()` returns
+  `-ENXIO` because `mips_hpt_frequency` is never set on ramips/MIPS_GIC
+  (`arch/mips/ralink/timer-gic.c` only runs `of_clk_init()`/`timer_probe()`),
+  so the GIC clockevent (local 1) is the only timer.  The compare armed by
+  sync-r4k therefore latches in `GIC_VP_PEND` and is dropped by the GIC mask -
+  exactly what the board shows.  IP7 stays free for the GIC's shared
+  interrupts (the board DTB reserves it: `mti,reserved-cpu-vectors = <7>`).
+
+The model raised `Cause.IP7` directly from `cpu_mips_timer_expire()`, which is
+the pre-CM wiring, and `handle_percpu_irq()`'s ack/EOI pair (clear `IM7`,
+then `unmask_mips_irq`) re-enabled it while `Cause.TI` stayed latched: 100k
+deliveries later, `note_interrupt()` printed `irq 7: nobody cared`.
+
+Fixed by moving the delivery to the GIC:
+
+* `cpu_mips_timer_irq()` is a weak core hook carrying the old IP7 behaviour;
+  the mt7621 CM module overrides it and calls `mips_gic_local_irq(...,
+  GIC_LOCAL_INT_TIMER, level)`.
+* The GIC model now implements local 2 (pending bit, `GIC_VP_MASK` bit,
+  `GIC_VPE_TIMER_MAP`) and ORs it into the CPU pin evaluation together with
+  shared interrupts and local 1.  Masked, nothing is delivered - the board's
+  behaviour; enabled, it arrives on whichever pin the guest mapped.
+
+Result: OpenWrt boots cleanly (`Brought up 1 node, 4 CPUs`, no irq 7, no
+"Disabling IRQ"), `/proc/cpuinfo` matches the board (`core 0/0/1/1`,
+`VPE 0/1/0/1`, `ASEs: mips16 dsp mt`), and `/proc/interrupts` matches it too
+(only GIC lines, `Local 1 timer` per CPU).  Verified over repeated boots, a
+70 s run and a warm reset.
+
+The same probe explains the CP0 compare write race the model compensates
+for: a guest arms Compare from a Count it has just read, and host call
+latency can make a small delta (`read_c0_count() + 16`) arrive already behind
+the count.  The wrap-around interpretation then schedules the compare 2^32
+ticks (~4.9 s) later, which is what `c0_compare_int_usable()`'s 50-tick
+window rejects.  `cpu_mips_store_compare()` now distinguishes a fresh arm
+(`Cause.TI` clear) from an acknowledgment (`Cause.TI` set, e.g.
+`c0_compare_interrupt()`'s re-write of the same value): a fresh arm at most
+10 us behind expires immediately, an ack keeps the wrap semantics.
+`MT7621_NO_CMP_CLAMP=1` restores the old behaviour for A/B.
+
+## 16. The frame engine's owner changes at the hand-off (and GLO_CFG is not a plain register)
+
+Symptom (netinstall agent, `/init.real` start):
+
+```
+[   15.07] CPU 0 Unable to handle kernel paging request at virtual address 00000000
+           epc == 00000000, ra == 80286e44
+           Kernel panic - not syncing: Fatal exception in interrupt
+```
+
+`ra` is inside `napi_poll()`, at the `work = n->poll(n, n->weight)` indirect
+call, so a `napi_struct` had `->poll == NULL`.  Two model defects combined:
+
+1. **`ETH_PDMA_GLO_CFG` was captured by an early store-and-return** in
+   `mt7621_eth_write()`, before the handler that implements its semantics.
+   That handler starts the engines on the `TX_EN` 0->1 edge (kicking every
+   ring) and tracks `RX_EN`; with it unreachable, descriptors queued while
+   the driver had the engine off never got their edge kick (per-ring CTX
+   writes normally cover that, but not the first batch), and the RX side had
+   no notion of which engine generation owned the ring.
+
+2. **Frames were delivered into the bootloader's ring after the hand-off.**
+   RouterBOOT leaves `GLO_CFG = 0x45` (RX_EN set) and a live ring at
+   `0x0fddcd60`; the kernel reuses that RAM long before its driver probes the
+   MAC.  From the moment the kernel starts, every broadcast the installer
+   sends (PING/OFFR, every few seconds) was DMA-written into freed kernel
+   memory for ~15 s.  When `/init.real` brought the interface up and the first
+   RX interrupt ran `net_rx_action`, the corrupted `napi_struct` was called
+   through a NULL `->poll`.  A real part does not do this: the bootloader's
+   DMA configuration dies with the hand-off.
+
+Fix:
+
+* `PDMA_GLO_CFG` is handled only by the full handler (no early store).  Its
+  `TX_EN` 0->1 edge kicks all four rings, which is what starts the first
+  batch the driver queued with the engine off.
+* The RX ring base the bootloader armed is remembered whenever non-kernel code
+  programs it.  Ownership is then checked per delivered frame against who is
+  running on the boot CPU, and the discriminator is the **kernel text window**
+  (`0x80000000..0x801fffff`), not a "bootloader range": RouterBOOT runs both
+  at `0xa0201000` and from a relocated KSEG0 copy around `0x80e00000`, while
+  Breed (`0x8ff...`) and the stage-2 loader (`0x81000000`) are elsewhere.  A
+  range test for bootloader addresses therefore refused RouterBOOT's own
+  BOOTP/TFTP replies and the board never fetched the agent; while the
+  bootloader is not in the kernel window its ring stays live, and once the
+  kernel's text runs, frames for the bootloader's ring are refused until the
+  driver programs its own base (`RX_2B_OFFSET` set).  A timer-polled
+  "hand-off" flag was tried first and is not sufficient either: RouterOS's
+  boot path never trips that poll.  The per-frame check needs no timing
+  assumptions.
+
+A third, independent defect produced the same crash *before any frame
+arrives* (confirmed by the user: "immediate, before broadcast and offer
+begins").  The bootloader leaves the engine's latched interrupt status set
+(the model's `TX_DONE` latch is deliberately mask-independent, and a final
+bootloader RX can remain pending), and `raether` enables `INT_MASK`
+(`0x3000f`) *before* `netif_napi_add()` and before `request_irq` unmasks the
+line.  A stale `RX_DONE0` therefore fires the instant the mask is enabled,
+`napi_schedule` runs on a zeroed `napi_struct`, and `net_rx_action` calls a
+NULL `->poll`.  The engine's status belongs to the firmware generation: the
+first 0 -> non-zero `INT_MASK` write (and a MAC reset, `GLO_CFG` with both
+engines off) discards it, logging
+
+```
+mt7621: eth: discarded firmware interrupt status 00010000 at driver unmask
+```
+
+Verified on the OpenWrt image with a socket netdev: the bootloader's 42-byte
+ARP frames are delivered into its ring, the stale `RX_DONE0` is discarded at
+the driver's first unmask, frames for the old ring are refused between the
+hand-off and the driver probe, and delivery resumes into the kernel's own
+ring (`base=02da4000 cnt=512`, tagged, `linux=1`); the guest still boots with
+`{2,2}` / four CPUs, no irq 7 activity and survives a warm reset.
+
+## 17. A reset resets every controller, not just the CPU
+
+The machine used to reset a handful of fields inline (`nfi_regs`, the SPI
+register file, the ethernet engine, systick) and rely on the rest being
+harmless.  That is how the model accumulated "which latch did *this* boot
+leave behind?" bugs, one per report.  A real reset clears the whole SoC, so
+`mt7621_reset()` now calls one complete reset per block and nothing else:
+
+| block | reset | clears |
+|---|---|---|
+| SYSCTL | `mt7621_sysctl_reset` | whole 0x1e000000 window, straps, `SYS_RSTSTAT` latch |
+| MEMC | `mt7621_dramc_reset` | PLL/DDR defaults (the trained values the BootROM leaves) |
+| WDT | `mt7621_wdt_reset` | armed bark `QEMUTimer`, timer block, cause flag |
+| CM/CPC | `mt7621_cm_reset` | `GCR_*`/`CPC_*`, per-core coherence, core-selector latches |
+| NFI | `mt7621_nfi_reset` | register file, FIFOs, address stream, pending read, program buffer/FDM |
+| SPI | `mt7621_spi_reset` | controller registers, RX FIFO, command/address latch |
+| eth | `mt7621_eth_dev_reset` | PDMA/QDMA/QDMA ring indices, MT7530 file, PHYs, GIC line |
+| xHCI/IPPC | `mt7621_usb_reset` | whole MAC + port-power window |
+| EIP-93 | `mt7621_crypto_reset` | register file |
+| systick | `mt7621_systick_reset` | registers, both timers, counter anchor, GIC line |
+| L1D | `mt7621_dcache_reset` | tags/line geometry from the new `Config1` |
+| bring-up | `mt7621_loader_reset` | hand-off latch, kernel-text polls, PC history, budgets |
+
+Deliberately *not* reset: DRAM and its aliases (a warm reset keeps memory,
+which the bootloader's warm path depends on), the NAND medium and SPI NOR
+contents (flash is not erased by a reset), the board's strapping properties,
+and the debug sinks.  Order matters only where a default consumes a latched
+value: SYSCTL runs first because it folds a watchdog cause into `SYS_RSTSTAT`
+before `mt7621_wdt_reset` drops the flag, and systick runs last because its
+reset releases the GIC line that the BootROM hand-over then re-arms.
+
+`MT7621_NAND_SNAP=<file>` writes the medium at the first *real* reset (not the
+one QEMU performs while starting the machine), and `MT7621_TAGLOG_BOOT=<p>`
+keeps one NFI read trace per boot in `<p>.0`, `<p>.1`, …; a `pageread:` line
+carries the resolved row, offset, first word and address latch, which is what
+made the truncation below visible.
+
+## 18. Warm reboot loads a truncated kernel: the guest's yaffs GC erases it
+
+Symptom (RouterOS installed on the die image): the first boot is fine, a
+`/system reboot` after a few minutes prints
+
+```
+[NB] hdr=0000086a size=0020aa20 obj=00010100 seq=001011ff
+[NB] chunks=00000415          <- one chunk short of need=1046
+[NB] anchor=00000870
+jumping to kernel code
+```
+and then nothing at all - no `Initial ramdisk`, no kernel banner.
+
+It is not a reset leak.  A byte-for-byte snapshot of the medium at the reset
+(`MT7621_NAND_SNAP`) is identical to the boot dump, and the per-boot read
+trace differs only where the *guest* had erased pages: during boot 0 the
+running system's yaffs garbage collector erases block 22 (`0x580-0x5bf`) and
+block 36 (`0x900-0x92d`), writes 108 of the 110 live pages into block 37+
+(`0x940-0x9ab`), and drops two pages: `0x5a6` (a yaffs metadata page of a
+different object, `obj=0x100` - correctly dropped) and `0x92d`, the page our
+loader maps to the last chunk of the kernel object (`obj=0x10100`,
+`chunk=1046`, `seq=0x101500`, the file's partial 544-byte tail).
+
+The cave reads raw tags and takes the highest `seq` per chunk; yaffs takes its
+own liveness decision and, for that page, decides it is dead.  When the page
+is erased, the loader has no copy to fall back to, so the object it assembles
+is short by one chunk - and because the missing chunk sits at the end of the
+ELF (section header table), the loader hands the stub a truncated image and
+the boot dies before the console exists.
+
+### 18.1 Root cause: the page is an artifact of our offline image builder
+
+`0x92d` does not exist on the board.  Its own dump
+(`~/Downloads/backup-flash-dump-lg7200.bin`, the raw capture) has that row
+**erased** (data `ff…`, spare `ff…`); the board's `kernel` object is 1045
+chunks (2138356 B) and ends at `0x92c`.  Our boot image has 1046 chunks
+(2140704 B) because the console-patched kernel was injected offline with
+`nandboot/rb-nand-kernel.py put`, which for a chunk that has no page yet
+allocates one and then writes
+
+    sp = bytearray(template)      # template = chunk 1's page (0x870), 64 B: tag *and* ECC
+    pack seq/obj/chunk            # only these three fields are updated
+    -> the page claims chunk 1046 but carries chunk 1's ECC bytes
+
+Measured: across all 65536 pages there is exactly one pair with different data
+but the same 32-byte ECC field, `0x870`/`0x92d`; the tag fields differ only in
+`seq` and `chunk`.  Hardware ECC over different data cannot be equal, so those
+bytes were written by software - and the writer was us.
+
+The emulator never writes that page (per-run `nand-wr:` trace: programs at
+`2350+`, `9976+`, `1024/1025/1056/1057`; none at `2349`), so the defect is
+entirely in the image we start from.  yaffs sees a tag whose protection bytes
+belong to another page, treats the chunk as dead, and its GC drops it; on real
+hardware the same page would have been rejected at read time by the ECC engine
+before any of this.
+
+`rb-nand-kernel.py put` now **refuses** to allocate pages unless
+`--allow-emulator-alloc` is given, and says why.  The clean way to grow the
+object is to write it through yaffs (install it, or copy the file inside the
+filesystem) so the controller synthesises tag + ECC.  The model's own ECC
+engine is a stub (§18.2), so pages written *in* the emulator get `0xff` ECC -
+fine for emulator-only images, invalid on flash.
+
+### 18.2 The model cannot validate ECC either
+
+Under this model that path is not exercised: the emulated NFI's ECC block is a
+stub (`0x914` falls into the "no corrected/uncorrectable bits" branch, `0x90c`
+reports idle, `0x918` reports every sector done).  A real BCH encoder/decoder
+over `512+8` bytes with 8 parity bytes per sector (strength 4, 13 parity bits)
+would be needed before QEMU can reproduce "this page's tag does not decode";
+until then the only ECC-faithful test of either the writer or the loader is
+hardware.  What the emulator *can* show - and did - is the guard: a short load
+prints `chunks=N/need`, the missing chunk, `REFUSING: ELF tail missing`, and
+the stock ` kernel not found or data is corrupted`, instead of hanging.
+
+### 18.3 Loader side
+
+`nandboot/nand.c` now reads every page the way yaffs does: decoder on, per-sector
+`DECENUM` checked (0xf = uncorrectable), `DECEL` positions applied to data *and*
+FDM, and a page that fails is invisible to the header scan, the chunk map and the
+copy. On failure it prints the stock ` kernel not found or data is corrupted` and
+returns -1 instead of jumping.
+
+Under this model that path is **not exercised**: the emulated NFI's ECC block is
+a stub (`0x914` falls into the "no corrected/uncorrectable bits" branch, `0x90c`
+reports idle, `0x918` reports every sector done). A real BCH encoder/decoder over
+`512+8` bytes with 8 parity bytes per sector (strength 4, 13 parity bits) would
+be needed before QEMU can reproduce "this page's tag does not decode". Until
+then, the only ECC-faithful test of the loader is hardware; QEMU proves the
+no-regression path (the cave still finds all 1046 chunks when the medium has
+them).
