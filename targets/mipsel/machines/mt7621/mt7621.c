@@ -34,6 +34,7 @@
 #include "hw/sysbus.h"
 #include "net/net.h"
 #include "qemu/main-loop.h"
+#include "exec/icount.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/system.h"
@@ -178,6 +179,7 @@ static void mt7621_rstctl_write(void *opaque, hwaddr addr, uint64_t val,
             fprintf(stderr, "mt7621: guest requested a reset, holding\n");
             return;
         }
+        mt7621_eth_quiesce(s);
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
@@ -226,7 +228,7 @@ static void mt7621_gic_reset(void *opaque)
     mt7621_gic_default_map(opaque);
 }
 
-static void mt7621_sysctl_defaults(MT7621State *s)
+static void mt7621_sysctl_reset(MT7621State *s)
 {
     memset(s->sysctl_regs, 0, sizeof(s->sysctl_regs));
     /*
@@ -266,10 +268,34 @@ static void mt7621_sysctl_defaults(MT7621State *s)
      */
     {
         const char *cfg0 = getenv("MT7621_SYSCFG0");
+        /*
+         * The board's own booter dump (real lg-gapm7200, etherboot working)
+         * reads SYS_SYSCFG0 back as 0x000232c1 - CHIP_MODE, DDR type, the
+         * 40 MHz xtal in bits 8:6 (= 3) and bits 12/13/17.  The generic
+         * 0x100 | CHIP_MODE value only agreed on the xtal, and the booter
+         * derives its Ethernet descriptor set from these straps, so the
+         * board gets its real value here.
+         */
+        uint32_t board_cfg0 = s->board == MT7621_BOARD_LG_GAPM7200
+                              ? 0x000232c1u
+                              : (0x00000100u | s->chip_mode);
 
         s->sysctl_regs[SYS_SYSCFG0 / 4] = cfg0
             ? (uint32_t)strtoul(cfg0, NULL, 0)
-            : (0x00000100 | s->chip_mode);
+            : board_cfg0;
+    }
+    /*
+     * Offset 0x58: the same board dump reads 0x0a210a01 there and the
+     * generic model left it zero.  MT7621_SYSCTL58 overrides for A/B.
+     */
+    {
+        const char *v58 = getenv("MT7621_SYSCTL58");
+
+        if (v58) {
+            s->sysctl_regs[0x58 / 4] = (uint32_t)strtoul(v58, NULL, 0);
+        } else if (s->board == MT7621_BOARD_LG_GAPM7200) {
+            s->sysctl_regs[0x58 / 4] = 0x0a210a01u;
+        }
     }
     /*
      * CPLL clock config.  RouterBOOT programs 0x40800000 on the RB750Gr3,
@@ -310,7 +336,7 @@ static void mt7621_sysctl_defaults(MT7621State *s)
     }
 }
 
-static void mt7621_dramc_defaults(MT7621State *s)
+static void mt7621_dramc_reset(MT7621State *s)
 {
     memset(s->dramc_regs, 0, sizeof(s->dramc_regs));
     {
@@ -347,8 +373,16 @@ static void mt7621_dramc_defaults(MT7621State *s)
     {
         const char *pll = getenv("MT7621_CPU_PLL");
 
+        /*
+         * The value the real BootROM's DDR-init stage leaves in the MEMC PLL
+         * (traced: 0xc2005ab2).  It is what the bootloader reads to report
+         * "CPU frequency: 880 MHz"; the previous model default (FBDIV 21,
+         * PREDIV 0 = 0x150) is decoded by the booter as 440 MHz.  A cold boot
+         * was masked by the stage-1 write, but a warm reset skips stage 1 (the
+         * DRAM is already trained at that PLL) and then reported half speed.
+         */
         s->dramc_regs[0x648 / 4] = pll ? (uint32_t)strtoul(pll, NULL, 0)
-                                       : ((21 << 4) | (0 << 12)); /* 880MHz */
+                                       : 0xc2005ab2u;      /* 880MHz */
     }
     {
         const char *ddr = getenv("MT7621_DDR_PLL");
@@ -376,6 +410,10 @@ static void mt7621_dramc_defaults(MT7621State *s)
  * is written to the system controller, so the only way to notice is that a
  * CPU which can no longer be woken stays halted.
  */
+/* CP0 Count, for the per-CPU skew fix in the CM and the diagnostic below. */
+uint32_t cpu_mips_get_count(CPUMIPSState *env);
+void cpu_mips_store_count(CPUMIPSState *env, uint32_t value);
+
 static void mt7621_poweroff_poll(void *opaque)
 {
     MT7621State *s = opaque;
@@ -388,6 +426,29 @@ static void mt7621_poweroff_poll(void *opaque)
      * The netboot path hands over from a bootloader that has been running for
      * seconds, so the state it leaves behind matters.
      */
+    /*
+     * MT7621_COUNTLOG: per-CPU CP0 Count against the virtual clock.  The
+     * guest derives sched_clock from Count and timekeeping from the GIC
+     * counter, so a per-CPU baseline that differs shows up here as CPUs
+     * that are not in step.
+     */
+    if (getenv("MT7621_COUNTLOG") && s->cpu) {
+        static int64_t countlog_last;
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        if (now - countlog_last >= 500 * 1000000LL) {
+            int ci;
+
+            countlog_last = now;
+            fprintf(stderr, "countlog: t=%" PRIi64 "ms", now / 1000000);
+            for (ci = 0; ci < (int)s->ncpus; ci++) {
+                fprintf(stderr, " c%d=%" PRIu32, ci,
+                        cpu_mips_get_count(&s->cpus[ci]->env));
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     if (getenv("MT7621_ENTRYLOG") && s->cpu) {
         uint32_t hpc = env->active_tc.PC;
 
@@ -412,6 +473,132 @@ static void mt7621_poweroff_poll(void *opaque)
             fprintf(stderr, "\n");
         }
     }
+    /*
+     * Diagnostic: register dump at one PC (MT7621_PCHIT=0x...), a few times
+     * per boot.  A bootloader that takes a different branch after a warm
+     * reset is a register/memory difference, not a code difference.
+     */
+    if (getenv("MT7621_PCHIT") && s->cpu && s->pchit_budget > 0) {
+        uint32_t hit = (uint32_t)strtoul(getenv("MT7621_PCHIT"), NULL, 0);
+
+        if ((uint32_t)env->active_tc.PC == hit) {
+            int r;
+
+            s->pchit_budget--;
+            fprintf(stderr, "pchit pc=%08x", hit);
+            for (r = 1; r <= 31; r++) {
+                fprintf(stderr, " r%d=%08x", r,
+                        (uint32_t)env->active_tc.gpr[r]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+    /*
+     * Bootloader -> kernel hand-off.  RouterBOOT and Breed use CP0
+     * Count/Compare as a delay timer and jump to the kernel with the last
+     * Compare still armed (Breed: 0x00432380).  A kernel whose clockevent is
+     * the GIC compare never claims IP7, so the stale compare expires on the
+     * next Count wrap and every expiry is an unhandled "irq 7: nobody
+     * cared", which the kernel then disables - the real board does not show
+     * this.  Track the bootloader's arming state instead of a one-shot: the
+     * bootloader may briefly run in the kernel window during its own boot,
+     * then arm its delay timer again before the real hand-off.
+     *
+     * MT7621_NO_HANDOFF_TIMER_CLR=1 disables it for A/B.
+     */
+    if (s->cpu) {
+        uint32_t pc = (uint32_t)env->active_tc.PC;
+        bool boot_range = (pc >= 0xa0000000u) ||
+                          (pc >= 0x8f000000u && pc < 0x90000000u);
+
+        if (boot_range) {
+            s->seen_boot = true;
+            s->kernel_hits = 0;
+            if (env->CP0_Compare) {
+                s->bl_timer_armed = true;
+            }
+        } else if (!s->handoff_done) {
+            if (pc >= 0x80000000u && pc < 0x80200000u) {
+                s->kernel_hits++;
+            } else {
+                s->kernel_hits = 0;
+            }
+        }
+        if (!s->handoff_done && s->seen_boot && s->kernel_hits >= 2) {
+            /*
+             * The Linux kernel's text is the only thing that runs in
+             * 0x80000000..0x801fffff on this boot path (Breed is at 0x8ff...,
+             * the stage-2 loader at 0x81000000, RouterBOOT at 0xa0201000 and
+             * in its relocated KSEG0 copy at 0x80e00000), so the first kernel
+             * PC after bootloader code is the hand-off.  Latching this does
+             * not depend on the bootloader having armed CP0 Compare - relying
+             * on that (or on sampling the live PC per frame) missed the
+             * hand-off entirely on some images and then refused the kernel
+             * driver's own RX ring, which looked like "no RX and no TX".
+             */
+            s->bl_timer_armed = false;
+            s->handoff_done = true;
+            fprintf(stderr, "mt7621: kernel hand-off at pc=%08x: frame "
+                    "engine ownership changes (boot RX ring %08x dormant)\n",
+                    pc, s->bl_rx_base);
+            if (!getenv("MT7621_NO_HANDOFF_TIMER_CLR")) {
+                env->CP0_Count = 0;
+                env->CP0_Compare = 0;
+                env->CP0_Cause &= ~(1 << 9);     /* CP0Ca_TI */
+                if (getenv("MT7621_BOOTLOG")) {
+                    fprintf(stderr, "mt7621: hand-off at pc=%08x: CP0 timer "
+                            "cleared\n", pc);
+                }
+            }
+        }
+    }
+    /* Diagnostic: the first PCs the guest executes after reset. */
+    if (getenv("MT7621_BOOTLOG") && s->cpu) {
+        if (s->bootlog_budget-- > 0) {
+            fprintf(stderr, "bootpc: pc=%08x entry=%08x status=%08x\n",
+                    (uint32_t)env->active_tc.PC, (uint32_t)s->entry,
+                    env->CP0_Status);
+        }
+    }
+
+    /*
+     * Diagnostic: TLB-miss exceptions.  EXCLOG below deliberately filters
+     * these out (codes 1/2/3/8 are normal user-space traffic), but a guest
+     * that loops in its TLB-refill handler shows nothing else: the handler is
+     * entered, cannot map the address and returns into the same instruction.
+     * Log the first few with BadVAddr and the faulting words, which is what
+     * names the pointer that went out of range.
+     */
+    if (getenv("MT7621_TLBLOG") && s->cpu) {
+        static int tlb_budget = 48;
+        uint32_t cause = env->CP0_Cause;
+        unsigned code = (cause >> 2) & 0x1f;
+
+        /*
+         * User-space misses would eat the budget long before a booter fault,
+         * so MT7621_TLBLOG_MIN=<pc> restricts the log to faults at or above
+         * that address (e.g. 0x81000000 keeps only the booter's own).
+         */
+        const char *tlb_min = getenv("MT7621_TLBLOG_MIN");
+
+        if (tlb_min &&
+            (uint32_t)env->active_tc.PC < (uint32_t)strtoul(tlb_min, NULL, 0)) {
+            return;
+        }
+
+        if ((code == 1 || code == 2 || code == 3 || code == 8) &&
+            tlb_budget-- > 0) {
+            uint32_t epc = (uint32_t)env->CP0_EPC;
+            uint32_t prev = cpu_ldl_code(env, epc - 4);
+            uint32_t insn = cpu_ldl_code(env, epc);
+
+            fprintf(stderr, "tlbmiss: code=%u pc=%08x epc=%08x "
+                    "badvaddr=%08x cause=%08x prev=%08x insn=%08x\n",
+                    code, (uint32_t)env->active_tc.PC, epc,
+                    (uint32_t)env->CP0_BadVAddr, cause, prev, insn);
+        }
+    }
+
     /* Diagnostic: report every architectural exception the guest takes. */
     if (getenv("MT7621_EXCLOG") && s->cpu) {
         static int exc_budget = 4096;
@@ -500,9 +687,16 @@ static void mt7621_poweroff_poll(void *opaque)
         s->halt_ticks = 0;
     }
 
+    {
+        extern void mips_gic_level_report(void);
+        mips_gic_level_report();
+    }
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ? 1 : 250));
+              ((!s->handoff_done ||
+                getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ||
+                getenv("MT7621_TLBLOG") || getenv("MT7621_BOOTLOG"))
+               ? 1 : 250));
 }
 
 /*
@@ -645,16 +839,27 @@ static void mt7621_cmdline_poll(void *opaque)
     }
 }
 
-static void mt7621_reset(void *opaque)
+/*
+ * CPU configuration registers for the MT7621's 1004Kc.
+ *
+ * These must be applied *after* cpu_reset(), which reloads every CP0 config
+ * register from the CPU model.  mt7621_reset() (the machine reset handler)
+ * runs before the per-CPU handlers, so anything it writes to Config1/2/3/7
+ * is overwritten - that is how Config3.MT kept vanishing and why the SMP
+ * topology could never be made to stick.  Every CPU applies this from its own
+ * reset handler, so cores and re-released VPs all see the same hardware.
+ */
+void mt7621_cpu_hw_config(MT7621State *s, CPUMIPSState *env)
 {
-    MT7621State *s = opaque;
-    CPUMIPSState *env = &s->cpu->env;
-
-    if (getenv("MT7621_RSTLOG")) {
-        fprintf(stderr, "mt7621: machine reset, cpu pc=%08x ra=%08x\n",
-                env->active_tc.PC, env->active_tc.gpr[31]);
-    }
-
+    /*
+     * Config0.M (bit 31): "more configuration registers present".  The
+     * kernel walks Config1 -> Config2 -> Config3 only while each previous
+     * register has this bit set (decode_configs()).  The 1004Kc has it set;
+     * without it the guest never reads Config2/Config3, so neither the L2/M
+     * bits nor MIPS_ASE_MIPSMT (Config3.MT) are ever seen - which is why
+     * mips_cps_numvps() kept returning 1 even with CONFIG_MIPS_MT_SMP=y.
+     */
+    env->CP0_Config0 |= (1u << 31);
     /*
      * The real 1004Kc advertises ULRI + CMGCR, but with them visible this
      * model's OpenWrt guests take the MIPS CPS path and die before printing
@@ -674,6 +879,23 @@ static void mt7621_reset(void *opaque)
     }
     if (getenv("MT7621_CFG2")) {
         env->CP0_Config2 = strtoul(getenv("MT7621_CFG2"), NULL, 0);
+    } else if (!getenv("MT7621_NO_L2")) {
+        /*
+         * The board's own CPU reports a 256 KiB, 8-way, 32-byte-line L2
+         * (OpenWrt on hardware: "MIPS secondary cache 256kB, 8-way,
+         * linesize 32 bytes"); Config2.SL=0 hides it and the kernel boots
+         * without any secondary cache.  Fields: SA(3:0)=ways-1=7,
+         * SL(7:4)=line/2-1=3?  measured below, SS(11:8) selects the size.
+         * Measured against the guest's own decode: 0x447 prints exactly
+         * 256kB/8-way/32B.  MT7621_NO_L2=1 hides it again for A/B.
+         */
+        /*
+         * The M bit (31) is not decoration: decode_configs() reads
+         * Config3/4/5 only while the previous register has it set.  With
+         * Config2.M clear the kernel never read Config3 at all - no CM
+         * (CMGCR): "MIPS CPS SMP unable to proceed without a CM", and no MT.
+         */
+        env->CP0_Config2 = 0x80000447;
     }
     if (getenv("MT7621_CFG3")) {
         env->CP0_Config3 = strtoul(getenv("MT7621_CFG3"), NULL, 0);
@@ -683,6 +905,55 @@ static void mt7621_reset(void *opaque)
         timer_del(s->wdt_timer);
     }
 
+    /*
+     * Config7.AR: the MT7621's 1004K reports its D-cache as effectively
+     * physically indexed ("address recognition"), which is why OpenWrt on
+     * hardware prints "Primary data cache 32kB, 4-way, PIPT, no aliases"
+     * while this model printed VIPT/aliases (c-r4k.c only sets
+     * MIPS_CACHE_PINDEX when Config7.AR is readable).  With AR clear the
+     * guest also believes it has virtual aliases and (RouterOS) drops to a
+     * single core.  MT7621_NO_AR=1 restores the old view for A/B.
+     */
+    /*
+     * The 1004K core is multithreaded: Config3.MT describes 2 VPs (hardware
+     * threads) per core, which is what the board's kernel reports as
+     * "VPE topology {2,2}".  Without it mips_cps_numvps() returns 1 and the
+     * CM's PVPE field is ignored.  MT7621_NO_MT=1 restores the old view.
+     */
+    if (!getenv("MT7621_NO_MT")) {
+        env->CP0_Config3 |= (1u << 2);      /* CP0C3_MT */
+    }
+    if (s->cm_vps > 1 && !getenv("MT7621_NO_MT")) {
+        /*
+         * The MT half of the same hardware description.  The 1004Kc core
+         * implements two VPEs with one TC each, so:
+         *
+         *  - MVPConf0.PVPE is "VPEs minus one" (1).  cps-vec reads it to
+         *    size the VPE loop and to derive the EBase.CPUNum mask, and
+         *    QEMU's default of 0 hides the second VPE from both.
+         *  - VPE0 of each core is the master VPE (MVP); a core reset leaves
+         *    the other VPEs halted and inactive until the boot VPE starts
+         *    them (cps-vec's mips_cps_core_init()/mips_cps_boot_vpes()).
+         *
+         * Both are core properties, applied on every CPU reset.
+         */
+        CPUState *cs = env_cpu(env);
+        unsigned vp = cs->cpu_index % s->cm_vps;
+
+        cs->nr_threads = s->cm_vps;
+        env->mvp->CP0_MVPConf0 &= ~(0x1fu << CP0MVPC0_PVPE);
+        env->mvp->CP0_MVPConf0 |= (s->cm_vps - 1) << CP0MVPC0_PVPE;
+        if (vp == 0) {
+            env->CP0_VPEConf0 |= (1u << CP0VPEC0_MVP);
+        } else {
+            env->CP0_VPEConf0 &= ~(1u << CP0VPEC0_VPA);
+            env->active_tc.CP0_TCStatus = 0;
+            env->active_tc.CP0_TCHalt = 1;
+        }
+    }
+    if (!getenv("MT7621_NO_AR")) {
+        env->CP0_Config7 |= (1u << 16);      /* MIPS_CONF7_AR */
+    }
     if (s->cfg1_cache_fields) {
         env->CP0_Config1 = (env->CP0_Config1 & ~0xffffu) |
                            s->cfg1_cache_fields;
@@ -729,6 +1000,41 @@ static void mt7621_reset(void *opaque)
                                ((strtoul(dl, NULL, 0) & 7) << 10);
         }
     }
+    if (getenv("MT7621_RSTLOG")) {
+        fprintf(stderr, "cpu hw cfg: cfg1=%08x cfg2=%08x cfg3=%08x cfg7=%08x\n",
+                (uint32_t)env->CP0_Config1, (uint32_t)env->CP0_Config2,
+                (uint32_t)env->CP0_Config3, (uint32_t)env->CP0_Config7);
+    }
+}
+static void mt7621_reset(void *opaque)
+{
+    MT7621State *s = opaque;
+    CPUMIPSState *env = &s->cpu->env;
+
+    /*
+     * Cold boot runs the BootROM's DDR-init stage; a warm reset does not need
+     * it (DRAM is trained), and re-running it on this model ends in a stale
+     * hand-over: the stage returns into state left by the previous boot and
+     * the CPU ends up executing at 0xd10, so the bootloader never restarts
+     * (no banner, no output).  The real BootROM detects the trained DRAM and
+     * skips the training work, so entering the bootloader directly is the
+     * same end state; MT7621_STAGE1_WARM=1 forces the stage anyway.
+     */
+    s->reset_count++;
+    s->warm_boot = s->reset_count > 1 && !getenv("MT7621_STAGE1_WARM");
+    s->pchit_budget = 4;
+    {
+        const char *n = getenv("MT7621_BOOTLOG_N");
+
+        s->bootlog_budget = n ? atoi(n) : 40;
+    }
+    if (getenv("MT7621_RSTLOG")) {
+        fprintf(stderr, "mt7621: machine reset, cpu pc=%08x ra=%08x "
+                "cfg3=%08x cfg7=%08x\n",
+                env->active_tc.PC, env->active_tc.gpr[31],
+                (uint32_t)env->CP0_Config3, (uint32_t)env->CP0_Config7);
+    }
+
     /*
      * MT7621_CFGLOG=1 prints the line size the guest will actually see, so a
      * test that means to run at a given Dl can assert it instead of assuming
@@ -742,28 +1048,56 @@ static void mt7621_reset(void *opaque)
                 (uint32_t)env->CP0_Config1, dl, 1u << (dl + 1));
     }
 
-    mt7621_dcache_reset(s);
+    /*
+     * MT7621_NAND_SNAP: keep a copy of the medium as the guest left it, the
+     * first time the machine resets.  Whatever the running system programmed
+     * or erased is what the next boot's loader has to cope with.
+     */
+    mt7621_nand_taglog_boot_open();
+    {
+        const char *snap = getenv("MT7621_NAND_SNAP");
 
-    /* Everything the guest programmed is gone after a real reset. */
-    mt7621_eth_dev_reset(s);
-    memset(s->nfi_regs, 0, sizeof(s->nfi_regs));
-    memset(s->spi_regs, 0, sizeof(s->spi_regs));
-    s->spi_read_mode = false;
-    s->spi_addr = 0;
-    s->nfi_fifo_len = 0;
-    s->nfi_fifo_pos = 0;
-    s->nfi_col = 0;
-    s->nfi_row = 0;
-    s->nfi_served = 0;
-    s->nfi_last_cmd = 0;
-    s->nfi_addr_len = 0;
-    s->nfi_addr_pending = 0;
-    s->nfi_wbuf_len = 0;
-    s->nfi_writing = false;
-    mt7621_sysctl_defaults(s);
-    mt7621_dramc_defaults(s);
-    mt7621_cm_defaults(s);
-    memset(s->systick_regs, 0, sizeof(s->systick_regs));
+        /*
+         * reset_count == 1 is the reset QEMU performs while starting the
+         * machine (before the guest has run a single instruction); the medium
+         * at that point is the boot dump and says nothing about what the
+         * guest changed.  Only capture from the second reset on.
+         */
+        if (snap && s->reset_count > 1 && access(snap, F_OK) != 0) {
+            mt7621_nand_snapshot(s, snap);
+        }
+    }
+
+    /*
+     * A real reset clears every controller on the SoC, so a reboot never
+     * inherits state from the system it replaced.  Each block resets itself
+     * completely - register file, FIFOs, latches, pending interrupts - and
+     * the order below is the only place that knows about dependencies:
+     *
+     *   sysctl  first, because it latches a recorded watchdog reset cause
+     *           into SYS_RSTSTAT before wdt_reset() drops the cause flag;
+     *   CM      next: the core/VPE geometry it reports comes from ncpus and
+     *           the MT7621_VPS knob, not from anything the guest wrote;
+     *   systick last: its reset releases the GIC line, and the BootROM
+     *           hand-over at the end of this function re-arms the counter.
+     *
+     * Deliberately not touched: DRAM and its aliases (contents survive a warm
+     * reset, which is what the bootloader's warm path relies on), the NAND
+     * medium and the SPI NOR contents (flash is not erased by a reset), the
+     * board's strapping properties, and the debug sinks.
+     */
+    mt7621_sysctl_reset(s);      /* SYSCTL window + straps + RSTSTAT */
+    mt7621_dramc_reset(s);       /* MEMC/PLL defaults */
+    mt7621_wdt_reset(s);         /* timer block, armed bark, cause flag */
+    mt7621_cm_reset(s);          /* GCR/CPC + core-selector latches */
+    mt7621_nfi_reset(s);         /* NFI: regs, FIFOs, address/read latches */
+    mt7621_spi_reset(s);         /* SPI controller; NOR contents kept */
+    mt7621_eth_dev_reset(s);     /* frame engine, switch, PHYs, GIC line */
+    mt7621_usb_reset(s);         /* xHCI MAC + IPPC */
+    mt7621_crypto_reset(s);      /* EIP-93 register file */
+    mt7621_systick_reset(s);     /* regs, both timers, GIC line */
+    mt7621_dcache_reset(s);      /* L1D tags/line geometry */
+    mt7621_loader_reset(s);      /* per-boot bring-up latches */
 
     /*
      * Linux scribbled over the RAM the bootloader lived in, so the BootROM
@@ -775,6 +1109,18 @@ static void mt7621_reset(void *opaque)
 
     /* Malta does the same when a -kernel image is supplied. */
     env->CP0_Status &= ~(1 << 2); /* CP0St_ERL */
+    /*
+     * The hand-over must not inherit the bootloader's CP0 timer.  RouterBOOT
+     * and Breed both use Count/Compare as a delay timer (Breed's last write
+     * is e.g. Compare=0x00432380), and a kernel whose clockevent is the GIC
+     * compare never claims IP7: the stale Compare then expires on the next
+     * Count wrap and every expiry is an unhandled "irq 7: nobody cared",
+     * which the kernel eventually disables.  A real reset clears the timer;
+     * clear it here so the guest starts from the same state.
+     */
+    env->CP0_Count = 0;
+    env->CP0_Compare = 0;
+    env->CP0_Cause &= ~(1 << 9);         /* CP0Ca_TI */
     env->active_tc.PC = s->entry;
     if (getenv("MT7621_ENTRY_DIRTY") && s->elf_kernel) {
         /* reproduce the CP0/TLB state RouterBOOT leaves at the hand-over */
@@ -826,6 +1172,64 @@ static void mt7621_reset(void *opaque)
 
 }
 
+/*
+ * MT7621_PERIPHSPY: name the peripheral-window offsets that no block answers.
+ *
+ * The peripheral container covers 1 MiB from 0x1e000000.  A guest access with
+ * no subregion behind it reads as zero and writes vanish, which is silent by
+ * design - and useless when a device is modelled at the wrong address.  This
+ * catch-all is registered before the real blocks (so it is always overridden
+ * where a model exists) and reports what falls through it.
+ *
+ * MT7621_PERIPHSPY_LO / _HI narrow the report to an absolute address range,
+ * because early boot touches a lot of unused space.
+ */
+static bool mt7621_spy_wanted(hwaddr pa)
+{
+    const char *lo = getenv("MT7621_PERIPHSPY_LO");
+    const char *hi = getenv("MT7621_PERIPHSPY_HI");
+
+    if (lo && pa < strtoull(lo, NULL, 0)) {
+        return false;
+    }
+    if (hi && pa >= strtoull(hi, NULL, 0)) {
+        return false;
+    }
+    return true;
+}
+
+static uint64_t mt7621_spy_read(void *opaque, hwaddr addr, unsigned size)
+{
+    static unsigned budget = 6000;
+    hwaddr pa = MT7621_PERIPH_BASE + addr;
+
+    if (mt7621_spy_wanted(pa) && budget--) {
+        fprintf(stderr, "periph: unassigned read  %08x size=%u\n",
+                (unsigned)pa, size);
+    }
+    return 0;
+}
+
+static void mt7621_spy_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    static unsigned budget = 6000;
+    hwaddr pa = MT7621_PERIPH_BASE + addr;
+
+    if (mt7621_spy_wanted(pa) && budget--) {
+        fprintf(stderr, "periph: unassigned write %08x <- %08x size=%u\n",
+                (unsigned)pa, (uint32_t)val, size);
+    }
+}
+
+static const MemoryRegionOps mt7621_spy_ops = {
+    .read = mt7621_spy_read,
+    .write = mt7621_spy_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static void mt7621_machine_init(MachineState *machine)
 {
     MT7621State *s = MT7621_MACHINE(machine);
@@ -834,6 +1238,26 @@ static void mt7621_machine_init(MachineState *machine)
     uint64_t ram_size = machine->ram_size;
     int i;
 
+    /*
+     * MT7621_LOG=<file>: send every model diagnostic there, independently of
+     * how the shell captures stderr.  The bring-up traces (hand-off, RX/TX,
+     * GIC sources) are the only way to see what the model did while the
+     * guest's serial console is busy with its own output, and redirections in
+     * a launcher script have repeatedly lost them.
+     */
+    {
+        const char *logp = getenv("MT7621_LOG");
+
+        if (logp && *logp) {
+            FILE *lf = freopen(logp, "w", stderr);
+
+            if (!lf) {
+                fprintf(stderr, "mt7621: cannot open %s\n", logp);
+            } else {
+                setvbuf(stderr, NULL, _IOLBF, 0);
+            }
+        }
+    }
     mt7621_trace = getenv("MT7621_TRACE") != NULL;
     s->board = MT7621_BOARD_LG_GAPM7200;
     /* resolves the preset (and its chip_mode) from -M board= or the image */
@@ -941,7 +1365,8 @@ static void mt7621_machine_init(MachineState *machine)
                                      mt7621_poweroff_poll, s);
     timer_mod(s->poweroff_timer,
               qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
-              (getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ? 1 : 250));
+              (getenv("MT7621_ENTRYLOG") || getenv("MT7621_EXCLOG") ||
+               getenv("MT7621_TLBLOG") || getenv("MT7621_BOOTLOG") ? 1 : 250));
 
     if (getenv("MT7621_CMDLINE")) {
         s->cmdline_extra = g_strdup(getenv("MT7621_CMDLINE"));
@@ -1048,7 +1473,20 @@ static void mt7621_machine_init(MachineState *machine)
     memory_region_init(&s->periph, NULL, "mt7621.periph",
                        MT7621_PERIPH_SIZE);
 
-    mt7621_sysctl_defaults(s);
+    /*
+     * Bring-up knob: a catch-all over the whole peripheral window, added
+     * first so every real block wins, that names the offsets a guest touches
+     * but no model answers.  This is how a missing controller is found
+     * without guessing (e.g. "which address is the SSUSB IPPC block on this
+     * board's device tree?").
+     */
+    if (getenv("MT7621_PERIPHSPY")) {
+        memory_region_init_io(&s->spy, NULL, &mt7621_spy_ops, s,
+                              "mt7621.periphspy", MT7621_PERIPH_SIZE);
+        memory_region_add_subregion(&s->periph, 0, &s->spy);
+    }
+
+    mt7621_sysctl_reset(s);
     memory_region_init_io(&s->sysctl, NULL, &mt7621_reg_ops, s->sysctl_regs,
                           "mt7621.sysctl", 0x1000);
     memory_region_init_io(&s->rstctl, NULL, &mt7621_rstctl_ops, s,
@@ -1060,7 +1498,7 @@ static void mt7621_machine_init(MachineState *machine)
 
     mt7621_systick_init(s);
 
-    mt7621_dramc_defaults(s);
+    mt7621_dramc_reset(s);
     memory_region_init_io(&s->dramc, NULL, &mt7621_reg_ops, s->dramc_regs,
                           "mt7621.dramc", 0x1000);
     memory_region_add_subregion(&s->periph, MT7621_DRAMC_OFF, &s->dramc);
@@ -1087,6 +1525,7 @@ static void mt7621_machine_init(MachineState *machine)
     }
 
     mt7621_crypto_init(s);
+    mt7621_usb_init(s);
 
     memory_region_add_subregion(sysmem, MT7621_PERIPH_BASE, &s->periph);
 

@@ -5,3 +5,4 @@ targets/mipsel/machines/mt7621/patches/0002-mt7621-bring-up-tracing-in-the-MIPS-
 targets/mipsel/machines/mt7621/patches/0003-mt7621-syslog-trace.patch
 targets/mipsel/machines/mt7621/patches/0004-mt7621-cachelog.patch
 targets/mipsel/machines/mt7621/patches/0005-mt7621-data-cache-model.patch
+targets/mipsel/machines/mt7621/patches/0006-mt7621-1004kc-mt-bring-up.patch

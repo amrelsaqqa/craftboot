@@ -1,0 +1,727 @@
+From d9ca10bec15168e64bdf0bc18af7e84ead63e4b0 Mon Sep 17 00:00:00 2001
+From: mt7621 model <model@local>
+Date: Sun, 22 Nov 2026 19:55:01 +0200
+Subject: [PATCH] mt7621: 1004Kc MT bring-up; CP0 compare via GIC local timer
+
+The 1004Kc core is 2 VPEs x 1 TC, and Linux (CONFIG_MIPS_MT_SMP + CPS)
+brings the second VPE of each core up with cps-vec's mttc0 sequence.  Three
+core-model details are needed for that to work on a multi-core part:
+
+- VPECONTROL.TARGTC numbers TCs within the processor (core), not globally.
+  mips_cpu_map_tc() assumed a global thread index, so from core 1 it
+  addressed core 0's VPEs.  When the machine describes the topology (one
+  CPUState per VPE, nr_threads VPs per core) map TARGTC to the sibling VCPU
+  of the current core.
+
+- The translation-time gate in gen_mftr()/gen_mttr() NOPs when
+  TARGTC > MVPConf0.PTC.  On a 1004K PTC is 0 (one TC per VPE) while TARGTC
+  is 1 for the second VP of the core, so every sibling access became a NOP.
+  Ask instead whether the TC exists in the processor and whether the target
+  is another VPE of this core.
+
+- EVP is per processor: DVPE/EVPE must only stop/start the other VPEs of
+  the executing core.  Iterating over every CPU stopped the running boot
+  core whenever a secondary core was released.
+
+Route the CP0 count/compare interrupt through the GIC on a CM part.  On a
+1004Kc covered by a Coherence Manager the compare interrupt is the GIC's
+VP-local GIC_LOCAL_INT_TIMER (2), latched in GIC_VP_PEND and forwarded only
+when the VP mask bit and GIC_VPE_TIMER_MAP say so.  The model raised
+Cause.IP7 directly, which is the pre-CM wiring and made an unhandled
+"irq 7: nobody cared" storm on every guest that never routes the local
+timer (the board shows no irq 7 activity at all).  A weak
+cpu_mips_timer_irq() keeps the old default for machines without a CM; the
+CM machine overrides it, and the GIC now models local 2 (mask, map,
+pending) alongside its own compare.
+
+GIC_VPE_CTL must report TIMER_ROUTABLE (bit 1): gic_get_c0_compare_int()
+uses it to decide between the GIC local timer and CPU IP7.  Reporting 0 put
+a guest that registers the r4k clockevent (RouterOS sets mips_hpt_frequency)
+on IP7 while cpu_mips_timer_irq() delivered the compare as local 2 - a line
+nobody acknowledged, held high (giclevel: local 2 held high) and eventually
+wedging a CPU.
+
+Also model the CP0 compare write race: a guest arms Compare from a Count it
+has just read, and host call latency can make a small delta arrive already
+behind the count.  The wrap-around interpretation then schedules the compare
+2^32 ticks later, which is what Linux's c0_compare_int_usable() (50-tick
+window) rejects.  A fresh arm (no pending Cause.TI) that is at most 10 us
+behind expires immediately; an acknowledgment keeps the wrap semantics.
+
+MT7621_GICIRQLOG reports per-source interrupt rates (gicrate) and held-high
+levels (giclevel), so an unacknowledged level that storms a CPU is visible
+without a per-transition flood.
+ hw/intc/mips_gic.c                  | 177 +++++++++++++++++++++++++---
+ include/hw/intc/mips_gic.h          |  11 ++
+ target/mips/internal.h              |   1 +
+ target/mips/system/cp0_timer.c      |  91 +++++++++++++-
+ target/mips/tcg/system/cp0_helper.c |  76 ++++++++++++
+ target/mips/tcg/translate.c         |  43 +++++--
+ 6 files changed, 371 insertions(+), 28 deletions(-)
+---
+ hw/intc/mips_gic.c                  | 189 +++++++++++++++++++++++++---
+ include/hw/intc/mips_gic.h          |  11 ++
+ target/mips/internal.h              |   1 +
+ target/mips/system/cp0_timer.c      |  91 +++++++++++++-
+ target/mips/tcg/system/cp0_helper.c |  76 +++++++++++
+ target/mips/tcg/translate.c         |  43 +++++--
+ 6 files changed, 383 insertions(+), 28 deletions(-)
+
+diff --git a/hw/intc/mips_gic.c b/hw/intc/mips_gic.c
+index 8fd74fd..43bce8e 100644
+--- a/hw/intc/mips_gic.c
++++ b/hw/intc/mips_gic.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/timer.h"
+ #include "qemu/log.h"
+ #include "qemu/module.h"
+ #include "qapi/error.h"
+@@ -45,7 +46,7 @@ static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin);
+ 
+ static void mips_gic_set_vp_irq(MIPSGICState *gic, int vp, int pin)
+ {
+-    static int budget = 300;
++    static int budget = 4000;
+     if (gic_log_on() && budget-- > 0) {
+         CPUState *cs = qemu_get_cpu(0);
+         uint32_t pc = cs ? (uint32_t)cpu_env(cs)->active_tc.PC : 0;
+@@ -73,10 +74,16 @@ static void mips_gic_set_vp_irq_impl(MIPSGICState *gic, int vp, int pin)
+     }
+     if (((gic->vps[vp].compare_map & GIC_MAP_MSK) == pin) &&
+             (gic->vps[vp].mask & GIC_VP_MASK_CMP_MSK)) {
+-        /* ORing with local pending register (count/compare) */
++        /* ORing with local pending register (GIC count/compare) */
+         ored_level |= (gic->vps[vp].pend & GIC_VP_MASK_CMP_MSK) >>
+                       GIC_VP_MASK_CMP_SHF;
+     }
++    if (((gic->vps[vp].timer_map & GIC_MAP_MSK) == pin) &&
++            (gic->vps[vp].mask & GIC_VP_MASK_TIMER_MSK)) {
++        /* ORing with local pending register (CP0 count/compare) */
++        ored_level |= (gic->vps[vp].pend & GIC_VP_MASK_TIMER_MSK) >>
++                      GIC_VP_MASK_TIMER_SHF;
++    }
+     if (kvm_enabled())  {
+         kvm_mips_set_ipi_interrupt(env_archcpu(gic->vps[vp].env),
+                                    pin + GIC_CPU_PIN_OFFSET,
+@@ -110,10 +117,91 @@ static void gic_update_pin_for_irq(MIPSGICState *gic, int n_IRQ)
+     mips_gic_set_vp_irq(gic, vp, pin);
+ }
+ 
++/*
++ * Rate summary for the interrupt inputs: a source that fires hundreds of
++ * times per second is a storm (an unacknowledged level), and printing one
++ * line per second is far more useful than a per-transition flood that runs
++ * out of budget before the interesting moment.
++ */
++static int gic_shared_level[64];
++static int gic_local_level[8];
++
++void mips_gic_level_report(void)
++{
++    static int64_t last;
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    int i;
++
++    if (!getenv("MT7621_GICIRQLOG") || now - last < 1000) {
++        return;
++    }
++    last = now;
++    for (i = 0; i < 64; i++) {
++        if (gic_shared_level[i]) {
++            fprintf(stderr, "giclevel: shared %d held high\n", i);
++        }
++    }
++    for (i = 0; i < 8; i++) {
++        if (gic_local_level[i]) {
++            fprintf(stderr, "giclevel: local %d held high\n", i);
++        }
++    }
++}
++
++static void gic_rate_log(const char *kind, int n, int level)
++{
++    static struct {
++        int64_t win;
++        uint32_t n;
++    } r[64], l[8];
++    int64_t now;
++    uint32_t *cnt;
++
++    if (!getenv("MT7621_GICIRQLOG")) {
++        return;
++    }
++    if (n >= 0 && n < 64) {
++        if (kind[0] == 's') {
++            gic_shared_level[n] = level;
++        } else if (n < 8) {
++            gic_local_level[n] = level;
++        }
++    }
++    if (!level) {
++        return;
++    }
++    now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    if (n < 0 || n >= 64) {
++        return;
++    }
++    cnt = kind[0] == 's' ? &r[n].n : &l[n].n;
++    {
++        int64_t *win = kind[0] == 's' ? &r[n].win : &l[n].win;
++
++        if (now - *win >= 1000) {
++            if (*cnt > 200) {
++                fprintf(stderr, "gicrate: %s %d = %u/s\n", kind, n, *cnt);
++            }
++            *cnt = 0;
++            *win = now;
++        }
++    }
++    (*cnt)++;
++}
++
+ static void gic_set_irq(void *opaque, int n_IRQ, int level)
+ {
+     MIPSGICState *gic = (MIPSGICState *) opaque;
+ 
++    if (getenv("MT7621_GICIRQLOG") && !getenv("MT7621_QUIET")) {
++        static int budget = 200;
++
++        if (budget-- > 0) {
++            fprintf(stderr, "gicirq: shared %d <- %d\n", n_IRQ, level);
++        }
++    }
++    gic_rate_log("shared", n_IRQ, level);
++
+     if (gic_log_on()) {
+         static int budget = 200;
+         if (budget-- > 0) {
+@@ -149,6 +237,8 @@ static uint64_t gic_read_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
+         return gic->vps[vp_index].mask;
+     case GIC_VP_COMPARE_MAP_OFS:
+         return gic->vps[vp_index].compare_map;
++    case GIC_VP_TIMER_MAP_OFS:
++        return gic->vps[vp_index].timer_map;
+     case GIC_VP_OTHER_ADDR_OFS:
+         return gic->vps[vp_index].other_addr;
+     case GIC_VP_IDENT_OFS:
+@@ -252,30 +342,77 @@ bad_offset:
+     return 0;
+ }
+ 
++void mips_gic_local_irq(MIPSGICState *gic, uint32_t vp, int intr, int level)
++{
++    uint32_t bit = 1u << intr;
++    uint32_t map;
++
++    if (vp >= gic->num_vps) {
++        return;
++    }
++
++    if (getenv("MT7621_GICIRQLOG") && !getenv("MT7621_QUIET")) {
++        static int budget = 400000;
++        static int last_level[64];
++
++        /* only local 2 (CP0 compare routed through the GIC), only changes */
++        if (intr == GIC_LOCAL_INT_TIMER && vp < 64 &&
++            last_level[vp] != level && budget-- > 0) {
++            MIPSCPU *cpu = MIPS_CPU(qemu_get_cpu(vp));
++
++            last_level[vp] = level;
++            fprintf(stderr, "gicirq2: t=%lldms vp%u <- %d pc=%08x mask=%08x "
++                    "tmap=%08x pend=%08x\n",
++                    (long long)(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)),
++                    vp, level,
++                    cpu ? (uint32_t)cpu->env.active_tc.PC : 0,
++                    gic->vps[vp].mask, gic->vps[vp].timer_map,
++                    gic->vps[vp].pend);
++        }
++    }
++    gic_rate_log("local", intr, level);
++    if (level) {
++        gic->vps[vp].pend |= bit;
++    } else {
++        gic->vps[vp].pend &= ~bit;
++    }
++
++    switch (intr) {
++    case GIC_LOCAL_INT_COMPARE:
++        map = gic->vps[vp].compare_map;
++        break;
++    case GIC_LOCAL_INT_TIMER:
++        map = gic->vps[vp].timer_map;
++        break;
++    default:
++        /* The remaining local sources are not modelled; they latch only. */
++        return;
++    }
++
++    if (map & GIC_MAP_TO_PIN_MSK) {
++        /*
++         * Recompute the whole pin: it may carry shared interrupts and the
++         * other local source, and the mask is applied by that helper.  This
++         * also lowers the pin when the source is acknowledged.
++         */
++        mips_gic_set_vp_irq(gic, vp, map & GIC_MAP_MSK);
++    }
++}
++
+ static void gic_timer_expire_cb(void *opaque, uint32_t vp_index)
+ {
+     MIPSGICState *gic = opaque;
+ 
+-    gic->vps[vp_index].pend |= (1 << GIC_LOCAL_INT_COMPARE);
+-    if (gic->vps[vp_index].pend &
+-            (gic->vps[vp_index].mask & GIC_VP_MASK_CMP_MSK)) {
+-        if (gic->vps[vp_index].compare_map & GIC_MAP_TO_PIN_MSK) {
+-            /* it is safe to set the irq high regardless of other GIC IRQs */
+-            uint32_t pin = (gic->vps[vp_index].compare_map & GIC_MAP_MSK);
+-            qemu_irq_raise(gic->vps[vp_index].env->irq
+-                           [pin + GIC_CPU_PIN_OFFSET]);
+-        }
++    if (getenv("MT7621_TMRLOG")) {
++        fprintf(stderr, "gictmr: compare expire vp=%u\n", vp_index);
+     }
++    mips_gic_local_irq(gic, vp_index, GIC_LOCAL_INT_COMPARE, 1);
+ }
+ 
+ static void gic_timer_store_vp_compare(MIPSGICState *gic, uint32_t vp_index,
+                                        uint64_t compare)
+ {
+-    gic->vps[vp_index].pend &= ~(1 << GIC_LOCAL_INT_COMPARE);
+-    if (gic->vps[vp_index].compare_map & GIC_MAP_TO_PIN_MSK) {
+-        uint32_t pin = (gic->vps[vp_index].compare_map & GIC_MAP_MSK);
+-        mips_gic_set_vp_irq(gic, vp_index, pin);
+-    }
++    mips_gic_local_irq(gic, vp_index, GIC_LOCAL_INT_COMPARE, 0);
+     mips_gictimer_store_vp_compare(gic->gic_timer, vp_index, compare);
+ }
+ 
+@@ -299,6 +436,13 @@ static void gic_write_vp(MIPSGICState *gic, uint32_t vp_index, hwaddr addr,
+         OFFSET_CHECK((data & GIC_MAP_MSK) <= GIC_CPU_INT_MAX);
+         gic->vps[vp_index].compare_map = data & GIC_MAP_TO_PIN_REG_MSK;
+         break;
++    case GIC_VP_TIMER_MAP_OFS:
++        OFFSET_CHECK((data & GIC_MAP_MSK) <= GIC_CPU_INT_MAX);
++        gic->vps[vp_index].timer_map = data & GIC_MAP_TO_PIN_REG_MSK;
++        mips_gic_local_irq(gic, vp_index, GIC_LOCAL_INT_TIMER,
++                           !!(gic->vps[vp_index].pend &
++                              GIC_VP_MASK_TIMER_MSK));
++        break;
+     case GIC_VP_OTHER_ADDR_OFS:
+         OFFSET_CHECK(data < gic->num_vps);
+         gic->vps[vp_index].other_addr = data;
+@@ -441,7 +585,18 @@ static void gic_reset(void *opaque)
+                      (numintrs     << GIC_SH_CONFIG_NUMINTRS_SHF)  |
+                      (gic->num_vps << GIC_SH_CONFIG_PVPS_SHF);
+     for (i = 0; i < gic->num_vps; i++) {
+-        gic->vps[i].ctl         = 0x0;
++        /*
++         * GIC_VPE_CTL reports which VP-local interrupts this implementation
++         * can route to a CPU pin.  Bit 1 is TIMER_ROUTABLE: the CP0 count/
++         * compare interrupt.  Reporting 0 made Linux's
++         * gic_get_c0_compare_int() return the CPU's IP7 instead, so a guest
++         * that registers the r4k clockevent (RouterOS does; it sets
++         * mips_hpt_frequency) put its handler on IP7 while the model's
++         * cpu_mips_timer_irq() delivered the compare as GIC local 2 - a line
++         * nobody acknowledged, held high for as long as the guest ran
++         * (giclevel: local 2 held high) and eventually wedging a CPU.
++         */
++        gic->vps[i].ctl         = (1u << 1);   /* TIMER_ROUTABLE */
+         gic->vps[i].pend        = 0x0;
+         /* PERFCNT, TIMER and WD not implemented */
+         gic->vps[i].mask        = 0x32;
+diff --git a/include/hw/intc/mips_gic.h b/include/hw/intc/mips_gic.h
+index 4c61e99..ccd052b 100644
+--- a/include/hw/intc/mips_gic.h
++++ b/include/hw/intc/mips_gic.h
+@@ -193,6 +193,7 @@ struct MIPSGICVPState {
+     uint32_t pend;
+     uint32_t mask;
+     uint32_t compare_map;
++    uint32_t timer_map;
+     uint32_t other_addr;
+     CPUMIPSState *env;
+ };
+@@ -222,4 +223,14 @@ struct MIPSGICState {
+     uint32_t counter_bits;
+ };
+ 
++/*
++ * Drive one of the VP-local interrupt sources (GIC_LOCAL_INT_*), as the core
++ * does for its CP0 count/compare interrupt (GIC_LOCAL_INT_TIMER) and the GIC
++ * timer does for its own compare (GIC_LOCAL_INT_COMPARE).  The source latches
++ * in GIC_VP_PEND; it only reaches a CPU interrupt pin when the VP mask bit is
++ * set and the local interrupt's map register points at a pin - which is how
++ * a guest enables it (gic_all_vpes_local_irq_controller / the EIC setup).
++ */
++void mips_gic_local_irq(MIPSGICState *gic, uint32_t vp, int intr, int level);
++
+ #endif /* MIPS_GIC_H */
+diff --git a/target/mips/internal.h b/target/mips/internal.h
+index cc9797a..3c7a9e2 100644
+--- a/target/mips/internal.h
++++ b/target/mips/internal.h
+@@ -218,6 +218,7 @@ void msa_reset(CPUMIPSState *env);
+ 
+ /* cp0_timer.c */
+ uint32_t cpu_mips_get_count(CPUMIPSState *env);
++void cpu_mips_timer_irq(CPUMIPSState *env, int level);
+ void cpu_mips_store_count(CPUMIPSState *env, uint32_t value);
+ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value);
+ void cpu_mips_start_count(CPUMIPSState *env);
+diff --git a/target/mips/system/cp0_timer.c b/target/mips/system/cp0_timer.c
+index ca16945..bfe0ca9 100644
+--- a/target/mips/system/cp0_timer.c
++++ b/target/mips/system/cp0_timer.c
+@@ -26,6 +26,32 @@
+ #include "system/kvm.h"
+ #include "internal.h"
+ 
++/*
++ * Deliver the CP0 count/compare interrupt.  On a core covered by a Coherence
++ * Manager this is not a CPU interrupt pin at all: it is the GIC's VP-local
++ * interrupt GIC_LOCAL_INT_TIMER, gated by the GIC's VP mask/map, and a SoC
++ * with a CM overrides this hook to drive it there.  The default is the
++ * pre-CM behaviour (Cause.IP7 / IntCtl.IPTI), used by machines without a CM.
++ */
++__attribute__((weak)) void cpu_mips_timer_irq(CPUMIPSState *env, int level)
++{
++    int irq;
++
++    /*
++     * With a vectorizing external interrupt controller the core does not own
++     * interrupt delivery: Cause.IP is a vector level and the EIC feeds it.
++     */
++    if (env->CP0_Config3 & (1 << CP0C3_VEIC)) {
++        return;
++    }
++    irq = (env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7;
++    if (level) {
++        qemu_irq_raise(env->irq[irq]);
++    } else {
++        qemu_irq_lower(env->irq[irq]);
++    }
++}
++
+ /* MIPS R4K timer */
+ static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
+ {
+@@ -53,11 +79,28 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
+ /* Expire the timer.  */
+ static void cpu_mips_timer_expire(CPUMIPSState *env)
+ {
++    if (getenv("MT7621_TMRLOG")) {
++        fprintf(stderr, "cp0tmr: cpu%d expire count=%08x compare=%08x ipti=%u cfg3=%08x\n",
++                env_cpu(env)->cpu_index, env->CP0_Count, env->CP0_Compare,
++                (env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7,
++                env->CP0_Config3);
++    }
+     cpu_mips_timer_update(env);
+     if (env->insn_flags & ISA_MIPS_R2) {
+         env->CP0_Cause |= 1 << CP0Ca_TI;
+     }
+-    qemu_irq_raise(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
++    /*
++     * With a vectorizing external interrupt controller (Config3.VEIC) the
++     * core does not own interrupt delivery: Cause.IP is a vector level
++     * (cpu_mips_hw_interrupts_pending() compares pending > status) and the
++     * EIC, here the GIC, feeds the vector.  Raising env->irq[IPTI] in that
++     * mode injects a bare vector number - on the mt7621/1004K that shows up
++     * as an unhandled "irq 7: nobody cared" storm, because the guest's
++     * timekeeping is the GIC compare interrupt and nothing claims that
++     * vector.  Leave Cause.TI set (the guest may poll it) and let the EIC
++     * deliver the timer.
++     */
++    cpu_mips_timer_irq(env, 1);
+ }
+ 
+ uint32_t cpu_mips_get_count(CPUMIPSState *env)
+@@ -96,16 +139,58 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
+     }
+ }
+ 
++/*
++ * A guest arms the compare from a Count value it has just read, typically
++ * "write_c0_compare(read_c0_count() + delta)".  The count this model exposes
++ * is derived from the host clock, so by the time the mtc0 is emulated the
++ * count has already moved on by the host's call latency - a small delta then
++ * arrives *behind* the count.  Hardware evaluates the compare at the instant
++ * of the write, where that value is still ahead; taking the wrap-around
++ * interpretation here would make the compare disappear for the next 2^32
++ * ticks (about 4.9 s at 880 MHz).
++ *
++ * Linux's c0_compare_int_usable() probes exactly this, allowing only 50
++ * ticks, before registering its IP7 handler; when the probe fails the timer
++ * interrupt has no handler at all, which is the "irq 7: nobody cared" storm.
++ * Such a fresh arm is therefore scheduled to expire immediately.  Only a
++ * fresh arm is: a write that acknowledges an already-pending compare must
++ * keep the wrap semantics, or the handler would re-trigger itself forever.
++ * MT7621_NO_CMP_CLAMP=1 disables the compensation for A/B.
++ */
++#define CP0_COMPARE_SKEW_NS 10000
++
+ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
+ {
++    bool pending = !!(env->CP0_Cause & (1 << CP0Ca_TI));
++
++    if (getenv("MT7621_TMRLOG")) {
++        fprintf(stderr, "cp0tmr: cpu%d store_compare %08x pc=%08x dc=%d "
++                "count=%08x wait=%08x ti=%d\n",
++                env_cpu(env)->cpu_index, value, (uint32_t)env->active_tc.PC,
++                !!(env->CP0_Cause & (1 << CP0Ca_DC)),
++                cpu_mips_get_count_val(env),
++                (uint32_t)(value - cpu_mips_get_count_val(env)),
++                pending);
++    }
+     env->CP0_Compare = value;
+     if (!(env->CP0_Cause & (1 << CP0Ca_DC))) {
+-        cpu_mips_timer_update(env);
++        uint32_t count = cpu_mips_get_count_val(env);
++        int32_t behind = (int32_t)(count - value);
++        int64_t skew = clock_ns_to_ticks(env->count_clock,
++                                        CP0_COMPARE_SKEW_NS);
++
++        if (!getenv("MT7621_NO_CMP_CLAMP") &&
++            !pending && behind >= 0 && behind <= skew) {
++            timer_mod(env->timer,
++                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
++        } else {
++            cpu_mips_timer_update(env);
++        }
+     }
+     if (env->insn_flags & ISA_MIPS_R2) {
+         env->CP0_Cause &= ~(1 << CP0Ca_TI);
+     }
+-    qemu_irq_lower(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
++    cpu_mips_timer_irq(env, 0);
+ }
+ 
+ void cpu_mips_start_count(CPUMIPSState *env)
+diff --git a/target/mips/tcg/system/cp0_helper.c b/target/mips/tcg/system/cp0_helper.c
+index b69e70d..e51e77d 100644
+--- a/target/mips/tcg/system/cp0_helper.c
++++ b/target/mips/tcg/system/cp0_helper.c
+@@ -125,6 +125,31 @@ static CPUMIPSState *mips_cpu_map_tc(CPUMIPSState *env, int *tc)
+     }
+ 
+     cs = env_cpu(env);
++
++    /*
++     * MIPS MT (and the 1004Kc this models) numbers TCs within a processor
++     * (core): VPECONTROL.TARGTC selects a sibling TC of the *same* core,
++     * which is what cps-vec.S relies on when it starts the other VPEs of a
++     * core.  The generic mapping below treats TARGTC as a global CPU index,
++     * which is only equivalent on a single-core MT part.
++     *
++     * nr_threads is the number of VPs in the core in this topology (one
++     * CPUState per VPE, each with a single TC), so TARGTC addresses the
++     * VPE/thread of the current core and the local TC index is 0.
++     */
++    if (cs->nr_threads > 1) {
++        int core = cs->cpu_index / cs->nr_threads;
++
++        vpe_idx = core * cs->nr_threads + (tc_idx % cs->nr_threads);
++        *tc = 0;
++        other_cs = qemu_get_cpu(vpe_idx);
++        if (other_cs == NULL) {
++            return env;
++        }
++        cpu = MIPS_CPU(other_cs);
++        return &cpu->env;
++    }
++
+     vpe_idx = tc_idx / cs->nr_threads;
+     *tc = tc_idx % cs->nr_threads;
+     other_cs = qemu_get_cpu(vpe_idx);
+@@ -229,6 +254,11 @@ uint32_t cpu_mips_get_random(CPUMIPSState *env)
+ /* CP0 helpers */
+ target_ulong helper_mfc0_mvpcontrol(CPUMIPSState *env)
+ {
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: read mvpcontrol pc=%08x -> %08x\n",
++                (uint32_t)env->active_tc.PC,
++                (uint32_t)env->mvp->CP0_MVPControl);
++    }
+     return env->mvp->CP0_MVPControl;
+ }
+ 
+@@ -249,6 +279,10 @@ target_ulong helper_mfc0_random(CPUMIPSState *env)
+ 
+ target_ulong helper_mfc0_tcstatus(CPUMIPSState *env)
+ {
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: read tcstatus pc=%08x\n",
++                (uint32_t)env->active_tc.PC);
++    }
+     return env->active_tc.CP0_TCStatus;
+ }
+ 
+@@ -533,6 +567,10 @@ void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
+ 
+ void helper_mtc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
+ {
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: mtc0 vpecontrol cpu=%d val=%08x\n",
++                env_cpu(env)->cpu_index, (uint32_t)arg1);
++    }
+     uint32_t mask;
+     uint32_t newval;
+ 
+@@ -611,6 +649,12 @@ void helper_mttc0_vpeconf0(CPUMIPSState *env, target_ulong arg1)
+     newval = (other->CP0_VPEConf0 & ~mask) | (arg1 & mask);
+ 
+     /* TODO: TC exclusive handling due to ERL/EXL.  */
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: mttc0 vpeconf0 from=%d targ=%d -> cpu=%d val=%08x\n",
++                env_cpu(env)->cpu_index,
++                (int)(env->CP0_VPEControl & 0xff),
++                env_cpu(other)->cpu_index, newval);
++    }
+     other->CP0_VPEConf0 = newval;
+ }
+ 
+@@ -679,6 +723,12 @@ void helper_mttc0_tcstatus(CPUMIPSState *env, target_ulong arg1)
+     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);
+     CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+ 
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: mttc0 tcstatus from=%d targ=%d -> cpu=%d val=%08x\n",
++                env_cpu(env)->cpu_index,
++                (int)(env->CP0_VPEControl & 0xff),
++                env_cpu(other)->cpu_index, (uint32_t)arg1);
++    }
+     if (other_tc == other->current_tc) {
+         other->active_tc.CP0_TCStatus = arg1;
+     } else {
+@@ -767,6 +817,12 @@ void helper_mttc0_tchalt(CPUMIPSState *env, target_ulong arg1)
+     CPUMIPSState *other = mips_cpu_map_tc(env, &other_tc);
+     MIPSCPU *other_cpu = env_archcpu(other);
+ 
++    if (getenv("MT7621_MTLOG")) {
++        fprintf(stderr, "cp0mt: mttc0 tchalt from=%d targ=%d -> cpu=%d val=%08x\n",
++                env_cpu(env)->cpu_index,
++                (int)(env->CP0_VPEControl & 0xff),
++                env_cpu(other)->cpu_index, (uint32_t)arg1);
++    }
+     /* TODO: Halt TC / Restart (if allocated+active) TC. */
+ 
+     if (other_tc == other->current_tc) {
+@@ -1560,11 +1616,24 @@ target_ulong helper_emt(void)
+ target_ulong helper_dvpe(CPUMIPSState *env)
+ {
+     CPUState *other_cs = first_cpu;
++    CPUState *cs = env_cpu(env);
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+         CPU_FOREACH(other_cs) {
+             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
++
++            /*
++             * EVP is per processor: DVPE only stops the VPEs of the core
++             * that executes it (with one CPUState per VPE, the other VPEs
++             * of this core).  Stopping every CPU in the machine also halted
++             * the running boot CPU whenever a secondary core was released.
++             */
++            if (cs->nr_threads > 1 &&
++                other_cs->cpu_index / other_cs->nr_threads !=
++                cs->cpu_index / cs->nr_threads) {
++                continue;
++            }
+             /* Turn off all VPEs except the one executing the dvpe.  */
+             if (&other_cpu->env != env) {
+                 other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
+@@ -1578,12 +1647,19 @@ target_ulong helper_dvpe(CPUMIPSState *env)
+ target_ulong helper_evpe(CPUMIPSState *env)
+ {
+     CPUState *other_cs = first_cpu;
++    CPUState *cs = env_cpu(env);
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+         CPU_FOREACH(other_cs) {
+             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+ 
++            /* EVP is per processor; see helper_dvpe(). */
++            if (cs->nr_threads > 1 &&
++                other_cs->cpu_index / other_cs->nr_threads !=
++                cs->cpu_index / cs->nr_threads) {
++                continue;
++            }
+             if (&other_cpu->env != env
+                 /* If the VPE is WFI, don't disturb its sleep.  */
+                 && !mips_vpe_is_wfi(other_cpu)) {
+diff --git a/target/mips/tcg/translate.c b/target/mips/tcg/translate.c
+index 07d6b20..daf2161 100644
+--- a/target/mips/tcg/translate.c
++++ b/target/mips/tcg/translate.c
+@@ -8093,6 +8093,37 @@ cp0_unimplemented:
+ }
+ #endif /* TARGET_MIPS64 */
+ 
++/*
++ * MIPS MT numbers TCs within a processor (core): VPECONTROL.TARGTC selects a
++ * TC of the *same* core, and the target may live in another VPE of that core.
++ * A machine that describes that topology (one CPUState per VPE, nr_threads
++ * VPs per core) therefore bounds TARGTC by the VP count and resolves the
++ * target within the current core; otherwise QEMU's legacy single-VPE
++ * numbering (bounded by MVPConf0.PTC) applies.
++ */
++static bool mips_mt_tc_present(CPUMIPSState *env, int tc)
++{
++    CPUState *cs = env_cpu(env);
++
++    if (cs->nr_threads > 1) {
++        return tc < cs->nr_threads;
++    }
++    return tc <= (env->mvp->CP0_MVPConf0 & (0xff << CP0MVPC0_PTC));
++}
++
++static bool mips_mt_tc_is_other_vpe(CPUMIPSState *env, int tc)
++{
++    CPUState *cs = env_cpu(env);
++
++    if (cs->nr_threads > 1) {
++        int core = cs->cpu_index / cs->nr_threads;
++
++        return core * cs->nr_threads + (tc % cs->nr_threads) != cs->cpu_index;
++    }
++    return (env->tcs[tc].CP0_TCBind & (0xf << CP0TCBd_CurVPE)) !=
++           (env->active_tc.CP0_TCBind & (0xf << CP0TCBd_CurVPE));
++}
++
+ static void gen_mftr(CPUMIPSState *env, DisasContext *ctx, int rt, int rd,
+                      int u, int sel, int h)
+ {
+@@ -8100,11 +8131,9 @@ static void gen_mftr(CPUMIPSState *env, DisasContext *ctx, int rt, int rd,
+     TCGv t0 = tcg_temp_new();
+ 
+     if ((env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) == 0 &&
+-        ((env->tcs[other_tc].CP0_TCBind & (0xf << CP0TCBd_CurVPE)) !=
+-         (env->active_tc.CP0_TCBind & (0xf << CP0TCBd_CurVPE)))) {
++        mips_mt_tc_is_other_vpe(env, other_tc)) {
+         tcg_gen_movi_tl(t0, -1);
+-    } else if ((env->CP0_VPEControl & (0xff << CP0VPECo_TargTC)) >
+-               (env->mvp->CP0_MVPConf0 & (0xff << CP0MVPC0_PTC))) {
++    } else if (!mips_mt_tc_present(env, other_tc)) {
+         tcg_gen_movi_tl(t0, -1);
+     } else if (u == 0) {
+         switch (rt) {
+@@ -8325,12 +8354,10 @@ static void gen_mttr(CPUMIPSState *env, DisasContext *ctx, int rd, int rt,
+ 
+     gen_load_gpr(t0, rt);
+     if ((env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) == 0 &&
+-        ((env->tcs[other_tc].CP0_TCBind & (0xf << CP0TCBd_CurVPE)) !=
+-         (env->active_tc.CP0_TCBind & (0xf << CP0TCBd_CurVPE)))) {
++        mips_mt_tc_is_other_vpe(env, other_tc)) {
+         /* NOP */
+         ;
+-    } else if ((env->CP0_VPEControl & (0xff << CP0VPECo_TargTC)) >
+-             (env->mvp->CP0_MVPConf0 & (0xff << CP0MVPC0_PTC))) {
++    } else if (!mips_mt_tc_present(env, other_tc)) {
+         /* NOP */
+         ;
+     } else if (u == 0) {

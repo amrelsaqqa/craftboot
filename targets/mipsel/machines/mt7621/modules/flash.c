@@ -535,6 +535,19 @@ static const MemoryRegionOps mt7621_spi_ops = {
 };
 
 
+/*
+ * SPI controller reset: register file, RX FIFO and the command/address
+ * latch.  The NOR contents (s->flash) and the die's unique id (spi_uid) are
+ * not controller state and survive.
+ */
+void mt7621_spi_reset(MT7621State *s)
+{
+    memset(s->spi_regs, 0, sizeof(s->spi_regs));
+    memset(s->spi_rx, 0, sizeof(s->spi_rx));
+    s->spi_read_mode = false;
+    s->spi_addr = 0;
+}
+
 void mt7621_spi_init(MT7621State *s)
 {
     /*
@@ -569,7 +582,24 @@ ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
         uint64_t foff = off + done;
         size_t take = len - done;
 
-        if (s->nand_stride && s->nand_stride != MT7621_NAND_PAGE_SIZE) {
+        if (s->nand_spare == NAND_SPARE_SECTOR) {
+            /*
+             * Per-sector raw dump: each 512-byte sector is followed by its 16
+             * spare bytes, so a logical (main-area) offset maps to
+             * page*2112 + sector*528 + offset-in-sector.
+             */
+            uint64_t page = foff / MT7621_NAND_PAGE_SIZE;
+            uint64_t inpage = foff % MT7621_NAND_PAGE_SIZE;
+            uint64_t sector = inpage / 512;
+            uint64_t insector = inpage % 512;
+
+            if (take > 512 - insector) {
+                take = 512 - insector;
+            }
+            foff = page * s->nand_stride +
+                   sector * (512 + 16) + insector;
+        } else if (s->nand_stride &&
+                   s->nand_stride != MT7621_NAND_PAGE_SIZE) {
             uint64_t page = foff / MT7621_NAND_PAGE_SIZE;
             uint64_t inpage = foff % MT7621_NAND_PAGE_SIZE;
 

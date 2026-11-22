@@ -16,7 +16,15 @@
  * with a plausible MT7530 identity.
  */
 static void mt7621_eth_update_irq(MT7621State *s);
-static void mt7621_eth_tx(MT7621State *s, uint32_t ctx);
+static void mt7621_eth_tx(MT7621State *s, unsigned ci, uint32_t ctx);
+
+/*
+ * Sequence counters for MT7621_MDIOLOG.  A production model does not need
+ * them; they exist so a stuck busy-wait can be attributed to the write that
+ * started it ("poll +123 after w#45", both IAC values).
+ */
+static unsigned long mdio_wseq;
+static unsigned long mdio_rseq;
 /*
  * MT7621 switch special tag
  * ------------------------
@@ -103,6 +111,19 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
     }
 
     /*
+     * Only the switch's own PHYs are populated: five ports on the MT7530
+     * (addresses 0..4) plus the switch itself at 0x1f, handled above.  An MDIO
+     * address with nothing on it reads back all ones on real hardware; the
+     * model used to answer every address 0..31 with a plausible BMCR/BMSR and
+     * PHY ID, so a driver scanning the bus found "PHYs" that are not on the
+     * board and then timed out talking to them
+     * ("raeth: mdio timeout" x4 on the B70, one per phantom address).
+     */
+    if (phy > 4) {
+        return 0xffff;
+    }
+
+    /*
      * Only the switch port that owns the net backend has a cable in it.
      * MT7530 PHY addresses are the switch port numbers: 0 = the WAN port,
      * 1..4 = the four LAN PHYs.  Which *label* a port carries is a
@@ -131,7 +152,15 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
          */
         up = true;
     } else {
-        up = phy && phy == s->eth_port;
+        /*
+         * One backend, one cable: it belongs to the port MT7621_ETH_PORT
+         * names.  Address 0 is a real PHY on this board (the WAN port), so it
+         * must be able to report the cable like any other - RouterBOOT's
+         * etherboot polls BMSR at address 0 and refuses to send a single
+         * frame until it sees link.  Requiring phy != 0 here made etherboot
+         * spin for ever ("Press Ctrl+E" then nothing).
+         */
+        up = phy == s->eth_port;
     }
     if (up && !getenv("MT7621_ETH_ANYLINK")) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -151,8 +180,13 @@ static uint16_t mt7621_eth_phy_read(MT7621State *s, unsigned phy, unsigned reg)
 
     switch (reg & 0x1f) {
     case 1:                             /* BMSR: live status */
-        /* No autoneg: the PHY is strapped to 1000BASE-T full duplex. */
-        return up ? 0x7965 : 0x7941;
+        /*
+         * Values taken from the real board: its own etherboot dump reads
+         * BMSR = 0x796d with a cable (link, autoneg complete and the
+         * autoneg-ability bit 3 all set).  The model used to omit bit 3 in
+         * both states, which is not a value any PHY reports.
+         */
+        return up ? 0x796d : 0x7949;
     case 10:                            /* MII_STAT1000: link partner */
         return up ? 0x3800 : 0x0000;
     case 15:                            /* MII_ESTATUS: capabilities */
@@ -171,6 +205,63 @@ static uint64_t mt7621_eth_read(void *opaque, hwaddr addr, unsigned size)
     if (getenv("MT7621_ETHLOG")) {
         fprintf(stderr, "eth: read %04x -> %08x (size %u)\n",
                 (unsigned)off, val, size);
+    }
+    /*
+     * MT7621_QDMALOG also traces reads of the QDMA index registers.  Which
+     * one a driver polls for transmit completions is a per-driver fact:
+     * CTX (0x1b00) is its own index, DTX (0x1b04) is the DMA's, and DRX
+     * (0x1b14) is the receive-side DMA index.  A driver that never sees DTX
+     * move keeps every descriptor "in transmit" and stops the queue.
+     */
+    if (getenv("MT7621_TXDBG") && (off & 0xf) == 0xc && off < 0x0840) {
+        static int rbudget = -1;
+
+        if (rbudget < 0) {
+            const char *n = getenv("MT7621_TXDBG_N");
+
+            rbudget = n ? atoi(n) : 200;
+        }
+        if (rbudget-- > 0) {
+            fprintf(stderr, "ptxr off=%04x -> %08x\n", (unsigned)off, val);
+        }
+    }
+    if (getenv("MT7621_QDMALOG") && off >= ETH_QTX_CTX_PTR && off < 0x1b20) {
+        static int rbudget = 120;
+
+        if (rbudget-- > 0) {
+            fprintf(stderr, "qdma: read %04x -> %08x\n", (unsigned)off, val);
+        }
+    }
+    if (getenv("MT7621_MDIOLOG") && off == MT7621_ETH_IAC) {
+        /*
+         * The MDIO busy-wait polls ACCESS until it clears, and the read data
+         * is the low half.  Both are worth seeing when a driver reports a
+         * timeout: an ACCESS that is still set at read time means the
+         * transaction never completed, and 0xffff in the data half means the
+         * driver will treat the read as "no reply" even though the bus
+         * completed.
+         *
+         * Print the first few polls of every stuck stretch, then one in a
+         * hundred: a busy-wait that never completes is thousands of reads and
+         * the shape (which write started it) matters more than each line.
+         */
+        static unsigned long poll_from;
+
+        if ((val & ETH_IAC_ACCESS) || (val & 0xffff) == 0xffff) {
+            if (!poll_from) {
+                poll_from = mdio_rseq;
+            }
+            if (mdio_rseq - poll_from < 3 || ((mdio_rseq - poll_from) % 100) == 99) {
+                fprintf(stderr, "mdio: r#%lu (poll +%lu after w#%lu)"
+                        " iac=%08x%s%s\n", mdio_rseq,
+                        mdio_rseq - mdio_wseq, mdio_wseq, val,
+                        (val & ETH_IAC_ACCESS) ? " ACCESS-STILL-SET" : "",
+                        (val & 0xffff) == 0xffff ? " DATA-FFFF" : "");
+            }
+        } else {
+            poll_from = 0;
+        }
+        mdio_rseq++;
     }
     return val;
 }
@@ -196,10 +287,12 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         s->eth_regs[off >> 2] = val;
         return;
     }
-    if (off == ETH_PDMA_GLO_CFG) {
-        s->eth_regs[off >> 2] = val;
-        return;
-    }
+    /*
+     * PDMA_GLO_CFG is not a plain register: its TX_EN/RX_EN edges start and
+     * stop the engines (see the full handler below).  It must not be captured
+     * by an early "store and return" - doing so silently disabled the TX kick
+     * on TX_EN 0->1 and left the RX ring generation untracked.
+     */
     /*
      * Four PDMA transmit rings, one per Linux TX queue: BASE_PTR/MAX_CNT/
      * CTX_IDX/DTX_IDX at 0x0800 + q*0x10.  Ring 0 is the only one RouterBOOT
@@ -211,6 +304,15 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         unsigned q = (off - ETH_PTX_BASE_PTR0) >> 4;
 
         s->eth_regs[off >> 2] = val;
+        if (getenv("MT7621_TXDBG")) {
+            static int wbudget = 80;
+
+            if (wbudget-- > 0) {
+                fprintf(stderr, "ptxw q=%u off=%04x val=%08x glm=%08x\n",
+                        q, (unsigned)off, val,
+                        s->eth_regs[ETH_PDMA_GLO_CFG / 4]);
+            }
+        }
         if ((off & 0xf) == 0) {                 /* BASE_PTR: ring reload */
             s->ptx_idx[q] = 0;
         }
@@ -228,6 +330,12 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         s->eth_regs[off >> 2] = val;
         return;
     }
+    if (off == ETH_QTX_DTX_PTR1) {
+        s->qtx_dtx1 = val;
+        s->qtx_base1 = val;
+        s->eth_regs[off >> 2] = val;
+        return;
+    }
     if (off == ETH_QTX_DRX_PTR) {
         s->eth_regs[off >> 2] = val;
         return;
@@ -237,12 +345,28 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         /* Kicks that arrive while the engine is off (ring setup) are
          * ignored, exactly like the hardware does. */
         if (s->qtx_en) {
-            mt7621_eth_tx(s, val);
+            mt7621_eth_tx(s, 0, val);
+        }
+        return;
+    }
+    if (off == ETH_QTX_CTX_PTR1) {
+        s->eth_regs[off >> 2] = val;
+        if (s->qtx_en) {
+            mt7621_eth_tx(s, 1, val);
         }
         return;
     }
     if (off == ETH_PDMA_INT_STATUS) {
         s->eth_regs[off >> 2] &= ~val;     /* write 1 to clear */
+        if (getenv("MT7621_TXDBG")) {
+            static int cbudget = 60;
+
+            if (cbudget-- > 0) {
+                fprintf(stderr, "pdma: status clear %08x -> %08x mask=%08x\n",
+                        val, s->eth_regs[off >> 2],
+                        s->eth_regs[ETH_PDMA_INT_MASK / 4]);
+            }
+        }
         mt7621_eth_update_irq(s);
         return;
     }
@@ -259,21 +383,74 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
          * into descriptors the bootloader still owns.
          */
         s->eth_regs[off >> 2] = val;
+        if (!s->handoff_done) {
+            /* Bootloader code owns this ring; its buffers die with it. */
+            s->bl_rx_base = val;
+        }
         return;
     }
     if (off == ETH_PDMA_GLO_CFG) {
         uint32_t old = s->eth_regs[off >> 2];
 
+        if (getenv("MT7621_RXDBG")) {
+            static int gbudget = 60;
+
+            if (gbudget-- > 0) {
+                fprintf(stderr, "eth: glo cfg %08x -> %08x pc=%08x\n",
+                        old, (uint32_t)val,
+                        s->cpu ? (uint32_t)s->cpu->env.active_tc.PC : 0);
+            }
+        }
         s->eth_regs[off >> 2] = val;
-        /* RX DMA (re)start: the engine begins at descriptor 0 again */
+        if (val & (1u << 31)) {
+            if (!s->eth_linux) {
+                fprintf(stderr, "mt7621: eth: kernel driver took the MAC "
+                        "over (RX_2B_OFFSET, glo=%08x, boot ring %08x)\n",
+                        (uint32_t)val, s->bl_rx_base);
+            }
+            s->eth_linux = true;        /* RX_2B_OFFSET: the kernel driver */
+        }
+        /*
+         * TX_EN frames written while the engine is off do not fetch
+         * anything; the ring starts moving when the driver sets TX_EN.
+         * RouterOS's raether runs the whole reset/open sequence with the
+         * engines off (GLO_CFG <- 0 ... <- 0x45), so the kick has to happen
+         * on the 0->1 edge, not on the descriptor writes.
+         */
+        if ((val & 0x1) && !(old & 0x1)) {
+            unsigned q;
+
+            for (q = 0; q < 4; q++) {
+                mt7621_eth_pdma_tx(s, q);
+            }
+        }
+        if (!(val & 0x5)) {
+            /* MAC reset: a real engine drops its pending sources. */
+            s->eth_regs[ETH_PDMA_INT_STATUS / 4] = 0;
+        }
+        /*
+         * RX DMA (re)start.  Enabling the engine starts fetching from the
+         * *current* DRX index - it does not rewind the ring; only PDMA_RST
+         * (0x0a08) resets the indices.  Rewinding here made every driver that
+         * pauses and re-enables RX (RouterOS does during its switch setup)
+         * lose its place in the ring: the guest then reads descriptors it had
+         * already consumed and the bulk install stream was corrupted
+         * ("bad network connection" / "broken package").
+         */
         if ((val & 0x4) && !(old & 0x4)) {
-            s->rx_drx_idx = 0;
-            s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = 0;
+            if (!s->handoff_done) {
+                s->bl_rx_base = s->eth_regs[ETH_PRX_BASE_PTR0 / 4];
+            }
         }
         return;
     }
     if (off == 0x0a08) {                /* PDMA_RST_IDX */
-        s->eth_regs[off >> 2] = val;
+        /*
+         * A reset pulse, not a state: the real board's booter reads this
+         * register back as 0 after writing RST_DRX_IDX0, while the model
+         * left bit 16 set.
+         */
+        s->eth_regs[off >> 2] = 0;
         if (val & (1u << 16)) {         /* RST_DRX_IDX0 */
             s->rx_drx_idx = 0;
             s->eth_regs[ETH_PRX_DRX_IDX0 / 4] = 0;
@@ -289,6 +466,46 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
     }
     if (off == ETH_QDMA_INT_MASK || off == ETH_PDMA_INT_MASK) {
         /*
+         * MT7621_RX_GATE_UP=1: treat the driver's open-time mask
+         * (RX_DONE0 | TX_DONE0) as "the interface is up" and drop received
+         * frames before that.  This closes the probe window from the other
+         * side: no frame can fill the ring or latch RX_DONE while the driver
+         * is still initialising, so the first unmask cannot run a NAPI that
+         * netif_napi_add() has not filled in yet.  Off by default; a driver
+         * that programs a different mask would never open the gate.
+         */
+        if (off == ETH_PDMA_INT_MASK) {
+            uint32_t oldmask = s->eth_regs[off >> 2];
+
+            s->eth_up = (val == 0x00010001u);
+            /*
+             * The first unmask is the driver taking the interrupt source over
+             * from the firmware.  The engine's INT_STATUS still carries
+             * whatever the bootloader left latched (our TX_DONE latch is
+             * deliberately mask-independent, and the booter's last transmit is
+             * not necessarily acked before it jumps).  raether enables the
+             * mask *before* netif_napi_add(), so such a stale bit fires the
+             * handler immediately and net_rx_action calls a napi_struct whose
+             * ->poll is not set yet: "Fatal exception in interrupt",
+             * epc = 0, ra in napi_poll.  A real bootloader/engine hand-over
+             * leaves no pending source behind; clear it here.
+             */
+            if (oldmask == 0 && val != 0 &&
+                (s->eth_regs[ETH_PDMA_INT_STATUS / 4] != 0)) {
+                fprintf(stderr, "mt7621: eth: discarded firmware interrupt "
+                        "status %08x at driver unmask\n",
+                        s->eth_regs[ETH_PDMA_INT_STATUS / 4]);
+                s->eth_regs[ETH_PDMA_INT_STATUS / 4] = 0;
+            }
+            if (getenv("MT7621_TXDBG")) {
+                static int mbudget = 60;
+
+                if (mbudget-- > 0) {
+                    fprintf(stderr, "pdma: int mask <- %08x\n", (uint32_t)val);
+                }
+            }
+        }
+        /*
          * A level-triggered line must drop as soon as the driver masks the
          * source, otherwise the CPU stays in the interrupt handler forever.
          */
@@ -297,12 +514,46 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
         return;
     }
 
-    if (off == MT7621_ETH_IAC &&
-        (val & ETH_IAC_ACCESS) && (val & ETH_IAC_START)) {
+    if (getenv("MT7621_MDIOLOG") && off == MT7621_ETH_IAC) {
+        static unsigned budget = 240;
+
+        if (budget--) {
+            fprintf(stderr, "mdio: w#%lu %08x phy=%02u reg=%02u %s data=%04x"
+                    " access=%u start=%u\n", mdio_wseq, val,
+                    (unsigned)(val >> ETH_IAC_ADDR_SHIFT) & 0x1f,
+                    (unsigned)(val >> ETH_IAC_REG_SHIFT) & 0x1f,
+                    (val & ETH_IAC_WRITE) ? "wr" : "rd",
+                    (unsigned)(val & 0xffff),
+                    !!(val & ETH_IAC_ACCESS), !!(val & ETH_IAC_START));
+        }
+        mdio_wseq++;
+    }
+
+    if (off == MT7621_ETH_IAC && (val & ETH_IAC_ACCESS)) {
         unsigned phy = (val >> ETH_IAC_ADDR_SHIFT) & 0x1f;
         unsigned reg = (val >> ETH_IAC_REG_SHIFT) & 0x1f;
 
-        if (val & ETH_IAC_WRITE) {
+        if (!(val & ETH_IAC_START)) {
+            /*
+             * ACCESS (bit 31) is the transaction: write it and the controller
+             * runs the frame, then clears it.  ST (bit 16) is the copy of the
+             * MDIO frame's start-of-frame field, not a second go bit -
+             * clause-22 frames carry 01 there and clause-45 frames carry 00.
+             *
+             * RouterBOOT's etherboot sends such a frame (phy 0, register
+             * 0x1f) and then polls ACCESS.  Requiring ST here left ACCESS set
+             * for ever, so the booter spun ~1200 times per frame before
+             * giving up - which is what the "mdio: read ... ACCESS-STILL-SET"
+             * trace showed on the die image.
+             *
+             * No device on this bus answers clause 45, so a read completes
+             * with all ones, exactly like an unpopulated address.
+             */
+            if (val & ETH_IAC_READ) {
+                val |= 0xffff;
+            }
+            val &= ~ETH_IAC_ACCESS;
+        } else if (val & ETH_IAC_WRITE) {
             unsigned data = val & 0xffff;
 
             if (phy == 0x1f) {
@@ -340,22 +591,26 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
                 }
             }
             /*
-             * Clear only ACCESS.  Clearing START as well was tried and
-             * panics RouterOS: it takes another completion bit into
-             * account and ends up dispatching through a NULL handler
-             * (epc = 0, "Fatal exception in interrupt") during
-             * switch0: mediatek_reset.  Keep the behaviour the working
-             * images were built against; probe START polling separately
-             * with MT7621_IAC_CLR_START=1.
+             * The real board's IAC register reads back as 0x0000_<data>
+             * after a transfer: the controller clears ACCESS and the whole
+             * request (register/address/read/write/start) and keeps only the
+             * 16-bit data.  Keeping the request bits (the old behaviour) is
+             * a difference a booter can see when it re-reads the register.
              */
-            if (getenv("MT7621_IAC_CLR_START")) {
-                val &= ~(ETH_IAC_ACCESS | ETH_IAC_START);
-            } else {
-                val &= ~ETH_IAC_ACCESS;
-            }
+            val &= 0xffffu;
         } else {
-            val = (val & ~(ETH_IAC_ACCESS | 0xffff)) |
-                  mt7621_eth_phy_read(s, phy, reg);
+            uint16_t data = mt7621_eth_phy_read(s, phy, reg);
+
+            /* completed read: hardware leaves 0x0000_<data> (see above) */
+            val = data;
+            if (getenv("MT7621_MDIOLOG")) {
+                static unsigned rbudget = 200;
+
+                if (rbudget--) {
+                    fprintf(stderr, "mdio: read phy=%02u reg=%02u -> %04x\n",
+                            phy, reg, data);
+                }
+            }
         }
     }
 
@@ -383,6 +638,9 @@ static void mt7621_eth_write(void *opaque, hwaddr addr, uint64_t val64,
  */
 static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
 {
+    if (s->eth_halted) {
+        return;
+    }
     uint32_t base = s->eth_regs[(ETH_PTX_BASE_PTR0 + q * 0x10) / 4];
     uint32_t cnt = s->eth_regs[(ETH_PTX_MAX_CNT0 + q * 0x10) / 4];
     uint32_t ctx = s->eth_regs[(ETH_PTX_CTX_IDX0 + q * 0x10) / 4];
@@ -393,6 +651,17 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
     unsigned fport = 0;
     int guard = 0;
 
+    /*
+     * PDMA_GLO_CFG.TX_EN (bit 0): a disabled engine does not fetch
+     * descriptors.  The guest reprograms the rings during reset with the
+     * engine off, and the bootloader's ring is still programmed then, so
+     * fetching on those writes transmitted half-built frames and latched
+     * TX_DONE for a NAPI instance that had not been registered yet.
+     */
+    if (!(s->eth_regs[ETH_PDMA_GLO_CFG / 4] & 0x1) &&
+        !getenv("MT7621_TX_IGNORE_DMAEN")) {
+        return;
+    }
     if (!base || !cnt || cnt > 0x1000) {
         s->ptx_idx[q] = ctx;
         return;
@@ -438,7 +707,11 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
 
         if (last && flen >= 14) {
             bool forward = true;
+            uint8_t tag4[4] = { 0 };
 
+            if (flen >= 16) {
+                memcpy(tag4, frame + 12, 4);
+            }
             forward = mt7621_tx_strip_tag(s, frame, &flen);
             if (getenv("MT7621_ETHLOG")) {
                 fprintf(stderr, "eth: ptx idx=%u fport=%u tag=%02x%02x "
@@ -479,11 +752,35 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
                     fprintf(stderr, "\n");
                 }
             }
-            if (getenv("MT7621_NILOG")) {
-                fprintf(stderr, "eth: txn len=%zu fport=%u b12=%02x%02x%02x%02x "
-                        "dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                        flen, fport, frame[12], frame[13], frame[14], frame[15],
-                        frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]);
+            /*
+             * The first few transmits after a reset are logged
+             * unconditionally: when the installer and the agent just wait
+             * for each other, the first question is whether the guest
+             * transmitted at all, and what the frame looked like after the
+             * switch tag was stripped.
+             */
+            {
+                static int tx_boot = 6, tx_kernel = 16;
+
+                if (getenv("MT7621_NILOG")) {
+                    tx_boot = tx_kernel = 64;
+                }
+                if (s->handoff_done ? tx_kernel > 0 : tx_boot > 0) {
+                    if (s->handoff_done) {
+                        tx_kernel--;
+                    } else {
+                        tx_boot--;
+                    }
+                    fprintf(stderr, "eth: txn%s q=%u len=%zu fport=%u fwd=%d "
+                            ""
+                            "tag=%02x%02x%02x%02x dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                            "type=%02x%02x\n",
+                            s->handoff_done ? "(k)" : "(b)",
+                            q, flen, fport, forward,
+                            tag4[0], tag4[1], tag4[2], tag4[3],
+                            frame[0], frame[1], frame[2], frame[3], frame[4],
+                            frame[5], frame[12], frame[13]);
+                }
             }
             if (forward) {
                 mt7621_ni_dump("tx", frame, flen);
@@ -521,10 +818,20 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
      */
     if (processed && !getenv("MT7621_NOPDMA_TXDONE")) {
         uint32_t mask = s->eth_regs[ETH_PDMA_INT_MASK / 4];
-        uint32_t bits = 0;
+        uint32_t bits = PDMA_TX_DONE0 << q;
 
-        if (mask & (PDMA_TX_DONE0 << q)) {
-            bits |= PDMA_TX_DONE0 << q;
+        /*
+         * INT_STATUS is set by the engine; INT_MASK only gates the IRQ line.
+         * Latching only masked bits lost every completion that happened while
+         * the guest had interrupts masked - raether masks them inside its
+         * xmit path, so it never reaped those descriptors:
+         *
+         *   eth0: queue1->trans_start=... stopped:1 in_transmit:101
+         *
+         * MT7621_MASKED_STATUS=1 restores the old (wrong) behaviour for A/B.
+         */
+        if (getenv("MT7621_MASKED_STATUS")) {
+            bits &= mask;
         }
         /*
          * MT7621_TX_DLY=1 additionally latches MTK_TX_DONE_DLY when the
@@ -551,14 +858,39 @@ static void mt7621_eth_pdma_tx(MT7621State *s, unsigned q)
      * many descriptors were consumed and which completion bits it masks.
      */
     if (getenv("MT7621_TXDBG")) {
-        static int budget = 24;
+        /* Only the guest's own driver: the bootloader's DHCP retries would
+         * otherwise consume the whole budget before /init.real starts.
+         * MT7621_TXDBG_N raises the budget: the bootloader's own DHCP
+         * retries can consume the default before the guest driver starts. */
+        static int budget = -1;
 
+        if (budget < 0) {
+            const char *n = getenv("MT7621_TXDBG_N");
+
+            budget = n ? atoi(n) : 24;
+        }
         if (budget-- > 0) {
+            uint32_t d0 = 0, d2 = 0;
+
+            if (base && cnt && idx < cnt) {
+                d0 = address_space_ldl_le(&address_space_memory,
+                                          base + idx * 16,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+                d2 = address_space_ldl_le(&address_space_memory,
+                                          base + idx * 16 + 4,
+                                          MEMTXATTRS_UNSPECIFIED, NULL);
+            }
             fprintf(stderr, "eth: ptx q=%u base=%08x cnt=%u ctx=%u idx=%u "
-                    "done=%d mask=%08x status=%08x\n",
+                    "done=%d mask=%08x status=%08x glo=%08x "
+                    "desc0=%08x desc2=%08x%s\n",
                     q, base, cnt, ctx, idx, processed,
                     s->eth_regs[ETH_PDMA_INT_MASK / 4],
-                    s->eth_regs[ETH_PDMA_INT_STATUS / 4]);
+                    s->eth_regs[ETH_PDMA_INT_STATUS / 4],
+                    s->eth_regs[ETH_PDMA_GLO_CFG / 4], d0, d2,
+                    (idx != ctx && !processed) ?
+                        (s->eth_regs[ETH_PDMA_GLO_CFG / 4] & 1 ? " blocked=desc"
+                                                              : " blocked=txoff")
+                        : "");
         }
     }
 }
@@ -720,10 +1052,42 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     bool took_bql = !bql_locked();
     unsigned ring = 0;
     bool have_ring = false;
-    bool linux_guest;
+    bool linux_guest = false;
     static int dbg;
 
-    if (len < 14) {
+    if (len < 14 || s->eth_halted) {
+        return;
+    }
+    /*
+     * PDMA_GLO_CFG.RX_EN (bit 2).  The engine only fetches descriptors and
+     * only latches RX_DONE while it is enabled.  This matters at hand-over:
+     * the bootloader leaves its ring programmed and GLO_CFG = 0x45, then the
+     * guest driver resets the MAC during probe (GLO_CFG <- 0) and re-arms its
+     * own ring before re-enabling.  Without the gate we kept delivering into
+     * whatever ring was still programmed - during RouterOS probe that is the
+     * bootloader's ring, and the RX interrupt then ran raether's ISR before
+     * netif_napi_add() had filled in ->poll: net_rx_action called through a
+     * NULL pointer, "Fatal exception in interrupt", epc = 0.
+     */
+    if (getenv("MT7621_RX_GATE_UP") && !s->eth_up) {
+        return;
+    }
+
+    if (!(s->eth_regs[ETH_PDMA_GLO_CFG / 4] & 0x4) &&
+        !getenv("MT7621_RX_IGNORE_DMAEN")) {
+        if (getenv("MT7621_RXDBG")) {
+            static int budget = 40;
+
+            if (budget-- > 0) {
+                fprintf(stderr, "rxpkt drop: RX DMA off len=%zu glm=%08x "
+                        "r0(base=%08x cnt=%u) r1(base=%08x cnt=%u)\n",
+                        len, s->eth_regs[ETH_PDMA_GLO_CFG / 4],
+                        s->eth_regs[(ETH_PRX_BASE_PTR0 + 0x00) / 4],
+                        s->eth_regs[(ETH_PRX_MAX_CNT0 + 0x00) / 4],
+                        s->eth_regs[(ETH_PRX_BASE_PTR0 + 0x10) / 4],
+                        s->eth_regs[(ETH_PRX_MAX_CNT0 + 0x10) / 4]);
+            }
+        }
         return;
     }
     /*
@@ -801,6 +1165,25 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
         if (!b || !c || c > 0x1000) {
             continue;
         }
+        /*
+         * The bootloader's DMA configuration ends at the hand-off: the kernel
+         * reuses the RAM that ring points at before its driver probes the
+         * MAC, so writing frames there corrupts live kernel memory.  Observed
+         * on the netinstall agent as a napi_struct whose ->poll became NULL,
+         * then "Fatal exception in interrupt" (epc = 0, in napi_poll) when
+         * /init.real brought the interface up.  Skip the old ring until the
+         * kernel driver installs its own (or marks the MAC as taken over).
+         */
+        if (s->handoff_done && s->bl_rx_base && b == s->bl_rx_base) {
+            static int sbudget = 8;
+
+            if (sbudget-- > 0) {
+                fprintf(stderr, "mt7621: eth: refusing frames into the "
+                        "pre-hand-off RX ring %08x (kernel has not armed its "
+                        "own ring yet)\n", b);
+            }
+            continue;
+        }
         i = s->eth_regs[(ETH_PRX_DRX_IDX0 + ring * 0x10) / 4];
         if (i >= c) {
             i = 0;
@@ -817,6 +1200,22 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     }
     }
     if (!have_ring) {
+        if (getenv("MT7621_RXDBG")) {
+            static unsigned nrxdbg = 200;
+
+            if (nrxdbg--) {
+                fprintf(stderr, "rxpkt: no ring len=%zu r0(base=%08x cnt=%u "
+                        "drx=%u) r1(base=%08x cnt=%u drx=%u) switch=%d "
+                        "first=%08x\n", len,
+                        s->eth_regs[(ETH_PRX_BASE_PTR0 + 0x00) / 4],
+                        s->eth_regs[(ETH_PRX_MAX_CNT0 + 0x00) / 4],
+                        s->eth_regs[(ETH_PRX_DRX_IDX0 + 0x00) / 4],
+                        s->eth_regs[(ETH_PRX_BASE_PTR0 + 0x10) / 4],
+                        s->eth_regs[(ETH_PRX_MAX_CNT0 + 0x10) / 4],
+                        s->eth_regs[(ETH_PRX_DRX_IDX0 + 0x10) / 4],
+                        s->eth_switch, s->eth_rx_first_base);
+            }
+        }
         if (getenv("MT7621_RXDBG") || getenv("MT7621_ETHLOG")) {
             fprintf(stderr, "rxpkt drop: no armed ring (r0 base=%08x cnt=%u "
                     "drx=%u, r1 base=%08x cnt=%u drx=%u) len=%zu\n",
@@ -941,8 +1340,66 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     if (linux_guest && getenv("MT7621_RX_OFF")) {
         rx_off = atoi(getenv("MT7621_RX_OFF")) & 3;
     }
+    /*
+     * The first few deliveries after a reset are logged unconditionally: the
+     * installed RouterOS panics in a softirq shortly after its switch driver
+     * comes up, and the tag/port a frame was delivered with is the first thing
+     * that has to be known - an invalid switch-port index there is a plausible
+     * cause for the unaligned access seen in the FDB learning path.
+     */
+    {
+        static unsigned frx_boot = 6, frx_kernel = 16;
+
+        if (getenv("MT7621_RXDBG")) {
+            frx_boot = frx_kernel = 200;
+        }
+        if (s->handoff_done ? frx_kernel > 0 : frx_boot > 0) {
+            if (s->handoff_done) {
+                frx_kernel--;
+            } else {
+                frx_boot--;
+            }
+            fprintf(stderr, "rxpkt: %s ring=%u base=%08x idx=%u buf=%08x "
+                    "cap=%u len=%zu tagged=%d linux=%d off=%u tag=%02x%02x "
+                    "fportb=%08x dst=%02x:%02x:%02x:%02x:%02x:%02x "
+                    "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x\n",
+                    s->handoff_done ? "deliver(k)" : "deliver(b)",
+                    ring, base, idx, rxd1, cap, len, tagged_mode, linux_guest,
+                    rx_off, (tagged_mode ? (unsigned)tagged[12] : 0),
+                    (tagged_mode ? (unsigned)tagged[13] : 0),
+                    fport_bits, buf[0], buf[1], buf[2], buf[3], buf[4],
+                    buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                    buf[12], buf[13]);
+        }
+    }
     if (flen > cap) {
         flen = cap;                        /* stay inside the driver buffer */
+    }
+    /*
+     * The descriptor has to point at a real DMA buffer.  A stale or
+     * half-programmed descriptor (ring re-arm, driver teardown) can carry a
+     * garbage buffer address or capacity, and writing the frame there
+     * scribbles over whatever lives at that guest address - observed as a
+     * napi_struct whose ->poll became NULL, taking net_rx_action down with
+     * epc=0 in interrupt context.  Drop such a frame instead of obeying it:
+     * the guest never hands hardware a descriptor like that, so this is not
+     * a departure from the hardware, it is refusing to invent one.
+     */
+    {
+        uint32_t phys = rxd1 & 0x1fffffffu;
+
+        /* RAM size from the alias count the machine installed at reset. */
+        uint64_t ramsz = 0x20000000ull / ((uint64_t)s->ram_alias_count + 1);
+
+        if (cap < 64 || cap > 0x10000u || phys < 0x100u ||
+            (uint64_t)phys + cap + 16 > ramsz) {
+            if (getenv("MT7621_RXDBG") || getenv("MT7621_ETHLOG")) {
+                fprintf(stderr, "eth: rx drop bad-desc idx=%u desc=%08x "
+                        "buf=%08x cap=%u len=%zu\n",
+                        idx, desc, rxd1, cap, len);
+            }
+            goto out;
+        }
     }
     /*
      * PDMA_GLO_CFG has RX_2B_OFFSET set, so the engine starts the frame two
@@ -1002,11 +1459,37 @@ static void mt7621_eth_rx(MT7621State *s, const uint8_t *buf, size_t len)
     {
         /* One RX-done bit per ring: 16 for ring 0, 17 for ring 1. */
         uint32_t bit = PDMA_RX_DONE << ring;
-        uint32_t rxint = s->eth_regs[ETH_PDMA_INT_MASK / 4] &
-                         (bit | PDMA_RX_DLY_INT);
+        uint32_t mask = s->eth_regs[ETH_PDMA_INT_MASK / 4];
+        uint32_t bits = 0;
 
-        if (rxint) {
-            s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= rxint;
+        /*
+         * RX_DONE only while the driver has RX_DONE enabled.  This is the
+         * probe race, reproduced with a broadcast every 300 ms:
+         *
+         *   insmod raether.ko; ifconfig eth0 ... up   -> epc = 0 in napi_poll
+         *   insmod raether.ko; sleep 25; ifconfig ... -> healthy link
+         *
+         * The probe programs the rings and enables the engine with the
+         * interrupt mask clear; frames that arrive then latch a status bit,
+         * and the first unmask (open) raises the line before netif_napi_add
+         * has filled in ->poll.  Hardware does not do that because the
+         * switch only forwards to the CPU port once the port is up, which
+         * this model has no switch to enforce.
+         *
+         * TX_DONE keeps latching regardless of the mask (the separate
+         * "in_transmit:101" queue stall needs exactly that).
+         */
+        if (mask & bit) {
+            bits |= bit;
+        }
+        if (mask & PDMA_RX_DLY_INT) {
+            bits |= PDMA_RX_DLY_INT;    /* coalescing counter bit */
+        }
+        if (getenv("MT7621_MASKED_STATUS")) {
+            bits &= mask;
+        }
+        if (bits) {
+            s->eth_regs[ETH_PDMA_INT_STATUS / 4] |= bits;
         }
     }
 
@@ -1188,7 +1671,15 @@ static void mt7621_phy_defaults(MT7621State *s)
         s->phy_regs[p][4]  = 0x01e1;    /* 10/100 advertise */
         s->phy_regs[p][9]  = 0x0300;    /* MII_CTRL1000: 1000BASE-T f/h */
     }
-    s->phy_link_ns = 0;
+    /*
+     * Autonegotiation finishes a fixed time after the PHY is powered, not
+     * after the first time somebody asks: the deadline is set here, at
+     * machine reset.  Setting it on the first BMSR read instead made the
+     * first poll always report "link down", which RouterBOOT's etherboot
+     * treats as "retry" - and the retry path of this booter build faults
+     * (see model-quirks.md sec.9), so the boot hung with no output.
+     */
+    s->phy_link_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 300 * 1000 * 1000LL;
     (void)r;
 }
 
@@ -1464,31 +1955,36 @@ static void mt7621_eth_tx_tso(MT7621State *s, const uint8_t *frame, size_t len)
     }
 }
 
-static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
+static void mt7621_eth_tx(MT7621State *s, unsigned ci, uint32_t ctx)
 {
-    uint32_t p = s->qtx_dtx;
-    uint32_t base = s->qtx_base;
+    uint32_t p = ci ? s->qtx_dtx1 : s->qtx_dtx;
+    uint32_t base = ci ? s->qtx_base1 : s->qtx_base;
     int guard = 0;
     unsigned sent = 0;
     /*
-     * One frame can span several descriptors (skb head + page fragments);
+     * One frame[ci] can span several descriptors (skb head + page fragments);
      * the engine concatenates them until it meets TX_DMA_LS0.  Keep the
-     * partially assembled frame across calls.
+     * partially assembled frame[ci] across calls.
      */
-    static uint8_t frame[0x10000];
-    static size_t flen;
-    static bool frame_started;
-    static unsigned frame_fport;
-    static bool frame_csum;
-    static bool frame_tso;
+    static uint8_t frame[2][0x10000];
+    static size_t flen[2];
+    static bool frame_started[2];
+    static unsigned frame_fport[2];
+    static bool frame_csum[2];
+    static bool frame_tso[2];
 
     if (!base || p < base || p >= base + TX_RING_BYTES ||
         ctx < base || ctx >= base + TX_RING_BYTES) {
         /* the ring was re-allocated: resynchronise and send nothing */
-        flen = 0;
-        frame_started = false;
-        s->qtx_dtx = ctx;
-        s->qtx_base = ctx;
+        flen[ci] = 0;
+        frame_started[ci] = false;
+        if (ci) {
+            s->qtx_dtx1 = ctx;
+            s->qtx_base1 = ctx;
+        } else {
+            s->qtx_dtx = ctx;
+            s->qtx_base = ctx;
+        }
         return;
     }
 
@@ -1519,18 +2015,18 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
             }
         }
         if (filled && txd1 && len) {
-            if (!frame_started) {
-                frame_started = true;
-                frame_fport = (txd4 >> TX_DMA_FPORT_SHIFT) & 0x7;
-                frame_csum = !!(txd4 & TX_DMA_CHKSUM);
-                frame_tso = !!(txd4 & TX_DMA_TSO);
+            if (!frame_started[ci]) {
+                frame_started[ci] = true;
+                frame_fport[ci] = (txd4 >> TX_DMA_FPORT_SHIFT) & 0x7;
+                frame_csum[ci] = !!(txd4 & TX_DMA_CHKSUM);
+                frame_tso[ci] = !!(txd4 & TX_DMA_TSO);
             }
-            if (len > sizeof(frame) - flen) {
-                len = sizeof(frame) - flen;
+            if (len > sizeof(frame[ci]) - flen[ci]) {
+                len = sizeof(frame[ci]) - flen[ci];
             }
             address_space_read(&address_space_memory, txd1,
-                               MEMTXATTRS_UNSPECIFIED, frame + flen, len);
-            flen += len;
+                               MEMTXATTRS_UNSPECIFIED, frame[ci] + flen[ci], len);
+            flen[ci] += len;
 
             if (last) {
                 bool forward = false;
@@ -1542,41 +2038,41 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                  * switch would put on our port may leave through this
                  * backend; GMAC2 (the wan MAC) is not behind the switch.
                  */
-                if (frame_fport == 1) {
-                    forward = mt7621_tx_strip_tag(s, frame, &flen);
+                if (frame_fport[ci] == 1) {
+                    forward = mt7621_tx_strip_tag(s, frame[ci], &flen[ci]);
                 }
 
-                if (forward && frame_tso) {
-                    mt7621_eth_tx_tso(s, frame, flen);
+                if (forward && frame_tso[ci]) {
+                    mt7621_eth_tx_tso(s, frame[ci], flen[ci]);
                     forward = false;
-                } else if (forward && frame_csum) {
-                    mt7621_eth_tx_csum(frame, flen);
+                } else if (forward && frame_csum[ci]) {
+                    mt7621_eth_tx_csum(frame[ci], flen[ci]);
                 }
 
-                if (!forward && getenv("MT7621_ETHLOG") && flen > 18) {
+                if (!forward && getenv("MT7621_ETHLOG") && flen[ci] > 18) {
                     fprintf(stderr, "eth: tx drop fport=%u tag=%02x%02x "
                             "len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                            frame_fport, frame[12], frame[13], flen,
-                            frame[0], frame[1], frame[2], frame[3],
-                            frame[4], frame[5]);
+                            frame_fport[ci], frame[ci][12], frame[ci][13], flen[ci],
+                            frame[ci][0], frame[ci][1], frame[ci][2], frame[ci][3],
+                            frame[ci][4], frame[ci][5]);
                 }
                 if (forward && getenv("MT7621_ETHLOG") && sent < 8) {
                     fprintf(stderr, "eth: txf dst=%02x:%02x:%02x:%02x:%02x:%02x "
                             "src=%02x:%02x:%02x:%02x:%02x:%02x type=%02x%02x "
                             "len=%zu\n",
-                            frame[0], frame[1], frame[2], frame[3], frame[4],
-                            frame[5], frame[6], frame[7], frame[8], frame[9],
-                            frame[10], frame[11], frame[12], frame[13], flen);
+                            frame[ci][0], frame[ci][1], frame[ci][2], frame[ci][3], frame[ci][4],
+                            frame[ci][5], frame[ci][6], frame[ci][7], frame[ci][8], frame[ci][9],
+                            frame[ci][10], frame[ci][11], frame[ci][12], frame[ci][13], flen[ci]);
                 }
                 if (forward) {
-                    mt7621_ni_dump("tx", frame, flen);
+                    mt7621_ni_dump("tx", frame[ci], flen[ci]);
                 }
                 if (forward && s->nic) {
-                    qemu_send_packet(qemu_get_queue(s->nic), frame, flen);
+                    qemu_send_packet(qemu_get_queue(s->nic), frame[ci], flen[ci]);
                     sent++;
                 }
-                flen = 0;
-                frame_started = false;
+                flen[ci] = 0;
+                frame_started[ci] = false;
             }
         }
 
@@ -1594,8 +2090,38 @@ static void mt7621_eth_tx(MT7621State *s, uint32_t ctx)
                 p, ctx, sent, guard);
     }
 
-    s->qtx_dtx = p;
-    s->eth_regs[ETH_QTX_DRX_PTR / 4] = p;
+    if (ci) {
+        s->qtx_dtx1 = p;
+    } else {
+        s->qtx_dtx = p;
+    }
+    /*
+     * QDMA progress is published in DTX (0x1b04): it is the DMA's own
+     * transmit index and the only thing a driver can use to tell how many
+     * descriptors it may reuse.  0x1b14 is DRX, the DMA-side *receive*
+     * index; reporting TX progress there left the driver's "in transmit"
+     * count at max_tx_buffers_per_port and stopped the queue:
+     *
+     *   NETDEV WATCHDOG: eth0 (): transmit queue 0 timed out
+     *   eth0: queue0->trans_start=... stopped:1 in_transmit:101
+     *
+     * 101 is max_tx_buffers_per_port, and the agent then could not send the
+     * discovery reply that carries the key ("Key was rejected").
+     */
+    /*
+     * Publish the progress to BOTH QDMA pointers.  DTX is the DMA's own
+     * transmit index, but mainline mtk_eth_soc reclaims from DRX
+     * (MTK_QTX_DRX_PTR, 0x1b14) and walks txd2 chains whose descriptors must
+     * carry TX_DMA_OWNER_CPU:
+     *
+     *   dma = mtk_r32(eth, reg_map->qdma.drx_ptr);
+     *   while ((cpu != dma) ...) { ... if (!(desc->txd3 & OWNER_CPU)) break; }
+     *
+     * With only DTX updated, the driver never reclaims -> NETDEV WATCHDOG
+     * "transmit queue N timed out".
+     */
+    s->eth_regs[(ci ? ETH_QTX_DTX_PTR1 : ETH_QTX_DTX_PTR) / 4] = p;
+    s->eth_regs[(ci ? 0x1b34 : ETH_QTX_DRX_PTR) / 4] = p;
     if (s->nic) {
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     }
@@ -1633,9 +2159,20 @@ void mt7621_eth_init(MT7621State *s)
      * the live port, which is what the bring-up logs used.  RouterOS numbers
      * ether1..5 as ports 0..4 and the tap has always been ether5 there, so
      * that board keeps 4.
+     *
+     * RouterBOOT's etherboot polls BMSR on whichever PHY its eth code was
+     * told to use (the patched booter for this board uses PHY 1), so the
+     * default must stay on a LAN PHY - 0 is the WAN PHY and is link-down
+     * unless MT7621_ETH_PORT=0 moves the cable there.
      */
     const char *p = getenv("MT7621_ETH_PORT");
-    unsigned def_port = s->board == MT7621_BOARD_RB750GR3 ? 4 : 1;
+    /*
+     * lg-gapm7200: the netinstall cable goes into the WAN socket, and that is
+     * the PHY RouterBOOT's etherboot reads (the board's own register dump
+     * shows BMSR = 0x796d, link up).  So the backend represents the WAN PHY
+     * (address 0) on this board by default; the RB750Gr3 keeps its ether5.
+     */
+    unsigned def_port = s->board == MT7621_BOARD_RB750GR3 ? 4 : 0;
 
     s->eth_port = p ? (unsigned)atoi(p) : def_port;
     s->eth_irq = qdev_get_gpio_in(s->gic, 3);
@@ -1683,13 +2220,42 @@ void mt7621_eth_init(MT7621State *s)
 }
 
 /* reset state: called from the machine's reset handler */
+/*
+ * A guest reset request ends the frame engine's life: on the SoC the reset
+ * itself stops both DMAs within microseconds, but this model's reset path is
+ * slow (flash programming, loader emulation).  Without quiescing, the engine
+ * kept writing received frames into RAM while the guest was tearing its page
+ * tables down, which surfaced as "BUG: Bad page map in process route_FANTASY
+ * pte:00000001" and a corrupted rss-counter during /system reboot.
+ */
+void mt7621_eth_quiesce(MT7621State *s)
+{
+    s->eth_halted = true;
+    s->qtx_en = false;
+    s->eth_regs[ETH_PDMA_GLO_CFG / 4] = 0;
+    s->eth_regs[ETH_QDMA_GLO_CFG / 4] = 0;
+    mt7621_eth_update_irq(s);
+}
+
 void mt7621_eth_dev_reset(MT7621State *s)
 {
     memset(s->eth_regs, 0, sizeof(s->eth_regs));
+    s->eth_halted = false;
     s->qtx_dtx = 0;
+    s->qtx_dtx1 = 0;
+    s->qtx_base1 = 0;
     s->qtx_base = 0;
     s->qtx_en = false;
+    s->eth_linux = false;
+    s->handoff_done = false;
+    s->bl_rx_base = 0;
+    s->eth_rx_first_base = 0;
+    s->eth_up = false;
+    s->eth_switch = false;
     s->rx_drx_idx = 0;
+    s->ptx_idx[0] = s->ptx_idx[1] = s->ptx_idx[2] = s->ptx_idx[3] = 0;
     mt7621_switch_defaults(s);
     mt7621_phy_defaults(s);
+    /* No descriptor state, no interrupt: the GIC input must be released. */
+    mt7621_eth_update_irq(s);
 }

@@ -40,6 +40,28 @@ static uint32_t mt7621_systick_count(MT7621State *s, int64_t now)
            & 0xffff;
 }
 
+/*
+ * systick reset: registers, counter anchor, both timers and the GIC line.
+ * mt7621_systick_boot_handover() then re-creates the state the BootROM leaves
+ * (counter running, compare at 0xffff, interrupt enabled).
+ */
+void mt7621_systick_reset(MT7621State *s)
+{
+    if (s->systick_timer) {
+        timer_del(s->systick_timer);
+    }
+    if (s->systick_pulse_off) {
+        timer_del(s->systick_pulse_off);
+    }
+    memset(s->systick_regs, 0, sizeof(s->systick_regs));
+    s->systick_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->systick_base_count = 0;
+    s->systick_pending = false;
+    if (s->systick_irq) {
+        qemu_irq_lower(s->systick_irq);
+    }
+}
+
 void mt7621_systick_set_pending(MT7621State *s, bool pending)
 {
     s->systick_pending = pending;

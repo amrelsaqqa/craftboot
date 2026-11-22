@@ -78,6 +78,13 @@ typedef struct MT7621DSet {
     uint8_t stale;              /* bit per way */
 } MT7621DSet;
 
+/* How the dump stores the spare area (see nand_spare below) */
+enum {
+    NAND_SPARE_NONE = 0,        /* main area only, spare synthesised */
+    NAND_SPARE_PAGE = 1,        /* 2048 data + 64 spare per page */
+    NAND_SPARE_SECTOR = 2,      /* 512 data + 16 spare per sector */
+};
+
 struct MT7621State {
     MachineState parent;
 
@@ -114,6 +121,7 @@ struct MT7621State {
     MemReentrancyGuard nic_guard;
     qemu_irq eth_irq;
     uint32_t rx_drx_idx;
+    uint32_t bl_rx_base;        /* bootloader's RX ring base (owner marker) */
     uint32_t ptx_idx[4];        /* PDMA transmit ring consumer index */
     int64_t phy_link_ns;        /* when the tapped PHY reports link up */
     uint16_t phy_regs[32][32];  /* MDIO register file per address */
@@ -128,6 +136,22 @@ struct MT7621State {
     uint32_t eth_rx_first_base; /* first RX ring base seen: the bootloader's.
                                  * The kernel installs its own ring, which is the
                                  * only reliable "handover happened" signal. */
+    int reset_count;            /* machine resets: 1 = initial (cold) */
+    bool seen_high_pc;          /* guest ran in the bootloader's RAM window */
+    bool handoff_done;          /* kernel took over from the bootloader */
+    bool seen_boot;             /* bootloader code has executed */
+    unsigned kernel_hits;       /* consecutive polls in kernel text */
+    bool bl_timer_armed;        /* bootloader left CP0 Compare armed */
+    unsigned cm_vps;            /* VPs (hardware threads) per core */
+    uint8_t cm_coherent[MT7621_MAX_CPUS]; /* GCR_CL_COHERENCE, per core */
+    bool warm_boot;             /* reset with DRAM already trained */
+    int pchit_budget;           /* PC-hit register dump budget */
+    int bootlog_budget;         /* per-reset instruction trace budget */
+    bool eth_up;                /* driver wrote its open-time INT_MASK */
+    bool eth_halted;            /* reset requested: engine stops DMA */
+    bool eth_linux;             /* kernel driver took the MAC over: it programs
+                                 * PDMA_GLO_CFG with RX_2B_OFFSET, which RouterBOOT
+                                 * never sets.  The reliable phase marker. */
     bool eth_switch;            /* guest programmed a PCR matrix: a switch-aware
                                  * stack (RouterOS) owns the port now.  RouterBOOT
                                  * never writes PCR, so this is the reliable
@@ -135,9 +159,17 @@ struct MT7621State {
                                  * useless because the booter sets it during TFTP. */
     uint32_t qtx_dtx;           /* forward DMA pointer (next to send) */
     uint32_t qtx_base;          /* start of the TX descriptor ring */
+    uint32_t qtx_dtx1;          /* second QDMA TX context (0x1b20/0x1b24) */
+    uint32_t qtx_base1;
     bool qtx_en;                /* QDMA TX DMA enable */
     MemoryRegion cm;
     MemoryRegion eth;
+    MemoryRegion spy;           /* MT7621_PERIPHSPY catch-all, bring-up only */
+    MemoryRegion usb;           /* SSUSB xHCI MAC at 0x1e1c0000 */
+    MemoryRegion ippc;          /* SSUSB port power/clock at 0x1e1d0700 */
+    uint32_t usb_regs[0x1000 / 4];
+    uint32_t ippc_regs[0x100 / 4];
+    bool usb_run;               /* USBCMD Run/Stop: USBSTS.HCH is its inverse */
     MemoryRegion fe_sram;       /* 0x1e108000: FE/PSE SRAM used before DDR */
     MemoryRegion ram_alias[8];
     int ram_alias_count;
@@ -151,6 +183,15 @@ struct MT7621State {
     uint8_t *nand;
     uint64_t nand_size;
     uint32_t nand_stride;       /* bytes per page in the dump (2048/2112) */
+    /*
+     * How the spare area sits in the dump:
+     *   NAND_SPARE_NONE  main area only, spare synthesised
+     *   NAND_SPARE_PAGE  2048 data + 64 spare per page ("mtdall" style)
+     *   NAND_SPARE_SECTOR 512 data + 16 spare per sector, 4 per page - what
+     *                     the controller itself streams and what a raw
+     *                     nanddump of this part contains
+     */
+    int nand_spare;
     uint32_t nand_pages;        /* pages in the dump */
     uint8_t nfi_fifo[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
     uint32_t nfi_fifo_len;
@@ -163,9 +204,15 @@ struct MT7621State {
     uint8_t nfi_addr[8];
     uint32_t nfi_addr_len;
     uint32_t nfi_addr_pending;
+    bool nfi_addr_fresh;      /* a command started a new address phase */
+    bool nfi_read_pending;    /* 0x30 seen, page not fetched yet */
+    bool nfi_addr_row_only;   /* erase: address stream has no column bytes */
 
     /* page program buffer */
     uint8_t nfi_wbuf[MT7621_NAND_PAGE_SIZE + MT7621_NAND_OOB_SIZE];
+    /* spare bytes the guest pushed through NFI_FDML/FDMM for this program */
+    uint8_t nfi_fdmbuf[MT7621_NAND_OOB_SIZE];
+    bool nfi_fdm_set;
     uint32_t nfi_wbuf_len;
     uint32_t nfi_wcol;          /* column of the page-program that filled wbuf */
     bool nfi_writing;
@@ -291,15 +338,32 @@ bool mt7621_flag(const char *name);
 /* modules (each one is modules/<block>.c) */
 void mt7621_uart1_init(MT7621State *s);
 void mt7621_wdt_init(MT7621State *s);
+void mt7621_wdt_reset(MT7621State *s);
 void mt7621_systick_init(MT7621State *s);
+void mt7621_systick_reset(MT7621State *s);
+/*
+ * Per-controller resets: each one clears *all* of that block's state - the
+ * register file, FIFOs, latches and pending interrupts - and nothing else.
+ * mt7621_reset() calls every one of them, so a warm boot never inherits
+ * device state from the system it replaced.  Flash contents and the board's
+ * strapping properties are not device state and are preserved.
+ */
+void mt7621_nfi_reset(MT7621State *s);
+void mt7621_spi_reset(MT7621State *s);
+void mt7621_usb_reset(MT7621State *s);
+void mt7621_crypto_reset(MT7621State *s);
+void mt7621_loader_reset(MT7621State *s);
 void mt7621_board_apply(MT7621State *s, const char *filename);
 void mt7621_spi_init(MT7621State *s);
 void mt7621_nfi_init(MT7621State *s);
 void mt7621_nand_load(MT7621State *s, const char *filename);
 void mt7621_eth_init(MT7621State *s);
+void mt7621_eth_quiesce(MT7621State *s);
+void mt7621_cpu_hw_config(MT7621State *s, CPUMIPSState *env);
 void mt7621_eth_dev_reset(MT7621State *s);
+void mt7621_usb_init(MT7621State *s);
 void mt7621_cm_init(MT7621State *s);
-void mt7621_cm_defaults(MT7621State *s);
+void mt7621_cm_reset(MT7621State *s);
 void mt7621_cpu_reset(void *opaque);
 void mt7621_crypto_init(MT7621State *s);
 void mt7621_dump_init(MT7621State *s);
@@ -308,6 +372,8 @@ void mt7621_nor_load(MT7621State *s, const char *filename);
 ssize_t mt7621_flash_pread(MT7621State *s, int fd, uint64_t off,
                            void *buf, size_t len);
 void mt7621_nand_attach(MT7621State *s);
+void mt7621_nand_snapshot(MT7621State *s, const char *path);
+void mt7621_nand_taglog_boot_open(void);
 /* write-all helper for the persistent NAND image */
 int mt7621_pwrite_all(int fd, const void *buf, size_t len, off_t off);
 /* the CM/CPC reset path reprograms the systick compare */

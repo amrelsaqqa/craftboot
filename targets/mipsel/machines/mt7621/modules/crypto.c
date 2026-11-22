@@ -46,7 +46,7 @@
                                  (1u << 16) | (1u << 15) | (1u << 14) | \
                                  (1u << 13) | (1u << 2) | (1u << 0))
 
-static void mt7621_crypto_reset(MT7621State *s)
+void mt7621_crypto_reset(MT7621State *s)
 {
     memset(s->crypto_regs, 0, sizeof(s->crypto_regs));
     s->crypto_regs[EIP93_REG_PE_REVISION / 4] =

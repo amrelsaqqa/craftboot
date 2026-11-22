@@ -10,6 +10,7 @@
 #define MT7621_ETH_IAC          0x10004
 
 #define ETH_IAC_ACCESS          (1u << 31)
+#define ETH_IAC_READ            (1u << 19)
 #define ETH_IAC_WRITE           (1u << 18)
 #define ETH_IAC_START           (1u << 16)
 #define ETH_IAC_ADDR_SHIFT      20
@@ -48,6 +49,8 @@
 #define ETH_QDMA_GLO_CFG        0x1a04
 #define ETH_QTX_CTX_PTR         0x1b00
 #define ETH_QTX_DTX_PTR         0x1b04
+#define ETH_QTX_CTX_PTR1        0x1b20
+#define ETH_QTX_DTX_PTR1        0x1b24
 #define ETH_QTX_DRX_PTR         0x1b14
 #define ETH_QDMA_INT_STATUS     0x1a18
 #define ETH_QDMA_INT_MASK       0x1a1c

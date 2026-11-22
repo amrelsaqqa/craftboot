@@ -7,6 +7,38 @@
 #include "qemu/osdep.h"
 #include "mt7621.h"
 
+/* KSEG1 window: 512 MiB on this SoC, upper half aliases the DRAM below */
+#define MT7621_LOAD_WINDOW 0x20000000ULL
+
+/*
+ * Loader/bring-up reset: every latch the model uses to follow the boot is a
+ * property of *one* boot.  Keeping any of them across a reset makes the
+ * second boot take the first boot's path (the hand-off latch especially: a
+ * bootloader frame would be refused because "the kernel already owns the
+ * engine").
+ */
+void mt7621_loader_reset(MT7621State *s)
+{
+    s->seen_high_pc = false;
+    s->seen_boot = false;
+    s->handoff_done = false;
+    s->kernel_hits = 0;
+    s->bl_timer_armed = false;
+    s->entry_logged = false;
+    s->rom_logged = false;
+    s->pc_hist_idx = 0;
+    memset(s->pc_hist, 0, sizeof(s->pc_hist));
+    s->halt_ticks = 0;
+    s->halt_seen_running = false;
+    s->ramwin_n = 0;
+    s->cmdline_cursor = 0;
+    s->cmdline_phys = 0;
+    s->cmdline_ticks = 0;
+    s->cmdline_kernel_seen = false;
+    s->cmdline_patches = 0;
+    s->cmdline_deadline_ns = 0;
+}
+
 void mt7621_load_image(MT7621State *s, const char *filename)
 {
     uint8_t hdr[64];
@@ -155,7 +187,49 @@ void mt7621_load_image(MT7621State *s, const char *filename)
         if (s->entry) {
             entry = s->entry;
         }
-        if (bl_off && !getenv("MT7621_STAGE1")) {
+        if (bl_off && !getenv("MT7621_NO_ROM_STAGE1") && !s->warm_boot) {
+            /*
+             * Hardware path: with a non-zero ih_bootloader_offset the BootROM
+             * runs the DDR-init stage first.  It copies the image data that
+             * precedes the bootloader (bl_off - 64 bytes) into the BootROM's
+             * stage-1 window at 0xb9000000 and enters it there; stage 1 trains
+             * DRAM and then loads and jumps to the bootloader at ih_load.
+             *
+             * The emulated DRAM is already up, so stage 1 only has to make
+             * its own way to the bootloader -- but running it is what the
+             * silicon does, and the bootloader may rely on state it leaves
+             * (exception vectors, TLB, caches).  Measured: the Breed die dump
+             * boots only through this path; the old "step 2" shortcut (jump
+             * straight to the bootloader) prints nothing at all with it.
+             * MT7621_NO_ROM_STAGE1=1 restores the shortcut for A/B.
+             */
+            load  = 0xb9000000;
+            entry = 0xb9000000;
+            off   = 64;
+            size  = (uint64_t)bl_off - 64;
+            printf("mt7621: BootROM step 1: DDR-init stage 0x%" PRIx64
+                   " bytes @0x%08x -> 0x%08x, then bootloader @0x%x\n",
+                   size, (unsigned)off, (unsigned)load, bl_off);
+            /* the bootloader still has to be in place for the hand-over */
+            {
+                uint32_t bl_load = (uint32_t)ldl_be_p(hdr + 16);
+                uint32_t bl_size = 64 + (uint64_t)img_size - bl_off;
+
+                if (bl_load & 0x80000000) {
+                    uint8_t *tmp = g_malloc(bl_size);
+                    if (mt7621_flash_pread(s, fd, bl_off, tmp, bl_size) !=
+                        (ssize_t)bl_size) {
+                        error_report("mt7621: %s: short read at 0x%x",
+                                     filename, bl_off);
+                        exit(1);
+                    }
+                    address_space_write(&address_space_memory,
+                                        bl_load & 0x1fffffff,
+                                        MEMTXATTRS_UNSPECIFIED, tmp, bl_size);
+                    g_free(tmp);
+                }
+            }
+        } else if (bl_off && !getenv("MT7621_STAGE1")) {
             if (bl_off >= 64 + (uint64_t)img_size) {
                 error_report("mt7621: bootloader offset 0x%x out of range",
                              bl_off);
@@ -174,9 +248,15 @@ void mt7621_load_image(MT7621State *s, const char *filename)
                    " bytes from file 0x%x -> 0x%" PRIx64 "\n",
                    size, bl_off, load);
         }
-        if ((load & 0x1fffffff) + size > s->ram.size) {
+        /*
+         * The KSEG1 window is twice the DRAM size on this SoC (the second
+         * 256 MiB aliases the first), and the BootROM runs stage 1 out of the
+         * 0xbfc00000 window, which lands in that alias.  Check the window,
+         * not the RAM region, or a legitimate stage-1 load is rejected.
+         */
+        if ((load & 0x1fffffff) + size > MT7621_LOAD_WINDOW) {
             error_report("mt7621: image 0x%" PRIx64 "+0x%" PRIx64
-                         " does not fit in RAM", load, size);
+                         " does not fit in the KSEG1 window", load, size);
             exit(1);
         }
         printf("mt7621: uImage payload 0x%" PRIx64 " bytes -> 0x%" PRIx64
@@ -219,6 +299,54 @@ void mt7621_load_image(MT7621State *s, const char *filename)
         size -= chunk;
     }
     g_free(buf);
+
+    /*
+     * Mirror the RouterBOOT area to 0x80e00000 before the booter runs.
+     *
+     * The 256 KiB "RouterBoot" partition is not only a config store: its
+     * 0x28-byte header is the board's *flash descriptor*.  Word 0 is
+     * 0x10000009, then the geometry the booter parses at 0x811018b4:
+     *
+     *   +0x14  config TLV offset ("Hard")
+     *   +0x18, +0x1c, +0x20, +0x24  geometry windows
+     *
+     * and the TLVs themselves follow.  The booter reads all of that from RAM
+     * at 0x80e00000, not from flash: the boot chain leaves the area there
+     * before the booter's first line of C runs (ROUTERBOOT-NOTES.md sec.3,
+     * sec.15, sec.18 - the reason the cave loader had to wget rb-area.bin
+     * there).  Without it the booter writes only its magic word, parses zeros
+     * for the geometry and dies on a NULL-based pointer the moment etherboot
+     * needs a descriptor (observed: TLB load fault at 0xffff8f14 from
+     * `lb v1,-0x70ec(t6)` with $t6 = 0).
+     *
+     * This board's own device tree puts the area at flash 0x1e0000:
+     * "RouterBoot" 0x1e0000-0x220000.  MT7621_RB_AREA=<offset> overrides it,
+     * MT7621_RB_AREA_MIRROR=0 disables the mirror for A/B.
+     */
+    if (s->board == MT7621_BOARD_LG_GAPM7200 &&
+        (!getenv("MT7621_RB_AREA_MIRROR") ||
+         atoi(getenv("MT7621_RB_AREA_MIRROR")))) {
+        const char *area_env = getenv("MT7621_RB_AREA");
+        uint64_t area_off = area_env ? strtoull(area_env, NULL, 0) : 0x1e0000;
+
+        if (total >= area_off + 0x40000) {
+            uint8_t *area = g_malloc(0x40000);
+
+            if (mt7621_flash_pread(s, fd, area_off, area, 0x40000) ==
+                0x40000) {
+                address_space_write(&address_space_memory, 0xe00000,
+                                    MEMTXATTRS_UNSPECIFIED, area, 0x40000);
+                printf("mt7621: RouterBoot area 0x40000 from flash 0x%"
+                       PRIx64 " -> 0x80e00000 (board descriptors)"
+                       " [hdr=%08x geom=%08x,%08x,%08x,%08x hard=%08x]\n",
+                       area_off,
+                       ldl_le_p(area + 0x00), ldl_le_p(area + 0x14),
+                       ldl_le_p(area + 0x18), ldl_le_p(area + 0x1c),
+                       ldl_le_p(area + 0x20), ldl_le_p(area + 0xf000));
+            }
+            g_free(area);
+        }
+    }
     close(fd);
 
     s->entry = entry;

@@ -45,6 +45,7 @@ mt7621_MACHINE_SRCS := \
     modules/eth.h:hw/mips/mt7621/eth.h \
     modules/cm.c:hw/mips/mt7621/cm.c \
     modules/crypto.c:hw/mips/mt7621/crypto.c \
+    modules/usb.c:hw/mips/mt7621/usb.c \
     modules/dump.c:hw/mips/mt7621/dump.c \
     modules/loader.c:hw/mips/mt7621/loader.c \
     modules/dcache.c:hw/mips/mt7621/dcache.c
